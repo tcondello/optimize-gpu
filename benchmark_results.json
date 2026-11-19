@@ -1,0 +1,56 @@
+{
+  "compiler": {
+    "legacy_docker_exec_nvcc_ms": 552.54,
+    "zero_mount_nvrtc_daemon_ms": 33.95,
+    "speedup_x": 16.3,
+    "cubin_bytes": 2856
+  },
+  "qwen_benchmark": {
+    "gpu_arch": "sm_86",
+    "vram_mb": 10240,
+    "model": "Qwen3-4B-Instruct-2507",
+    "model_size_gb": 2.497,
+    "baselines": {
+      "stock_tinygrad_metal_m3_pro_tok_s": 3.65,
+      "stock_tinygrad_nv_rtx3080_tok_s": 8.51,
+      "stock_tinygrad_nv_rtx3080_ms_tok": 117.52,
+      "stock_tinygrad_nv_rtx3080_bw_gbs": 22.11
+    },
+    "optimized_nv_rtx3080": {
+      "avg_decode_ms_tok": 7.92,
+      "min_decode_ms_tok": 7.49,
+      "avg_decode_tok_s": 126.22,
+      "peak_decode_tok_s": 133.49,
+      "effective_model_bw_gbs": 315.21,
+      "lm_head_peak_bw_gbs": 715.0,
+      "prefill_prompt_tokens": 387,
+      "prefill_ttft_ms": 418.91,
+      "prefill_tok_s": 923.8,
+      "speedup_vs_stock_nv_x": 14.83,
+      "speedup_vs_stock_metal_x": 34.58
+    },
+    "verification_prompts": [
+      {
+        "prompt": "Compute 17 * 23 concisely in two lines and state the final integer.",
+        "response": "17 * 23 = (17 * 20) + (17 * 3) = 340 + 51 = 391  \n391",
+        "tokens": 41,
+        "tok_per_s": 117.91,
+        "passed": true
+      },
+      {
+        "prompt": "Write a Python one-liner that returns the squares of even numbers in a list `nums`.",
+        "response": "```python\n[square for num in nums if num % 2 == 0 for square in [num ** 2]]\n```",
+        "tokens": 27,
+        "tok_per_s": 117.42,
+        "passed": true
+      },
+      {
+        "prompt": "In 2 short sentences, what is CUDA warp shuffle (`__shfl_down_sync`)?",
+        "response": "CUDA warp shuffle (`__shfl_down_sync`) allows threads within a warp to exchange data with threads in the same warp, specifically moving data down (toward lower thread indices) in a synchronized manner. It ensures all threads in the warp participate and guarantees data consistency across the warp.",
+        "tokens": 57,
+        "tok_per_s": 117.99,
+        "passed": true
+      }
+    ]
+  }
+}

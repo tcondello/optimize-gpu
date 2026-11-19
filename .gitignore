@@ -1,0 +1,14 @@
+# Build artifacts
+qwen-nv-rs/target/
+!qwen-nv-rs/kernels/*.cubin
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# OS & editor files
+.DS_Store
+*.swp
+*.log

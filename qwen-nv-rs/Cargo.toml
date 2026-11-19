@@ -1,0 +1,16 @@
+[package]
+name = "qwen-nv"
+version = "0.2.0"
+edition = "2021"
+description = "Zero-Docker, Zero-Middleware Native macOS ARM64 Rust Runtime & GA102 (sm_86) Persistent Megakernel Engine for Qwen on Thunderbolt NVIDIA eGPUs"
+
+[[bin]]
+name = "qwen-nv"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = false
