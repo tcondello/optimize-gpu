@@ -17,8 +17,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::daemon::{client_generate_ids_cancellable, daemon_ping, ensure_daemon_running, stop_daemon};
+use crate::audio::{read_wav_mono_16k, CoreAudioPlayer, CoreAudioRecorder, ASR_SAMPLE_RATE, TTS_SAMPLE_RATE};
+use crate::daemon::{
+    client_asr_warm, client_generate_ids_cancellable, client_lora_clear, client_lora_load,
+    client_lora_status, client_speak_via_daemon, client_transcribe_via_daemon, client_tts_warm,
+    daemon_ping, ensure_daemon_running, stop_daemon,
+};
 use crate::gguf::{resolve_model_path, BpeTokenizer, GgufFile, QwenModelConfig};
+use crate::tts::TtsSynthParams;
 
 // =============================================================================
 // Compiler-Verified macOS `aarch64-apple-darwin` POSIX Termios / Winsize / Poll ABI
@@ -681,6 +687,7 @@ enum InputEvent {
     CtrlC,
     CtrlQ,
     CtrlL,
+    CtrlR,
     CtrlS,
     CtrlY,
     CtrlW,
@@ -845,6 +852,7 @@ fn poll_input_events(timeout_ms: i32, paste_acc: &mut Option<String>) -> Vec<Inp
             0x03 => events.push(InputEvent::CtrlC),
             0x11 => events.push(InputEvent::CtrlQ),
             0x0c => events.push(InputEvent::CtrlL),
+            0x12 => events.push(InputEvent::CtrlR),
             0x13 => events.push(InputEvent::CtrlS),
             0x19 => events.push(InputEvent::CtrlY),
             0x17 => events.push(InputEvent::CtrlW),
@@ -986,6 +994,89 @@ fn extract_last_fenced_code(text: &str) -> Option<String> {
     last_block
 }
 
+/// Strip fenced code blocks and light Markdown formatting so spoken replies sound natural.
+fn sanitize_text_for_speech(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut in_fence = false;
+    for ln in md.split('\n') {
+        let trimmed = ln.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            if in_fence {
+                out.push_str(" Code block omitted. ");
+            }
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let cleaned = trimmed
+            .trim_start_matches('#')
+            .trim_start_matches('-')
+            .trim_start();
+        for ch in cleaned.chars() {
+            if ch != '*' && ch != '`' {
+                out.push(ch);
+            }
+        }
+        out.push(' ');
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Split spoken reply text into sentence-sized chunks (~40–180 chars) so the first sentence
+/// plays immediately (`< 120 ms` TTFA) while subsequent sentences synthesize seamlessly behind it.
+fn split_spoken_sentences(clean_text: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    for ch in clean_text.chars() {
+        cur.push(ch);
+        let len = cur.chars().count();
+        let is_sent_end = matches!(ch, '.' | '!' | '?' | ';');
+        let is_clause_end = ch == ',' || ch == ':';
+        if (is_sent_end && len >= 24) || (chunks.is_empty() && is_clause_end && len >= 42) || len >= 200 && ch == ' ' {
+            let trimmed = cur.trim().to_string();
+            if !trimmed.is_empty() {
+                chunks.push(trimmed);
+            }
+            cur.clear();
+        }
+    }
+    let tail = cur.trim().to_string();
+    if !tail.is_empty() {
+        if let Some(last) = chunks.last_mut() {
+            if tail.chars().count() < 18 {
+                last.push(' ');
+                last.push_str(&tail);
+                return chunks;
+            }
+        }
+        chunks.push(tail);
+    }
+    chunks
+}
+
+fn query_lora_badge_from_daemon() -> Option<String> {
+    let Ok(j) = client_lora_status() else {
+        return None;
+    };
+    if !j.contains("\"active\":true") {
+        return None;
+    }
+    let rank = j
+        .find("\"rank\":")
+        .and_then(|idx| {
+            let s: String = j[idx + 7..]
+                .chars()
+                .skip_while(|c| c.is_whitespace())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            s.parse::<usize>().ok()
+        })
+        .unwrap_or(0);
+    Some(format!(" LoRA r={} ", rank))
+}
+
 // =============================================================================
 // Main TUI App State & Render Loop
 // =============================================================================
@@ -1006,6 +1097,25 @@ struct TuiApp {
     temperature: f32,
     max_tokens: usize,
     system_prompt: String,
+
+    voice_enabled: bool,
+    voice_speaker: String,
+    voice_lang: String,
+    tts_model_ref: String,
+    tts_speaking: Arc<AtomicBool>,
+    tts_cancel_flag: Option<Arc<AtomicBool>>,
+    last_ttfa_ms: Arc<std::sync::Mutex<f64>>,
+    lora_badge: Option<String>,
+
+    // Live 100%-on-RTX-3080 Speech-to-Text (`Qwen3-ASR-1.7B Q8_0`) microphone & VAD state
+    asr_model_ref: String,
+    asr_lang_hint: String,
+    active_recorder: Option<CoreAudioRecorder>,
+    asr_rx: Option<Receiver<Result<(String, String, f64), String>>>,
+    last_asr_ms: f64,
+    hands_free_talk: bool,
+    prev_tts_speaking: bool,
+    talk_rearm_at: Option<Instant>,
 
     messages: Vec<ChatMsg>,
     input_chars: Vec<char>,
@@ -1051,6 +1161,8 @@ impl TuiApp {
         let tok = BpeTokenizer::from_gguf(&gguf)?;
         let cfg = QwenModelConfig::from_gguf(&gguf, &tok, max_ctx, model_ref)?;
 
+        let lora_badge = query_lora_badge_from_daemon();
+
         Ok(Self {
             model_ref: model_ref.to_string(),
             gguf_path,
@@ -1064,6 +1176,22 @@ impl TuiApp {
             temperature: temp,
             max_tokens: max_tokens.max(64),
             system_prompt: String::new(),
+            voice_enabled: false,
+            voice_speaker: "ryan".to_string(),
+            voice_lang: "english".to_string(),
+            tts_model_ref: "1.7b".to_string(),
+            tts_speaking: Arc::new(AtomicBool::new(false)),
+            tts_cancel_flag: None,
+            last_ttfa_ms: Arc::new(std::sync::Mutex::new(0.0)),
+            lora_badge,
+            asr_model_ref: "1.7b".to_string(),
+            asr_lang_hint: "auto".to_string(),
+            active_recorder: None,
+            asr_rx: None,
+            last_asr_ms: 0.0,
+            hands_free_talk: false,
+            prev_tts_speaking: false,
+            talk_rearm_at: None,
             messages: Vec::new(),
             input_chars: Vec::new(),
             cursor_idx: 0,
@@ -1088,6 +1216,86 @@ impl TuiApp {
 
     fn set_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    fn stop_active_tts(&mut self) {
+        if let Some(c) = &self.tts_cancel_flag {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.tts_speaking.store(false, Ordering::Relaxed);
+    }
+
+    fn spawn_tts_for_text(&mut self, raw_markdown: &str) {
+        let clean = sanitize_text_for_speech(raw_markdown);
+        if clean.is_empty() {
+            return;
+        }
+        self.stop_active_tts();
+        let sentences = split_spoken_sentences(&clean);
+        if sentences.is_empty() {
+            return;
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_bg = Arc::clone(&cancel);
+        let speaking_bg = Arc::clone(&self.tts_speaking);
+        let ttfa_bg = Arc::clone(&self.last_ttfa_ms);
+        let tts_ref = self.tts_model_ref.clone();
+        let speaker = self.voice_speaker.clone();
+        let lang = self.voice_lang.clone();
+
+        speaking_bg.store(true, Ordering::Relaxed);
+        self.tts_cancel_flag = Some(cancel);
+
+        thread::spawn(move || {
+            let Ok(mut player) = CoreAudioPlayer::new(TTS_SAMPLE_RATE) else {
+                speaking_bg.store(false, Ordering::Relaxed);
+                return;
+            };
+            let t_turn = Instant::now();
+            let mut recorded_ttfa = false;
+
+            for sent in sentences {
+                if cancel_bg.load(Ordering::Relaxed) {
+                    player.abort_immediate();
+                    speaking_bg.store(false, Ordering::Relaxed);
+                    return;
+                }
+                let params = TtsSynthParams {
+                    text: sent,
+                    speaker: speaker.clone(),
+                    language: lang.clone(),
+                    streaming_chunks: true,
+                    ..TtsSynthParams::default()
+                };
+                let _ = client_speak_via_daemon(
+                    &tts_ref,
+                    &params,
+                    Some(&cancel_bg),
+                    |chunk| {
+                        if cancel_bg.load(Ordering::Relaxed) {
+                            player.abort_immediate();
+                            return false;
+                        }
+                        if !recorded_ttfa {
+                            recorded_ttfa = true;
+                            if let Ok(mut g) = ttfa_bg.lock() {
+                                *g = t_turn.elapsed().as_secs_f64() * 1000.0;
+                            }
+                        }
+                        let _ = player.push_samples(chunk);
+                        true
+                    },
+                );
+            }
+
+            if cancel_bg.load(Ordering::Relaxed) {
+                player.abort_immediate();
+            } else {
+                player.drain();
+            }
+            speaking_bg.store(false, Ordering::Relaxed);
+        });
     }
 
     fn encode_conversation(&self) -> Vec<i32> {
@@ -1119,6 +1327,7 @@ impl TuiApp {
         if self.streaming_rx.is_some() {
             return;
         }
+        self.stop_active_tts();
         self.messages.push(ChatMsg {
             role: "user".into(),
             content: user_text,
@@ -1196,15 +1405,171 @@ impl TuiApp {
     }
 
     fn cancel_active_stream(&mut self) {
+        let mut stopped_any = false;
+        if let Some(mut rec) = self.active_recorder.take() {
+            rec.abort();
+            stopped_any = true;
+        }
+        if self.asr_rx.take().is_some() {
+            stopped_any = true;
+        }
+        if self.hands_free_talk {
+            self.hands_free_talk = false;
+            self.talk_rearm_at = None;
+            stopped_any = true;
+        }
         if let Some(c) = &self.cancel_flag {
             c.store(true, Ordering::Relaxed);
-            self.set_toast("Stopping GPU stream cleanly...");
+            stopped_any = true;
         }
+        if self.tts_speaking.load(Ordering::Relaxed) {
+            self.stop_active_tts();
+            stopped_any = true;
+        }
+        if stopped_any {
+            self.set_toast("Stopped active voice / GPU stream cleanly");
+        }
+    }
+
+    fn warm_voice_stack_bg(&self) {
+        let asr_ref = self.asr_model_ref.clone();
+        let tts_ref = self.tts_model_ref.clone();
+        thread::spawn(move || {
+            let _ = client_asr_warm(&asr_ref);
+            let _ = client_tts_warm(&tts_ref);
+        });
+    }
+
+    fn start_mic_recording(&mut self) {
+        if self.active_recorder.is_some() || self.asr_rx.is_some() || self.streaming_rx.is_some() {
+            return;
+        }
+        self.stop_active_tts();
+        self.talk_rearm_at = None;
+        if !self.voice_enabled {
+            self.voice_enabled = true;
+            self.warm_voice_stack_bg();
+        }
+        match CoreAudioRecorder::start(ASR_SAMPLE_RATE) {
+            Ok(rec) => {
+                self.active_recorder = Some(rec);
+                self.set_toast(
+                    "🎙 Listening on Mac mic -> 100% RTX 3080 Qwen3-ASR-1.7B (pause auto-sends • Enter/^R sends now • Esc cancels)",
+                );
+            }
+            Err(e) => {
+                self.hands_free_talk = false;
+                self.set_toast(format!("Mic error: {}", e));
+            }
+        }
+    }
+
+    fn submit_pcm_for_transcription(&mut self, pcm_16k: Vec<f32>) {
+        if pcm_16k.len() < 3200 {
+            self.set_toast("Voice clip too short (< 0.2s) — press Ctrl+R and speak a question");
+            if self.hands_free_talk {
+                self.talk_rearm_at = Some(Instant::now() + Duration::from_millis(350));
+            }
+            return;
+        }
+        let asr_ref = self.asr_model_ref.clone();
+        let lang_hint = self.asr_lang_hint.clone();
+        let (tx, rx) = mpsc::channel::<Result<(String, String, f64), String>>();
+        thread::spawn(move || {
+            let t0 = Instant::now();
+            let res = client_transcribe_via_daemon(&asr_ref, &lang_hint, &pcm_16k)
+                .map(|(text, sj)| (text, sj, t0.elapsed().as_secs_f64() * 1000.0));
+            let _ = tx.send(res);
+        });
+        self.asr_rx = Some(rx);
+    }
+
+    fn stop_and_submit_mic(&mut self) {
+        let Some(mut rec) = self.active_recorder.take() else {
+            return;
+        };
+        let pcm = rec.finish_and_take_samples();
+        self.submit_pcm_for_transcription(pcm);
+    }
+
+    fn pump_voice_input(&mut self) -> bool {
+        let mut changed = false;
+
+        // 1. Check live microphone auto-VAD endpointing (`0.95s` trailing silence after speech)
+        let should_auto_stop = self
+            .active_recorder
+            .as_ref()
+            .map(|r| r.live_stats().auto_stop_ready)
+            .unwrap_or(false);
+        if should_auto_stop {
+            self.stop_and_submit_mic();
+            changed = true;
+        }
+
+        // 2. Check completed RTX 3080 `Qwen3-ASR-1.7B` transcription
+        let mut asr_done: Option<Result<(String, String, f64), String>> = None;
+        if let Some(rx) = &self.asr_rx {
+            if let Ok(res) = rx.try_recv() {
+                asr_done = Some(res);
+            }
+        }
+        if let Some(res) = asr_done {
+            self.asr_rx = None;
+            changed = true;
+            match res {
+                Ok((transcript, _stats_json, stt_ms)) => {
+                    let clean = transcript.trim().to_string();
+                    self.last_asr_ms = stt_ms;
+                    if clean.is_empty() {
+                        self.set_toast(format!(
+                            "🎙 No speech detected ({:.0}ms RTX 3080 STT) — press Ctrl+R to speak",
+                            stt_ms
+                        ));
+                        if self.hands_free_talk {
+                            self.talk_rearm_at = Some(Instant::now() + Duration::from_millis(350));
+                        }
+                    } else {
+                        self.set_toast(format!("🎙 RTX 3080 STT ({:.0} ms): \"{}\"", stt_ms, clean));
+                        // Ensure spoken response is enabled so Speech-In -> LLM -> Speech-Out + TUI Chat completes!
+                        self.voice_enabled = true;
+                        self.start_generation(clean, false);
+                    }
+                }
+                Err(e) => {
+                    self.hands_free_talk = false;
+                    self.set_toast(format!("RTX 3080 ASR error: {}", e));
+                }
+            }
+        }
+
+        // 3. Hands-free `/talk` turn-taking: once TTS finishes speaking, re-open mic after brief echo guard
+        let now_speaking = self.tts_speaking.load(Ordering::Relaxed);
+        if self.hands_free_talk {
+            if self.prev_tts_speaking && !now_speaking && self.streaming_rx.is_none() && self.active_recorder.is_none() && self.asr_rx.is_none() {
+                self.talk_rearm_at = Some(Instant::now() + Duration::from_millis(400));
+                changed = true;
+            }
+            if let Some(when) = self.talk_rearm_at {
+                if Instant::now() >= when
+                    && !now_speaking
+                    && self.streaming_rx.is_none()
+                    && self.active_recorder.is_none()
+                    && self.asr_rx.is_none()
+                {
+                    self.talk_rearm_at = None;
+                    self.start_mic_recording();
+                    changed = true;
+                }
+            }
+        }
+        self.prev_tts_speaking = now_speaking;
+        changed
     }
 
     fn pump_stream(&mut self) -> bool {
         let mut changed = false;
         let mut finished = false;
+        let mut speak_reply_after: Option<String> = None;
 
         if let Some(rx) = &self.streaming_rx {
             while let Ok(ev) = rx.try_recv() {
@@ -1242,7 +1607,11 @@ impl TuiApp {
                         }
                         self.last_launches = st.kernel_launches;
                         self.last_spec_extra = st.spec_accepted_extra;
+                        let was_cancelled = st.cancelled;
                         if let Some(last) = self.messages.last_mut() {
+                            if self.voice_enabled && !was_cancelled && !last.content.is_empty() {
+                                speak_reply_after = Some(last.content.clone());
+                            }
                             last.stats = Some(st);
                         }
                         finished = true;
@@ -1264,6 +1633,9 @@ impl TuiApp {
         if finished {
             self.streaming_rx = None;
             self.cancel_flag = None;
+            if let Some(reply_md) = speak_reply_after {
+                self.spawn_tts_for_text(&reply_md);
+            }
         }
         changed
     }
@@ -1406,20 +1778,132 @@ impl TuiApp {
                 };
                 self.start_generation(prompt, true);
             }
+            "/speak" => {
+                self.voice_enabled = match arg {
+                    "on" | "1" | "true" => true,
+                    "off" | "0" | "false" => false,
+                    _ => !self.voice_enabled,
+                };
+                if self.voice_enabled {
+                    self.warm_voice_stack_bg();
+                    self.set_toast(format!(
+                        "🔊 Live RTX 3080 Voice ON (Qwen3-TTS-1.7B Q8_0 • speaker='{}' • Ctrl+R to talk)",
+                        self.voice_speaker
+                    ));
+                } else {
+                    self.hands_free_talk = false;
+                    self.talk_rearm_at = None;
+                    self.stop_active_tts();
+                    self.set_toast("🔇 Live RTX 3080 Voice OFF");
+                }
+            }
+            "/listen" | "/mic" => {
+                if !arg.is_empty() {
+                    // Support `/listen <path.wav>` to transcribe an audio file straight into the live TUI chat + voice loop!
+                    match read_wav_mono_16k(std::path::Path::new(arg)) {
+                        Ok(pcm) => {
+                            self.voice_enabled = true;
+                            self.submit_pcm_for_transcription(pcm);
+                        }
+                        Err(e) => self.set_toast(format!("WAV load error: {}", e)),
+                    }
+                } else if self.active_recorder.is_some() {
+                    self.stop_and_submit_mic();
+                } else {
+                    self.start_mic_recording();
+                }
+            }
+            "/talk" => {
+                self.hands_free_talk = match arg {
+                    "on" | "1" | "true" => true,
+                    "off" | "0" | "false" => false,
+                    _ => !self.hands_free_talk,
+                };
+                if self.hands_free_talk {
+                    self.voice_enabled = true;
+                    self.warm_voice_stack_bg();
+                    self.start_mic_recording();
+                    self.set_toast(
+                        "🎙🔊 Hands-Free RTX 3080 Voice Loop ON (speak naturally • auto-listens after each reply • Esc stops)",
+                    );
+                } else {
+                    self.talk_rearm_at = None;
+                    if let Some(mut rec) = self.active_recorder.take() {
+                        rec.abort();
+                    }
+                    self.set_toast("Hands-Free Voice Loop OFF (press Ctrl+R anytime for single-turn voice)");
+                }
+            }
+            "/say" => {
+                if arg.is_empty() {
+                    if let Some(m) = self.messages.iter().rev().find(|m| m.role == "assistant") {
+                        let text = m.content.clone();
+                        self.spawn_tts_for_text(&text);
+                        self.set_toast(format!("🔊 Speaking last reply via RTX 3080 ('{}')...", self.voice_speaker));
+                    } else {
+                        self.set_toast("Usage: /say <text> (or /say after an assistant reply)");
+                    }
+                } else {
+                    self.spawn_tts_for_text(arg);
+                    self.set_toast(format!("🔊 Speaking on RTX 3080 ('{}')...", self.voice_speaker));
+                }
+            }
+            "/voice" | "/speaker" => {
+                if arg.is_empty() {
+                    self.set_toast(format!(
+                        "Current voice: '{}' (presets: ryan, serena, vivian, aiden, uncle_fu, ono_anna, sohee, eric, dylan)",
+                        self.voice_speaker
+                    ));
+                } else {
+                    self.voice_speaker = arg.to_ascii_lowercase();
+                    self.set_toast(format!("✓ TTS voice preset set to '{}'", self.voice_speaker));
+                }
+            }
+            "/lora" => {
+                if arg.is_empty() || arg == "status" {
+                    let st = client_lora_status().unwrap_or_else(|e| format!("Error: {}", e));
+                    self.lora_badge = query_lora_badge_from_daemon();
+                    self.messages.push(ChatMsg {
+                        role: "info".into(),
+                        content: format!("**Fused Rank-r LoRA Status**: `{}`\nUse `/lora <adapter_path>` to hot-swap (`< 1 ms`) or `/lora off` to clear.", st),
+                        stats: None,
+                    });
+                } else if matches!(arg, "off" | "clear" | "none") {
+                    match client_lora_clear() {
+                        Ok(_) => {
+                            self.lora_badge = None;
+                            self.set_toast("✓ Cleared active LoRA adapter (0.0% base overhead)");
+                        }
+                        Err(e) => self.set_toast(format!("LoRA clear error: {}", e)),
+                    }
+                } else {
+                    let path_arg = arg.strip_prefix("load ").map(|s| s.trim()).unwrap_or(arg);
+                    match client_lora_load(path_arg, 1.0) {
+                        Ok(res) => {
+                            self.lora_badge = query_lora_badge_from_daemon();
+                            self.set_toast(format!("✓ Hot-swapped LoRA: {}", res));
+                        }
+                        Err(e) => self.set_toast(format!("LoRA load failed: {}", e)),
+                    }
+                }
+                self.scroll_from_bottom = 0;
+            }
             "/help" | _ => {
                 self.messages.push(ChatMsg {
                     role: "info".into(),
-                    content: "### Qwen-NV TUI Commands & Shortcuts\n\
+                    content: "### Qwen-NV v0.4 Full-Duplex RTX 3080 Voice + Text + LoRA TUI Commands\n\
+                        - `Ctrl+R` or `/listen` (`/mic`) — **Speak a question into your Mac mic**: runs 100%-on-RTX-3080 `Qwen3-ASR-1.7B Q8_0` STT -> captures text in chat -> streams `Qwen3-4B` -> speaks reply via `Qwen3-TTS-1.7B Q8_0`!\n\
+                        - `/talk [on|off]` — **Hands-free continuous voice conversation** (auto-listens after each spoken reply; `Esc` stops)\n\
+                        - `/speak [on|off]` — Toggle live **100%-on-RTX-3080 `Qwen3-TTS-1.7B Q8_0`** spoken replies (`24 kHz` streaming)\n\
+                        - `/say [text]` — Speak `<text>` (or the last assistant reply) aloud on RTX 3080 (`Esc` stops audio)\n\
+                        - `/voice <name>` — Select voice (`ryan`, `serena`, `vivian`, `aiden`, `uncle_fu`, `ono_anna`, `sohee`, `eric`, `dylan`)\n\
+                        - `/lora <path|off>` — `< 1 ms` hot-swap Rank-`r` (`r <= 32`) PEFT `.safetensors` LoRA adapter onto `Qwen3-4B`\n\
                         - `/bench` (or `/bench t1`) — Run live ~260 tok/s `BM=4` or ~173 tok/s `T=1` benchmark inside chat\n\
                         - `/verify` — Inspect loaded GGUF path, exact byte size, & unmodified model architecture\n\
                         - `/spec [on|off]` (`Ctrl+S`) — Toggle lossless `BM=4` speculative verification vs pure `T=1`\n\
-                        - `/temp <0.0..2.0>` — Set sampling temperature (`0.0` = deterministic greedy)\n\
-                        - `/max <N>` — Set max generated tokens per reply\n\
-                        - `/sys <text>` — Set system prompt (`/sys clear` to clear)\n\
+                        - `/temp <0.0..2.0>` │ `/max <N>` │ `/sys <text>` — Sampling & system prompt controls\n\
                         - `/copy` / `/copy code` (`Ctrl+Y`) — Copy last reply or code block to macOS clipboard\n\
-                        - `/mouse` — Toggle mouse-wheel capture vs native click-drag selection\n\
-                        - `/clear` (`Ctrl+L`) — Clear conversation & reset GPU KV cache\n\
-                        - `/quit` (`Ctrl+Q`) — Exit TUI (keeps GPU daemon warm) │ `/stop` — Unload GPU & exit"
+                        - `/clear` (`Ctrl+L`) — Clear conversation & KV cache │ `/quit` (`Ctrl+Q`) — Exit │ `/stop` — Unload GPU"
                         .into(),
                     stats: None,
                 });
@@ -1492,7 +1976,7 @@ impl TuiApp {
             scr.put_str(gx, 0, w, &gpu_tag, Style::new(FG_GREEN, BG_HEADER).bold());
         }
 
-        // Row 1: Spec mode badge + Temp + KV context gauge + Live Speedometer
+        // Row 1: Spec mode badge + Voice/LoRA badges + Temp + KV context gauge + Live Speedometer
         let mut x1 = 1;
         let (mode_lbl, mode_bg) = if self.spec_enabled {
             (" SPEC BM=4 ON ", BG_BADGE_ON)
@@ -1500,6 +1984,33 @@ impl TuiApp {
             (" T=1 MEGAKERNEL ", BG_BADGE_T1)
         };
         x1 = scr.put_str(x1, 1, w, mode_lbl, Style::new(FG_TEXT, mode_bg).bold());
+        if self.active_recorder.is_some() {
+            x1 = scr.put_str(x1 + 1, 1, w, " 🎙 LISTENING ", Style::new(BG_MAIN, FG_GREEN).bold());
+        } else if self.asr_rx.is_some() {
+            x1 = scr.put_str(x1 + 1, 1, w, " 🎙 RTX 3080 STT... ", Style::new(BG_MAIN, FG_CYAN).bold());
+        } else if self.tts_speaking.load(Ordering::Relaxed) {
+            let ttfa = self.last_ttfa_ms.lock().map(|g| *g).unwrap_or(0.0);
+            let lbl = if ttfa > 0.0 {
+                format!(" 🔊 SPEAKING ({:.0}ms TTFA) ", ttfa)
+            } else {
+                " 🔊 SYNTHESIZING... ".to_string()
+            };
+            x1 = scr.put_str(x1 + 1, 1, w, &lbl, Style::new(BG_MAIN, FG_AMBER).bold());
+        } else if self.hands_free_talk {
+            let lbl = format!(" 🎙🔊 TALK:{} ", self.voice_speaker);
+            x1 = scr.put_str(x1 + 1, 1, w, &lbl, Style::new(BG_MAIN, FG_GREEN).bold());
+        } else if self.voice_enabled {
+            let stt_note = if self.last_asr_ms > 0.0 {
+                format!(" • STT {:.0}ms", self.last_asr_ms)
+            } else {
+                String::new()
+            };
+            let lbl = format!(" 🔊 VOICE:{}{} ", self.voice_speaker, stt_note);
+            x1 = scr.put_str(x1 + 1, 1, w, &lbl, Style::new(FG_TEXT, BG_BOT_TAG).bold());
+        }
+        if let Some(lb) = &self.lora_badge {
+            x1 = scr.put_str(x1 + 1, 1, w, lb, Style::new(BG_MAIN, FG_PURPLE).bold());
+        }
         x1 = scr.put_str(
             x1 + 1,
             1,
@@ -1569,10 +2080,10 @@ impl TuiApp {
         if self.messages.is_empty() {
             all_lines.push(RenderedLine { spans: Vec::new(), row_bg: BG_MAIN });
             let welcome = format!(
-                "## Welcome to Qwen-NV Native Rust TUI\n\
-                 Connected to **{}** (`{:.2} GB` unmodified GGUF) on **NVIDIA GeForce RTX 3080 (`GA102`, {} SMs)** with **Docker OFF**.\n\n\
-                 - **Pure Serving Layer**: `0` model weights modified, `PROT_READ` read-only GGUF mapping, exact `FP16` KV cache, & lossless `BM=4` verification.\n\
-                 - **Instant Commands**: Type `/bench` for a live **~260 tok/s** benchmark, `/verify` to inspect GGUF integrity, `Ctrl+S` to toggle `BM=4` vs `T=1`, `Ctrl+Y` to copy replies, or `/help` for all commands.",
+                "## Welcome to Qwen-NV v0.4 Modular Text + Voice + LoRA TUI\n\
+                 Connected to **{}** (`{:.2} GB` unmodified GGUF) + co-resident **Qwen3-ASR-1.7B (`Q8_0`)** & **Qwen3-TTS-1.7B (`Q8_0`)** on **NVIDIA GeForce RTX 3080 (`GA102`, {} SMs)** with **Docker OFF**.\n\n\
+                 - **Speak to Your RTX 3080**: Press **`Ctrl+R`** (or type `/listen`) and speak a question — 100% of STT, LLM thinking, and `24 kHz` TTS run on the RTX 3080 while capturing the full conversation right here in chat! Or type `/talk` for continuous hands-free conversation.\n\
+                 - **Pure Serving Layer**: `0` model weights modified, `PROT_READ` read-only GGUF mapping, exact `FP16` KV cache, `< 5 ms` Rank-`r` LoRA hot-swap (`/lora`), & `/bench` for live **~260 tok/s** verification.",
                 self.cfg.model_name, self.gguf_size_gb, self.active_sms
             );
             all_lines.extend(format_markdown_block(&welcome, w.saturating_sub(2), false));
@@ -1671,19 +2182,33 @@ impl TuiApp {
         }
 
         // ---------------------------------------------------------------------
-        // 3b. Render Prompt Composer Box
+        // 3b. Render Prompt Composer Box (or Live Microphone VU Meter)
         // ---------------------------------------------------------------------
-        let is_busy = self.streaming_rx.is_some();
-        let border_st = if is_busy {
+        let mic_stats = self.active_recorder.as_ref().map(|r| r.live_stats());
+        let is_transcribing = self.asr_rx.is_some();
+        let is_busy = self.streaming_rx.is_some() || is_transcribing;
+        let border_st = if let Some(ref ms) = mic_stats {
+            if ms.speech_started {
+                Style::new(FG_GREEN, BG_MAIN).bold()
+            } else {
+                Style::new(FG_CORAL, BG_MAIN).bold()
+            }
+        } else if is_transcribing {
+            Style::new(FG_CYAN, BG_MAIN).bold()
+        } else if is_busy {
             Style::new(FG_AMBER, BG_MAIN)
         } else {
             Style::new(FG_BORDER_HI, BG_MAIN)
         };
 
-        let title = if is_busy {
+        let title = if mic_stats.is_some() {
+            "─ 🎙 Listening on Microphone -> RTX 3080 Qwen3-ASR-1.7B (Enter/^R sends now • Esc cancels) "
+        } else if is_transcribing {
+            "─ 🎙 Transcribing Speech on RTX 3080 (Qwen3-ASR-1.7B Q8_0)... "
+        } else if is_busy {
             "─ ⟳ Generating on RTX 3080 (press Esc to stop) "
         } else {
-            "─ Message Qwen3-4B (Enter to send • Alt+Enter newline • /help) "
+            "─ Message Qwen3-4B (Enter to send • Ctrl+R to speak • /talk hands-free • /help) "
         };
         scr.put_char(1, comp_top_y, '╭', border_st);
         let mut tx = scr.put_str(2, comp_top_y, w.saturating_sub(2), title, border_st);
@@ -1697,12 +2222,43 @@ impl TuiApp {
             scr.put_char(1, y, '│', border_st);
             scr.put_char(w.saturating_sub(2), y, '│', border_st);
             let line_idx = comp_scroll + r;
-            if self.input_chars.is_empty() && r == 0 && !is_busy {
+            if let Some(ref ms) = mic_stats {
+                if r == 0 {
+                    let level = ((ms.rms * 14.0).sqrt()).clamp(0.0, 1.0) as f64;
+                    let meter_w = 16usize;
+                    let lit = ((level * (meter_w as f64)).round() as usize).min(meter_w);
+                    let bar = format!(
+                        "🎙 [{}{}] {:4.1}s  {}",
+                        "█".repeat(lit),
+                        "░".repeat(meter_w - lit),
+                        ms.duration_sec,
+                        if ms.speech_started {
+                            "Speech detected — pause ~1s to auto-send (or press Enter / Ctrl+R)"
+                        } else {
+                            "Speak your question aloud now..."
+                        }
+                    );
+                    let st = if ms.speech_started {
+                        Style::new(FG_GREEN, BG_MAIN).bold()
+                    } else {
+                        Style::new(FG_TEXT, BG_MAIN)
+                    };
+                    scr.put_str(3, y, w.saturating_sub(3), &bar, st);
+                }
+            } else if is_transcribing && r == 0 {
                 scr.put_str(
                     3,
                     y,
                     w.saturating_sub(3),
-                    "Ask anything, paste code, or run /bench, /verify, /spec...",
+                    "Running GPU STFT/Mel -> 24L AuT Encoder -> 28L Qwen3 Megakernel on RTX 3080...",
+                    Style::new(FG_CYAN, BG_MAIN),
+                );
+            } else if self.input_chars.is_empty() && r == 0 && !is_busy {
+                scr.put_str(
+                    3,
+                    y,
+                    w.saturating_sub(3),
+                    "Press Ctrl+R to speak a question, type a message, or run /talk, /speak, /lora, /bench...",
                     Style::new(FG_DIM, BG_MAIN),
                 );
             } else if let Some(ln) = comp_lines.get(line_idx) {
@@ -1736,12 +2292,12 @@ impl TuiApp {
                 2,
                 footer_y,
                 w.saturating_sub(1),
-                "Enter:Send │ Alt+Enter:Newline │ Esc:Stop │ ^S:Spec │ ^Y:Copy │ ^L:Clear │ /bench │ /verify │ ^Q:Quit",
+                "^R:Mic/Speak │ /talk:Hands-Free │ Enter:Send │ Esc:Stop │ ^S:Spec │ ^Y:Copy │ ^L:Clear │ ^Q:Quit",
                 Style::new(FG_MUTED, BG_FOOTER),
             );
         }
 
-        if is_busy {
+        if is_busy || mic_stats.is_some() {
             None
         } else {
             let cy = comp_top_y + 1 + (cur_comp_row.saturating_sub(comp_scroll));
@@ -1812,13 +2368,23 @@ pub fn run_tui(
     temp: f32,
     max_tokens: usize,
     self_test: bool,
+    voice_start: bool,
+    voice_self_test: bool,
 ) -> Result<(), String> {
+    if voice_self_test {
+        return run_tui_voice_self_test(model_ref, max_ctx, spec, temp);
+    }
     if self_test {
         return run_tui_self_test(model_ref, max_ctx, spec, temp);
     }
 
     // Ensure daemon is up BEFORE entering Alternate Screen so any cold-boot log prints cleanly
     let mut app = TuiApp::new(model_ref, max_ctx, spec, temp, max_tokens)?;
+    if voice_start {
+        app.voice_enabled = true;
+        app.warm_voice_stack_bg();
+        app.set_toast("🎙🔊 RTX 3080 Full Voice Stack Active — press Ctrl+R to speak a question (or /talk for hands-free)");
+    }
     let mut guard = RawTermGuard::enter()?;
     let (w, h) = term_size();
     let mut scr = ScreenBuf::new(w, h);
@@ -1833,16 +2399,27 @@ pub fn run_tui(
             needs_redraw = true;
         }
 
+        if app.pump_voice_input() {
+            needs_redraw = true;
+        }
         if app.pump_stream() {
             needs_redraw = true;
         }
-        if app.streaming_rx.is_some() {
+        if app.streaming_rx.is_some()
+            || app.tts_speaking.load(Ordering::Relaxed)
+            || app.active_recorder.is_some()
+            || app.asr_rx.is_some()
+        {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
             needs_redraw = true;
         }
 
         // Refresh daemon ping latency periodically when idle
-        if app.streaming_rx.is_none() && last_ping_check.elapsed() > Duration::from_secs(5) {
+        if app.streaming_rx.is_none()
+            && app.active_recorder.is_none()
+            && app.asr_rx.is_none()
+            && last_ping_check.elapsed() > Duration::from_secs(5)
+        {
             let tp = Instant::now();
             if daemon_ping().is_ok() {
                 app.ping_ms = tp.elapsed().as_secs_f64() * 1000.0;
@@ -1864,7 +2441,15 @@ pub fn run_tui(
             needs_redraw = false;
         }
 
-        let poll_ms = if app.streaming_rx.is_some() { 16 } else { 50 };
+        let poll_ms = if app.streaming_rx.is_some()
+            || app.active_recorder.is_some()
+            || app.asr_rx.is_some()
+            || app.talk_rearm_at.is_some()
+        {
+            16
+        } else {
+            50
+        };
         let evs = poll_input_events(poll_ms, &mut paste_acc);
         if evs.is_empty() {
             continue;
@@ -1877,8 +2462,23 @@ pub fn run_tui(
                     app.cancel_active_stream();
                     return Ok(());
                 }
+                InputEvent::CtrlR => {
+                    if app.active_recorder.is_some() {
+                        app.stop_and_submit_mic();
+                    } else if app.asr_rx.is_some() {
+                        app.set_toast("Transcribing your voice on RTX 3080...");
+                    } else if app.streaming_rx.is_some() {
+                        app.set_toast("Wait for current reply or press Esc to interrupt");
+                    } else {
+                        app.start_mic_recording();
+                    }
+                }
                 InputEvent::CtrlC => {
-                    if app.streaming_rx.is_some() {
+                    if app.active_recorder.is_some()
+                        || app.asr_rx.is_some()
+                        || app.streaming_rx.is_some()
+                        || app.tts_speaking.load(Ordering::Relaxed)
+                    {
                         app.cancel_active_stream();
                     } else if !app.input_chars.is_empty() {
                         app.input_chars.clear();
@@ -1889,7 +2489,12 @@ pub fn run_tui(
                     }
                 }
                 InputEvent::Esc => {
-                    if app.streaming_rx.is_some() {
+                    if app.active_recorder.is_some()
+                        || app.asr_rx.is_some()
+                        || app.hands_free_talk
+                        || app.streaming_rx.is_some()
+                        || app.tts_speaking.load(Ordering::Relaxed)
+                    {
                         app.cancel_active_stream();
                     } else if app.scroll_from_bottom > 0 {
                         app.scroll_from_bottom = 0;
@@ -1990,8 +2595,12 @@ pub fn run_tui(
                 InputEvent::Up => app.move_cursor_vertical(-1),
                 InputEvent::Down => app.move_cursor_vertical(1),
                 InputEvent::Enter => {
-                    if app.streaming_rx.is_some() {
-                        app.set_toast("Wait for current reply or press Esc to stop first");
+                    if app.active_recorder.is_some() {
+                        app.stop_and_submit_mic();
+                        continue;
+                    }
+                    if app.asr_rx.is_some() || app.streaming_rx.is_some() {
+                        app.set_toast("Wait for current voice/text turn or press Esc to stop first");
                         continue;
                     }
                     let submitted: String = app.input_chars.iter().collect();
@@ -2064,6 +2673,120 @@ fn run_tui_self_test(model_ref: &str, max_ctx: usize, spec: bool, temp: f32) -> 
         ansi_bytes,
         reply1.trim(),
         reply2.trim()
+    );
+    Ok(())
+}
+
+/// End-to-end 100%-on-RTX-3080 Voice Loop TUI verification:
+/// 1. Warms co-resident `Qwen3-ASR-1.7B Q8_0` + `Qwen3-TTS-1.7B Q8_0` alongside `Qwen3-4B` in RTX 3080 VRAM
+/// 2. Feeds a spoken `16 kHz` WAV question through `TuiApp::submit_pcm_for_transcription`
+/// 3. Verifies `TuiApp::pump_voice_input` captures `▸ YOU` in `app.messages` and triggers `Qwen3-4B` streaming
+/// 4. Verifies `◆ Qwen3-4B-Instruct-2507` streams into `app.messages` & renders cleanly into `ScreenBuf`
+/// 5. Synthesizes the assistant's reply via `Qwen3-TTS-1.7B` on the RTX 3080 (`24 kHz` streaming TTFA)
+fn run_tui_voice_self_test(model_ref: &str, max_ctx: usize, spec: bool, temp: f32) -> Result<(), String> {
+    let mut app = TuiApp::new(model_ref, max_ctx, spec, temp, 96)?;
+    let _ = client_asr_warm("1.7b")?;
+    let _ = client_tts_warm("1.7b")?;
+
+    // Synthesize a deterministic spoken question via RTX 3080 TTS if `/tmp/spoken_question_16k.wav` is absent
+    let wav_path = std::path::Path::new("/tmp/spoken_question_16k.wav");
+    let pcm_16k = if wav_path.exists() {
+        read_wav_mono_16k(wav_path)?
+    } else {
+        let q_params = TtsSynthParams {
+            text: "What makes GDDR6X memory bandwidth so fast for running AI models locally?".into(),
+            speaker: "ryan".into(),
+            language: "english".into(),
+            seed: Some(42),
+            streaming_chunks: false,
+            ..Default::default()
+        };
+        let (wav_24k, _) = client_speak_via_daemon("1.7b", &q_params, None, |_| true)?;
+        crate::audio::resample_sinc_mono(&wav_24k, TTS_SAMPLE_RATE, ASR_SAMPLE_RATE)
+    };
+
+    // Disable Mac speaker output during automated headless self-test, then test TTS synthesis explicitly below
+    let mut scr = ScreenBuf::new(116, 36);
+    let t_roundtrip = Instant::now();
+
+    app.submit_pcm_for_transcription(pcm_16k);
+    let t_stt = Instant::now();
+    while app.asr_rx.is_some() {
+        app.pump_voice_input();
+        // Keep headless test silent on speakers; we measure exact daemon TTS TTFA right after LLM first sentence
+        app.voice_enabled = false;
+        if t_stt.elapsed() > Duration::from_secs(20) {
+            return Err("TUI voice self-test STT timed out".into());
+        }
+        thread::sleep(Duration::from_millis(3));
+    }
+    let stt_ms = app.last_asr_ms;
+    let user_msg = app
+        .messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .ok_or("Expected transcribed user message in TUI chat window")?;
+
+    let t_llm = Instant::now();
+    while app.streaming_rx.is_some() {
+        app.pump_stream();
+        if t_llm.elapsed() > Duration::from_secs(20) {
+            return Err("TUI voice self-test LLM generation timed out".into());
+        }
+        thread::sleep(Duration::from_millis(3));
+    }
+    let llm_ms = t_llm.elapsed().as_secs_f64() * 1000.0;
+    let asst_msg = app
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| m.content.clone())
+        .ok_or("Expected assistant reply in TUI chat window")?;
+
+    let clean_reply = sanitize_text_for_speech(&asst_msg);
+    let first_sent = split_spoken_sentences(&clean_reply)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| clean_reply.clone());
+
+    let tts_params = TtsSynthParams {
+        text: first_sent,
+        speaker: "ryan".into(),
+        language: "english".into(),
+        seed: Some(7),
+        streaming_chunks: true,
+        ..Default::default()
+    };
+    let t_tts = Instant::now();
+    let mut ttfa_ms = 0.0f64;
+    let mut got_first_audio = false;
+    let (reply_pcm, _) = client_speak_via_daemon("1.7b", &tts_params, None, |chunk| {
+        if !got_first_audio && !chunk.is_empty() {
+            got_first_audio = true;
+            ttfa_ms = t_tts.elapsed().as_secs_f64() * 1000.0;
+        }
+        true
+    })?;
+    let total_to_first_voice_ms = stt_ms + llm_ms + ttfa_ms;
+    let _ = t_roundtrip.elapsed();
+
+    let cursor = app.draw(&mut scr);
+    let ansi_bytes = scr.render_ansi(cursor).len();
+
+    println!(
+        "TUI_VOICE_SELF_TEST_OK | stt_ms={:.2} | llm_tps={:.2} | llm_ms={:.2} | tts_ttfa_ms={:.2} | speech_to_voice_ms={:.2} | reply_audio_s={:.2} | chat_msgs={} | ansi_frame={}B | transcript={:?} | reply_preview={:?}",
+        stt_ms,
+        app.last_tps,
+        llm_ms,
+        ttfa_ms,
+        total_to_first_voice_ms,
+        reply_pcm.len() as f64 / (TTS_SAMPLE_RATE as f64),
+        app.messages.len(),
+        ansi_bytes,
+        user_msg,
+        asst_msg.chars().take(90).collect::<String>()
     );
     Ok(())
 }

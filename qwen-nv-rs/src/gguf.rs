@@ -314,13 +314,13 @@ impl GgufFile {
                     *c += 12;
                     // Only materialize large arrays we actually use (`tokenizer.ggml.tokens` & `token_type`),
                     // skipping `merges`/`scores` in ~0.5 ms!
-                    if et == 8 && key == "tokenizer.ggml.tokens" {
+                    if et == 8 && (key == "tokenizer.ggml.tokens" || n <= 64) {
                         let mut v = Vec::with_capacity(n);
                         for _ in 0..n {
                             v.push(read_str(buf, c));
                         }
                         GgufVal::StrArr(v)
-                    } else if (et == 4 || et == 5) && key == "tokenizer.ggml.token_type" {
+                    } else if (et == 4 || et == 5) && (key == "tokenizer.ggml.token_type" || n <= 64) {
                         let mut v = Vec::with_capacity(n);
                         for _ in 0..n {
                             v.push(get_u32(buf, *c) as i32);
@@ -444,6 +444,107 @@ pub fn f32_to_f16_bits(v: f32) -> u16 {
         return sign | (((exp + 1) as u16) << 10);
     }
     sign | ((exp as u16) << 10) | (rounded as u16)
+}
+
+#[inline]
+pub fn f32_to_bf16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    if (bits & 0x7f80_0000) == 0x7f80_0000 && (bits & 0x007f_ffff) != 0 {
+        return ((bits >> 16) as u16) | 0x0040; // preserve quiet NaN
+    }
+    let lsb = (bits >> 16) & 1;
+    let rounding_bias = 0x7fff + lsb;
+    (bits.wrapping_add(rounding_bias) >> 16) as u16
+}
+
+pub fn decode_tensor_f32_req(gguf: &GgufFile, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
+    let info = gguf
+        .tensors
+        .get(name)
+        .ok_or_else(|| format!("Missing required tensor '{}' in GGUF", name))?;
+    let dims = info.dims.clone();
+    let v = decode_1d_f32(gguf, name)?.ok_or_else(|| format!("Missing '{}'", name))?;
+    Ok((v, dims))
+}
+
+pub fn decode_tensor_bf16_req(gguf: &GgufFile, name: &str) -> Result<(Vec<u16>, Vec<usize>), String> {
+    let info = gguf
+        .tensors
+        .get(name)
+        .ok_or_else(|| format!("Missing required tensor '{}' in GGUF", name))?;
+    let nel: usize = info.dims.iter().product();
+    let mut out = Vec::with_capacity(nel);
+    match info.ggml_type {
+        30 => {
+            let raw = gguf.tensor_bytes(info, nel * 2);
+            for i in 0..nel {
+                out.push(get_u16(raw, i * 2));
+            }
+        }
+        1 => {
+            let raw = gguf.tensor_bytes(info, nel * 2);
+            for i in 0..nel {
+                out.push(f32_to_bf16_bits(f16_to_f32(get_u16(raw, i * 2))));
+            }
+        }
+        0 => {
+            let raw = gguf.tensor_bytes(info, nel * 4);
+            for i in 0..nel {
+                out.push(f32_to_bf16_bits(f32::from_bits(get_u32(raw, i * 4))));
+            }
+        }
+        other => return Err(format!("Unsupported ggml_type={} for BF16 load on {}", other, name)),
+    }
+    Ok((out, info.dims.clone()))
+}
+
+pub fn resolve_tts_model_paths(talker_ref: &str, codec_ref: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
+    let talker_url_or_path = match talker_ref {
+        "" | "1.7b" | "1.7b-q8" | "q8_0" | "default" => {
+            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-1.7b-customvoice-Q8_0.gguf"
+        }
+        "1.7b-q4" | "q4_k_m" => {
+            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-1.7b-customvoice-Q4_K_M.gguf"
+        }
+        "1.7b-voicedesign" | "voicedesign" => {
+            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-1.7b-voicedesign-Q8_0.gguf"
+        }
+        "0.6b" | "0.6b-q8" => {
+            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-0.6b-customvoice-Q8_0.gguf"
+        }
+        other => other,
+    };
+    let codec_url_or_path = match codec_ref.unwrap_or("default") {
+        "" | "default" | "12hz" | "bf16" => {
+            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-tokenizer-12hz-BF16.gguf"
+        }
+        other => other,
+    };
+    let talker_path = resolve_model_path(talker_url_or_path)?;
+    let codec_path = resolve_model_path(codec_url_or_path)?;
+    Ok((talker_path, codec_path))
+}
+
+pub fn resolve_asr_model_path(asr_ref: &str) -> Result<PathBuf, String> {
+    let url_or_path = match asr_ref {
+        "" | "1.7b" | "1.7b-q8" | "q8_0" | "default" | "qwen3-asr:1.7b" => {
+            "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/main/Qwen3-ASR-1.7B-Q8_0.gguf"
+        }
+        "1.7b-q4" | "q4_k_m" => {
+            "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/main/Qwen3-ASR-1.7B-Q4_K_M.gguf"
+        }
+        "1.7b-q6" | "q6_k" => {
+            "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/main/Qwen3-ASR-1.7B-Q6_K.gguf"
+        }
+        "0.6b" | "0.6b-q8" | "qwen3-asr:0.6b" => {
+            "https://huggingface.co/handy-computer/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf"
+        }
+        "0.6b-q4" => {
+            "https://huggingface.co/handy-computer/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q4_K_M.gguf"
+        }
+        other => other,
+    };
+    resolve_model_path(url_or_path)
 }
 
 pub fn decode_1d_f32(gguf: &GgufFile, name: &str) -> Result<Option<Vec<f32>>, String> {
@@ -891,6 +992,13 @@ impl BpeTokenizer {
             bytes.extend_from_slice(self.token_bytes(id));
         }
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    pub fn find_token_id(&self, s: &str) -> Option<i32> {
+        if let Some(&id) = self.special_tokens.get(s) {
+            return Some(id);
+        }
+        self.normal_tokens.get(s.as_bytes()).copied()
     }
 }
 

@@ -13,8 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::audio::{encode_wav_pcm16, parse_wav_bytes_mono_16k, TTS_SAMPLE_RATE};
 use crate::engine::{GenerationStats, QwenMegakernelEngine};
 use crate::gguf::Utf8StreamDecoder;
+use crate::lora::LoraStatus;
+use crate::tts::TtsSynthParams;
 
 static SHUTDOWN_REQ: AtomicBool = AtomicBool::new(false);
 
@@ -72,6 +75,21 @@ pub fn format_stats_json(stats: &GenerationStats, token_ids: &[i32]) -> String {
         stats.spec_accepted_extra,
         stats.stop_reason,
         ids_str.join(",")
+    )
+}
+
+pub fn format_lora_json(st: &LoraStatus) -> String {
+    format!(
+        "{{\"active\":{},\"path\":\"{}\",\"rank\":{},\"alpha\":{:.2},\"scale\":{:.4},\
+          \"adapted_tensors\":{},\"vram_bytes\":{},\"swap_ms\":{:.3}}}",
+        st.active,
+        json_escape(&st.path),
+        st.rank,
+        st.alpha,
+        st.scale,
+        st.num_adapted_tensors,
+        st.vram_bytes,
+        st.swap_ms
     )
 }
 
@@ -171,6 +189,248 @@ fn handle_daemon_client(engine: &mut QwenMegakernelEngine, mut stream: UnixStrea
         "STOP" => {
             let _ = stream.write_all(b"BYE\n");
             Ok(true)
+        }
+        "LORA_STATUS" => {
+            let j = format_lora_json(&engine.lora_status);
+            let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+            Ok(false)
+        }
+        "LORA_CLEAR" => {
+            match engine.clear_lora() {
+                Ok(st) => {
+                    let _ = stream.write_all(format!("OK\t{}\n", format_lora_json(&st)).as_bytes());
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                }
+            }
+            Ok(false)
+        }
+        "LORA_LOAD" => {
+            if parts.len() < 3 {
+                let _ = stream.write_all(b"ERR\tMalformed LORA_LOAD\n");
+                return Ok(false);
+            }
+            let scale: f32 = parts[1].parse().unwrap_or(1.0);
+            let path = parts[2..].join("\t");
+            match engine.load_lora(&path, scale) {
+                Ok(st) => {
+                    let _ = stream.write_all(format!("OK\t{}\n", format_lora_json(&st)).as_bytes());
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                }
+            }
+            Ok(false)
+        }
+        "TTS_WARM" => {
+            let tk_ref = parts.get(1).copied().unwrap_or("1.7b");
+            match engine.ensure_tts_loaded(tk_ref) {
+                Ok(()) => {
+                    let tts = engine.tts.as_ref().unwrap();
+                    let _ = stream.write_all(
+                        format!("OK\t{}\t{:.1}\t{}\n", tts.model_name, tts.total_vram_mb, tts.speaker_names().join(",")).as_bytes(),
+                    );
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                }
+            }
+            Ok(false)
+        }
+        "ASR_WARM" => {
+            let asr_ref = parts.get(1).copied().unwrap_or("1.7b");
+            match engine.ensure_asr_loaded(asr_ref) {
+                Ok(()) => {
+                    let asr = engine.asr.as_ref().unwrap();
+                    let vram_mb = (asr.vram_bytes_total as f64) / (1024.0 * 1024.0);
+                    let _ = stream.write_all(
+                        format!("OK\t{}\t{:.1}\n", asr.model_name, vram_mb).as_bytes(),
+                    );
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                }
+            }
+            Ok(false)
+        }
+        "TRANSCRIBE" => {
+            // TRANSCRIBE \t asr_ref \t lang_hint \t n_samples + raw `[n_samples]` f32 LE bytes
+            if parts.len() < 4 {
+                let _ = stream.write_all(b"ERR\tMalformed TRANSCRIBE header\n");
+                return Ok(false);
+            }
+            let asr_ref = parts[1];
+            let lang_hint = parts[2];
+            let n_samples: usize = parts[3].parse().unwrap_or(0);
+            let mut raw = vec![0u8; n_samples * 4];
+            if !raw.is_empty() {
+                stream.read_exact(&mut raw).map_err(|e| e.to_string())?;
+            }
+            let pcm_16k: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))
+                .collect();
+            let lang_opt = if lang_hint.is_empty() || lang_hint.eq_ignore_ascii_case("auto") {
+                None
+            } else {
+                Some(lang_hint)
+            };
+            match engine.transcribe_audio(asr_ref, &pcm_16k, lang_opt) {
+                Ok(stats) => {
+                    let _ = stream.write_all(format!("OK\t{}\n", stats.to_json()).as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+            Ok(false)
+        }
+        "CODEC_DECODE" => {
+            // CODEC_DECODE \t talker_ref \t n_frames + raw `[n_frames * 16]` i32s
+            if parts.len() < 3 {
+                return Err("Malformed CODEC_DECODE".into());
+            }
+            let tk_ref = parts[1];
+            let n_frames: usize = parts[2].parse().unwrap_or(0);
+            let mut raw = vec![0u8; n_frames * 16 * 4];
+            if !raw.is_empty() {
+                stream.read_exact(&mut raw).map_err(|e| e.to_string())?;
+            }
+            let codes: Vec<i32> = raw
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+
+            let res = engine.ensure_tts_loaded(tk_ref).and_then(|_| {
+                let tts = engine.tts.as_mut().unwrap();
+                tts.reset_codec_stream(&mut engine.gpu)?;
+                let t0 = Instant::now();
+                let wav = tts.decode_codes_stream_chunk(&mut engine.gpu, &engine.module, &codes, n_frames)?;
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                Ok((wav, ms))
+            });
+            match res {
+                Ok((wav, ms)) => {
+                    let mut frame = Vec::with_capacity(5 + wav.len() * 4);
+                    frame.push(0x03);
+                    frame.extend_from_slice(&(wav.len() as u32).to_le_bytes());
+                    for &s in &wav {
+                        frame.extend_from_slice(&s.to_le_bytes());
+                    }
+                    let _ = stream.write_all(&frame);
+                    let sj = format!("{{\"frames\":{},\"n_samples\":{},\"codec_ms\":{:.3}}}", n_frames, wav.len(), ms);
+                    let sb = sj.as_bytes();
+                    let mut dframe = Vec::with_capacity(5 + sb.len());
+                    dframe.push(0x02);
+                    dframe.extend_from_slice(&(sb.len() as u32).to_le_bytes());
+                    dframe.extend_from_slice(sb);
+                    let _ = stream.write_all(&dframe);
+                    let _ = stream.flush();
+                }
+                Err(err_msg) => {
+                    let eb = err_msg.as_bytes();
+                    let mut eframe = Vec::with_capacity(5 + eb.len());
+                    eframe.push(0xff);
+                    eframe.extend_from_slice(&(eb.len() as u32).to_le_bytes());
+                    eframe.extend_from_slice(eb);
+                    let _ = stream.write_all(&eframe);
+                }
+            }
+            Ok(false)
+        }
+        "SPEAK" => {
+            // SPEAK \t talker_ref \t speaker \t lang \t max_frames \t temp \t top_k \t rep_pen \t seed_i64 \t streaming
+            if parts.len() < 10 {
+                return Err("Malformed SPEAK header".into());
+            }
+            let tk_ref = parts[1];
+            let speaker = parts[2].to_string();
+            let language = parts[3].to_string();
+            let max_frames: usize = parts[4].parse().unwrap_or(1024);
+            let temperature: f32 = parts[5].parse().unwrap_or(0.9);
+            let top_k: i32 = parts[6].parse().unwrap_or(50);
+            let rep_penalty: f32 = parts[7].parse().unwrap_or(1.05);
+            let seed_raw: i64 = parts[8].parse().unwrap_or(-1);
+            let streaming_chunks: bool = parts[9] == "1";
+
+            let mut ilen_b = [0u8; 4];
+            stream.read_exact(&mut ilen_b).map_err(|e| e.to_string())?;
+            let ilen = u32::from_le_bytes(ilen_b) as usize;
+            let mut ibuf = vec![0u8; ilen];
+            if ilen > 0 {
+                stream.read_exact(&mut ibuf).map_err(|e| e.to_string())?;
+            }
+            let mut tlen_b = [0u8; 4];
+            stream.read_exact(&mut tlen_b).map_err(|e| e.to_string())?;
+            let tlen = u32::from_le_bytes(tlen_b) as usize;
+            let mut tbuf = vec![0u8; tlen];
+            if tlen > 0 {
+                stream.read_exact(&mut tbuf).map_err(|e| e.to_string())?;
+            }
+
+            let params = TtsSynthParams {
+                text: String::from_utf8_lossy(&tbuf).into_owned(),
+                speaker,
+                language,
+                instruct: String::from_utf8_lossy(&ibuf).into_owned(),
+                max_frames,
+                temperature,
+                top_k,
+                top_p: 1.0,
+                rep_penalty,
+                sub_temperature: if temperature <= 0.0 { 0.0 } else { 0.9 },
+                sub_top_k: top_k,
+                sub_top_p: 1.0,
+                seed: if seed_raw >= 0 { Some(seed_raw as u64) } else { None },
+                streaming_chunks,
+            };
+
+            let mut client_alive = true;
+            let synth_res = engine.synthesize_speech(tk_ref, &params, Some(&SHUTDOWN_REQ), |samples| {
+                if samples.is_empty() {
+                    return true;
+                }
+                let mut frame = Vec::with_capacity(5 + samples.len() * 4);
+                frame.push(0x03);
+                frame.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+                for &s in samples {
+                    frame.extend_from_slice(&s.to_le_bytes());
+                }
+                if stream.write_all(&frame).is_err() || stream.flush().is_err() {
+                    client_alive = false;
+                    return false;
+                }
+                true
+            });
+
+            if !client_alive {
+                return Ok(false);
+            }
+
+            match synth_res {
+                Ok((_, stats)) => {
+                    let sj = stats.to_json();
+                    let sb = sj.as_bytes();
+                    let mut dframe = Vec::with_capacity(5 + sb.len());
+                    dframe.push(0x02);
+                    dframe.extend_from_slice(&(sb.len() as u32).to_le_bytes());
+                    dframe.extend_from_slice(sb);
+                    let _ = stream.write_all(&dframe);
+                    let _ = stream.flush();
+                }
+                Err(err_msg) => {
+                    let eb = err_msg.as_bytes();
+                    let mut eframe = Vec::with_capacity(5 + eb.len());
+                    eframe.push(0xff);
+                    eframe.extend_from_slice(&(eb.len() as u32).to_le_bytes());
+                    eframe.extend_from_slice(eb);
+                    let _ = stream.write_all(&eframe);
+                }
+            }
+            Ok(false)
         }
         "GEN" => {
             // GEN \t max_tokens \t temp \t spec \t reset \t mode("chat"|"raw"|"ids")
@@ -441,6 +701,255 @@ where
                 return Err(String::from_utf8_lossy(&eb).into_owned());
             }
             other => return Err(format!("Unexpected daemon frame tag {:#x}", other)),
+        }
+    }
+}
+
+pub fn client_simple_cmd(cmd_line: &str) -> Result<String, String> {
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path)
+        .map_err(|e| format!("Failed to connect to daemon {}: {}", sock_path.display(), e))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+    s.write_all(cmd_line.as_bytes()).map_err(|e| e.to_string())?;
+    s.flush().map_err(|e| e.to_string())?;
+    let mut rdr = BufReader::new(s);
+    let mut reply = String::new();
+    rdr.read_line(&mut reply).map_err(|e| e.to_string())?;
+    let trimmed = reply.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(rest) = trimmed.strip_prefix("OK\t") {
+        Ok(rest.to_string())
+    } else if let Some(err) = trimmed.strip_prefix("ERR\t") {
+        Err(err.to_string())
+    } else {
+        Err(format!("Unexpected daemon reply: {}", trimmed))
+    }
+}
+
+pub fn client_lora_load(path: &str, scale: f32) -> Result<String, String> {
+    client_simple_cmd(&format!("LORA_LOAD\t{:.4}\t{}\n", scale, path))
+}
+
+pub fn client_lora_clear() -> Result<String, String> {
+    client_simple_cmd("LORA_CLEAR\n")
+}
+
+pub fn client_lora_status() -> Result<String, String> {
+    client_simple_cmd("LORA_STATUS\n")
+}
+
+pub fn client_tts_warm(talker_ref: &str) -> Result<String, String> {
+    client_simple_cmd(&format!("TTS_WARM\t{}\n", talker_ref))
+}
+
+pub fn client_asr_warm(asr_ref: &str) -> Result<String, String> {
+    client_simple_cmd(&format!("ASR_WARM\t{}\n", asr_ref))
+}
+
+pub fn client_transcribe_via_daemon(
+    asr_ref: &str,
+    lang_hint: &str,
+    pcm_16k: &[f32],
+) -> Result<(String, String), String> {
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path)
+        .map_err(|e| format!("Failed to connect to daemon {}: {}", sock_path.display(), e))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+
+    let eff_ref = if asr_ref.trim().is_empty() { "1.7b" } else { asr_ref.trim() };
+    let eff_lang = if lang_hint.trim().is_empty() { "auto" } else { lang_hint.trim() };
+    let hdr = format!("TRANSCRIBE\t{}\t{}\t{}\n", eff_ref, eff_lang, pcm_16k.len());
+    let mut req = Vec::with_capacity(hdr.len() + pcm_16k.len() * 4);
+    req.extend_from_slice(hdr.as_bytes());
+    for &smp in pcm_16k {
+        req.extend_from_slice(&smp.to_bits().to_le_bytes());
+    }
+    s.write_all(&req).map_err(|e| e.to_string())?;
+    s.flush().map_err(|e| e.to_string())?;
+
+    let mut rdr = BufReader::new(s);
+    let mut reply = String::new();
+    rdr.read_line(&mut reply).map_err(|e| e.to_string())?;
+    let trimmed = reply.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(stats_json) = trimmed.strip_prefix("OK\t") {
+        let text = stats_json
+            .find("\"text\"")
+            .and_then(|idx| extract_json_str_after(&stats_json[idx + 6..]))
+            .unwrap_or_default();
+        Ok((text, stats_json.to_string()))
+    } else if let Some(err) = trimmed.strip_prefix("ERR\t") {
+        Err(err.to_string())
+    } else {
+        Err(format!("Unexpected TRANSCRIBE reply: {}", trimmed))
+    }
+}
+
+pub fn client_codec_decode_via_daemon(
+    talker_ref: &str,
+    codes_flat: &[i32],
+    n_frames: usize,
+) -> Result<(Vec<f32>, String), String> {
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path)
+        .map_err(|e| format!("Failed to connect to daemon {}: {}", sock_path.display(), e))?;
+    let hdr = format!("CODEC_DECODE\t{}\t{}\n", talker_ref, n_frames);
+    let mut req = Vec::with_capacity(hdr.len() + codes_flat.len() * 4);
+    req.extend_from_slice(hdr.as_bytes());
+    for &c in codes_flat {
+        req.extend_from_slice(&c.to_le_bytes());
+    }
+    s.write_all(&req).map_err(|e| e.to_string())?;
+    s.flush().map_err(|e| e.to_string())?;
+
+    let mut all_samples = Vec::new();
+    loop {
+        let mut tag = [0u8; 1];
+        s.read_exact(&mut tag).map_err(|e| e.to_string())?;
+        match tag[0] {
+            0x03 => {
+                let mut nb = [0u8; 4];
+                s.read_exact(&mut nb).map_err(|e| e.to_string())?;
+                let n = u32::from_le_bytes(nb) as usize;
+                let mut raw = vec![0u8; n * 4];
+                s.read_exact(&mut raw).map_err(|e| e.to_string())?;
+                for c in raw.chunks_exact(4) {
+                    all_samples.push(f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())));
+                }
+            }
+            0x02 => {
+                let mut lb = [0u8; 4];
+                s.read_exact(&mut lb).map_err(|e| e.to_string())?;
+                let jlen = u32::from_le_bytes(lb) as usize;
+                let mut jb = vec![0u8; jlen];
+                s.read_exact(&mut jb).map_err(|e| e.to_string())?;
+                return Ok((all_samples, String::from_utf8_lossy(&jb).into_owned()));
+            }
+            0xff => {
+                let mut lb = [0u8; 4];
+                s.read_exact(&mut lb).map_err(|e| e.to_string())?;
+                let elen = u32::from_le_bytes(lb) as usize;
+                let mut eb = vec![0u8; elen];
+                s.read_exact(&mut eb).map_err(|e| e.to_string())?;
+                return Err(String::from_utf8_lossy(&eb).into_owned());
+            }
+            other => return Err(format!("Unexpected CODEC_DECODE tag {:#x}", other)),
+        }
+    }
+}
+
+pub fn client_speak_via_daemon<F>(
+    talker_ref: &str,
+    params: &TtsSynthParams,
+    cancel: Option<&AtomicBool>,
+    mut on_audio_chunk: F,
+) -> Result<(Vec<f32>, String), String>
+where
+    F: FnMut(&[f32]) -> bool,
+{
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path)
+        .map_err(|e| format!("Failed to connect to daemon {}: {}", sock_path.display(), e))?;
+    let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+
+    let seed_i64 = params.seed.map(|v| v as i64).unwrap_or(-1);
+    let hdr = format!(
+        "SPEAK\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{}\t{}\n",
+        if talker_ref.is_empty() { "1.7b" } else { talker_ref },
+        if params.speaker.is_empty() { "ryan" } else { &params.speaker },
+        if params.language.is_empty() { "english" } else { &params.language },
+        params.max_frames,
+        params.temperature,
+        params.top_k,
+        params.rep_penalty,
+        seed_i64,
+        u8::from(params.streaming_chunks),
+    );
+    let ib = params.instruct.as_bytes();
+    let tb = params.text.as_bytes();
+    let mut req = Vec::with_capacity(hdr.len() + 8 + ib.len() + tb.len());
+    req.extend_from_slice(hdr.as_bytes());
+    req.extend_from_slice(&(ib.len() as u32).to_le_bytes());
+    req.extend_from_slice(ib);
+    req.extend_from_slice(&(tb.len() as u32).to_le_bytes());
+    req.extend_from_slice(tb);
+    s.write_all(&req).map_err(|e| e.to_string())?;
+    s.flush().map_err(|e| e.to_string())?;
+
+    let read_exact_opt_cancel = |sock: &mut UnixStream, mut dst: &mut [u8]| -> Result<bool, String> {
+        while !dst.is_empty() {
+            if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+                return Ok(false);
+            }
+            match sock.read(dst) {
+                Ok(0) => return Err("Daemon connection closed unexpectedly during SPEAK".into()),
+                Ok(n) => dst = &mut dst[n..],
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(format!("Daemon SPEAK read error: {}", e)),
+            }
+        }
+        Ok(true)
+    };
+
+    let mut all_samples = Vec::<f32>::new();
+    let mut chunk_buf = Vec::<f32>::new();
+    loop {
+        if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+            return Ok((all_samples, "{\"cancelled\":true}".into()));
+        }
+        let mut tag = [0u8; 1];
+        if !read_exact_opt_cancel(&mut s, &mut tag)? {
+            return Ok((all_samples, "{\"cancelled\":true}".into()));
+        }
+        match tag[0] {
+            0x03 => {
+                let mut nb = [0u8; 4];
+                if !read_exact_opt_cancel(&mut s, &mut nb)? {
+                    return Ok((all_samples, "{\"cancelled\":true}".into()));
+                }
+                let n_samp = u32::from_le_bytes(nb) as usize;
+                let mut raw = vec![0u8; n_samp * 4];
+                if n_samp > 0 && !read_exact_opt_cancel(&mut s, &mut raw)? {
+                    return Ok((all_samples, "{\"cancelled\":true}".into()));
+                }
+                chunk_buf.clear();
+                chunk_buf.reserve(n_samp);
+                for c in raw.chunks_exact(4) {
+                    chunk_buf.push(f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())));
+                }
+                all_samples.extend_from_slice(&chunk_buf);
+                if !on_audio_chunk(&chunk_buf) {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                    return Ok((all_samples, "{\"cancelled\":true}".into()));
+                }
+            }
+            0x02 => {
+                let mut lb = [0u8; 4];
+                if !read_exact_opt_cancel(&mut s, &mut lb)? {
+                    return Ok((all_samples, "{\"cancelled\":true}".into()));
+                }
+                let jlen = u32::from_le_bytes(lb) as usize;
+                let mut jb = vec![0u8; jlen];
+                if jlen > 0 && !read_exact_opt_cancel(&mut s, &mut jb)? {
+                    return Ok((all_samples, "{\"cancelled\":true}".into()));
+                }
+                return Ok((all_samples, String::from_utf8_lossy(&jb).into_owned()));
+            }
+            0xff => {
+                let mut lb = [0u8; 4];
+                let _ = read_exact_opt_cancel(&mut s, &mut lb)?;
+                let elen = u32::from_le_bytes(lb) as usize;
+                let mut eb = vec![0u8; elen];
+                let _ = read_exact_opt_cancel(&mut s, &mut eb)?;
+                return Err(String::from_utf8_lossy(&eb).into_owned());
+            }
+            other => return Err(format!("Unexpected daemon SPEAK frame tag {:#x}", other)),
         }
     }
 }
@@ -785,6 +1294,124 @@ fn handle_http_conn(engine: &mut QwenMegakernelEngine, mut stream: TcpStream, sp
                 resp_json
             );
             let _ = stream.write_all(http.as_bytes());
+        }
+        return Ok(());
+    }
+
+    if method == "POST" && path.starts_with("/v1/audio/speech") {
+        let body_str = String::from_utf8_lossy(&body);
+        let input = body_str
+            .find("\"input\"")
+            .and_then(|i| extract_json_str_after(&body_str[i + 7..]))
+            .unwrap_or_default();
+        if input.trim().is_empty() {
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            return Ok(());
+        }
+        let voice = body_str
+            .find("\"voice\"")
+            .and_then(|i| extract_json_str_after(&body_str[i + 7..]))
+            .unwrap_or_else(|| "ryan".into());
+        let voice_mapped = match voice.as_str() {
+            "alloy" | "echo" | "onyx" => "ryan",
+            "nova" | "shimmer" => "serena",
+            "fable" => "aiden",
+            other => other,
+        }
+        .to_string();
+        let instruct = body_str
+            .find("\"instructions\"")
+            .and_then(|i| extract_json_str_after(&body_str[i + 14..]))
+            .unwrap_or_default();
+
+        let params = TtsSynthParams {
+            text: input,
+            speaker: voice_mapped,
+            language: "auto".into(),
+            instruct,
+            streaming_chunks: false,
+            ..Default::default()
+        };
+
+        match engine.synthesize_speech("1.7b", &params, Some(&SHUTDOWN_REQ), |_| true) {
+            Ok((samples, _stats)) => {
+                let wav_bytes = encode_wav_pcm16(&samples, TTS_SAMPLE_RATE);
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n",
+                    wav_bytes.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(&wav_bytes);
+            }
+            Err(e) => {
+                let err_j = format!("{{\"error\":\"{}\"}}", json_escape(&e));
+                let hdr = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    err_j.len(),
+                    err_j
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+            }
+        }
+        return Ok(());
+    }
+
+    if method == "POST" && path.starts_with("/v1/audio/transcriptions") {
+        // Support both raw RIFF WAV body (`--data-binary @clip.wav`) and `multipart/form-data` (`-F file=@clip.wav`)
+        let wav_slice: Option<&[u8]> = if body.starts_with(b"RIFF") {
+            Some(&body)
+        } else {
+            body.windows(12)
+                .position(|w| &w[0..4] == b"RIFF" && &w[8..12] == b"WAVE")
+                .and_then(|off| {
+                    if off + 8 <= body.len() {
+                        let riff_sz = u32::from_le_bytes(body[off + 4..off + 8].try_into().unwrap()) as usize;
+                        let end = (off + 8 + riff_sz).min(body.len());
+                        Some(&body[off..end])
+                    } else {
+                        None
+                    }
+                })
+        };
+
+        let Some(wav_bytes) = wav_slice else {
+            let err_j = "{\"error\":\"Expected RIFF WAV audio body or multipart file upload\"}";
+            let hdr = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                err_j.len(),
+                err_j
+            );
+            let _ = stream.write_all(hdr.as_bytes());
+            return Ok(());
+        };
+
+        let pcm_res = parse_wav_bytes_mono_16k(wav_bytes);
+        let res = pcm_res.and_then(|pcm| engine.transcribe_audio("1.7b", &pcm, None));
+        match res {
+            Ok(stats) => {
+                let resp_j = format!(
+                    "{{\"text\":\"{}\",\"language\":\"{}\",\"duration\":{:.3},\"total_ms\":{:.2}}}",
+                    json_escape(&stats.text),
+                    json_escape(&stats.detected_language),
+                    stats.audio_sec,
+                    stats.total_ms
+                );
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                    resp_j.len(),
+                    resp_j
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+            }
+            Err(e) => {
+                let err_j = format!("{{\"error\":\"{}\"}}", json_escape(&e));
+                let hdr = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    err_j.len(),
+                    err_j
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+            }
         }
         return Ok(());
     }

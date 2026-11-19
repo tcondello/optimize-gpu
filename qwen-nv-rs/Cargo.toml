@@ -1,8 +1,8 @@
 [package]
 name = "qwen-nv"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
-description = "Zero-Docker, Zero-Middleware Native macOS ARM64 Rust Runtime & GA102 (sm_86) Persistent Megakernel Engine for Qwen on Thunderbolt NVIDIA eGPUs"
+description = "Zero-Docker, Zero-Middleware Native macOS ARM64 Rust Runtime & GA102 (sm_86) Persistent Megakernel Engine for Modular Qwen Text + Qwen3-ASR-1.7B STT + Qwen3-TTS-1.7B + Fused Rank-r LoRA on Thunderbolt NVIDIA eGPUs"
 
 [[bin]]
 name = "qwen-nv"

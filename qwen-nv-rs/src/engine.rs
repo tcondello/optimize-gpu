@@ -5,12 +5,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{fence, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::asr::{AsrStats, QwenAsrEngine};
 use crate::gguf::{
     decode_1d_f32, extract_quant_weight_bytes, precompute_freqs_cis_f32, resolve_model_path, BpeTokenizer, GgufFile,
     QwenModelConfig,
 };
+use crate::lora::{
+    prepare_lora_from_path, LoraStatus, QwenLayerLoraDesc, LORA_ARENA_DEFAULT_BYTES,
+};
 use crate::nv_defs::{put_u32, put_u64};
 use crate::nv_hw::{CubinModule, HostMappedBuffer, NvGpu, VramBuffer};
+use crate::tts::{QwenTtsEngine, TtsStats, TtsSynthParams};
 
 pub static EMBEDDED_CUBIN: &[u8] = include_bytes!("../kernels/qwen_sm86_megakernel.cubin");
 
@@ -51,6 +56,9 @@ pub struct QwenLayerDesc {
     pub down_type: i32,
     pub split_v: i32,
     pub split_gate_up: i32,
+
+    pub lora_ptr: u64,
+    pub _pad_lora: u64,
 }
 
 #[repr(C, align(16))]
@@ -91,6 +99,11 @@ pub struct QwenModelDesc {
     pub stop_id1: i32,
     pub stop_id2: i32,
     pub stop_id3: i32,
+
+    pub ws_ext_embed: u64,
+    pub ws_hidden_last: u64,
+    pub ws_logits_out: u64,
+    pub _pad_model: u64,
 }
 
 #[repr(C, align(64))]
@@ -106,6 +119,8 @@ pub struct QwenDecodeCtrl {
     pub stop_reason: i32,
     pub spec_tokens_in: [i32; 4],
     pub spec_tokens_out: [i32; 4],
+    pub export_logits: i32,
+    pub _pad_ctrl: [i32; 3],
     pub tokens_out: [i32; 4096],
 }
 
@@ -193,7 +208,15 @@ pub struct QwenMegakernelEngine {
     // Keep VRAM allocations alive for the lifetime of the engine
     _owned_vram: Vec<VramBuffer>,
     layers_host: Vec<QwenLayerDesc>,
+    layers_gpu: VramBuffer,
     model_desc_gpu: VramBuffer,
+
+    // Dynamic Rank-r (`r <= 32`) LoRA arena & co-resident 100%-GPU TTS + ASR engines
+    lora_arena: Option<VramBuffer>,
+    lora_descs_host: Vec<QwenLayerLoraDesc>,
+    pub lora_status: LoraStatus,
+    pub tts: Option<QwenTtsEngine>,
+    pub asr: Option<QwenAsrEngine>,
 
     // Scratch workspace buffers (sized for both `PREFILL_MAX_CHUNK=64` and `BM=4` / `T=1`)
     ws_x_res: VramBuffer,
@@ -218,8 +241,8 @@ pub struct QwenMegakernelEngine {
 
 impl QwenMegakernelEngine {
     pub fn load(model_ref: &str, max_context: usize) -> Result<Self, String> {
-        assert_eq!(std::mem::size_of::<QwenLayerDesc>(), 160);
-        assert_eq!(std::mem::size_of::<QwenModelDesc>(), 192);
+        assert_eq!(std::mem::size_of::<QwenLayerDesc>(), 176);
+        assert_eq!(std::mem::size_of::<QwenModelDesc>(), 224);
 
         let t0 = Instant::now();
         let local_path = resolve_model_path(model_ref)?;
@@ -477,7 +500,6 @@ impl QwenMegakernelEngine {
         let layers_gpu = gpu.alloc_vram(layers_bytes.len() as u64)?;
         gpu.upload_to_vram(&layers_gpu, 0, layers_bytes)?;
         let layers_ptr_va = layers_gpu.va_addr;
-        owned_vram.push(layers_gpu);
 
         // Allocate L2/VRAM scratch buffers
         let q_dim = cfg.n_heads * cfg.head_dim;
@@ -544,6 +566,10 @@ impl QwenMegakernelEngine {
             stop_id1: sids[1],
             stop_id2: sids[2],
             stop_id3: sids[3],
+            ws_ext_embed: 0,
+            ws_hidden_last: 0,
+            ws_logits_out: 0,
+            _pad_model: 0,
         };
         let mdesc_bytes = unsafe {
             std::slice::from_raw_parts(&mdesc as *const QwenModelDesc as *const u8, std::mem::size_of::<QwenModelDesc>())
@@ -565,6 +591,8 @@ impl QwenMegakernelEngine {
             t0.elapsed().as_secs_f64()
         );
 
+        let num_layers_cfg = cfg.num_layers;
+
         Ok(Self {
             gpu,
             module,
@@ -573,7 +601,13 @@ impl QwenMegakernelEngine {
             model_ref: model_ref.to_string(),
             _owned_vram: owned_vram,
             layers_host,
+            layers_gpu,
             model_desc_gpu,
+            lora_arena: None,
+            lora_descs_host: vec![QwenLayerLoraDesc::default(); num_layers_cfg],
+            lora_status: LoraStatus::default(),
+            tts: None,
+            asr: None,
             ws_x_res,
             ws_x_res2,
             ws_xq,
@@ -596,6 +630,175 @@ impl QwenMegakernelEngine {
 
     pub fn reset_cache(&mut self) {
         self.cached_kv_tokens.clear();
+    }
+
+    // -------------------------------------------------------------------------
+    // Dynamic Fused Rank-r (`r <= 32`) LoRA Hot-Swap (`< 1 ms` VRAM update!)
+    // -------------------------------------------------------------------------
+
+    pub fn load_lora(&mut self, path: &str, user_scale: f32) -> Result<LoraStatus, String> {
+        let q_dim = self.cfg.n_heads * self.cfg.head_dim;
+        let kv_dim = self.cfg.n_kv_heads * self.cfg.head_dim;
+        let mut prep = prepare_lora_from_path(
+            path,
+            user_scale,
+            self.cfg.num_layers,
+            self.cfg.dim,
+            self.cfg.hidden_dim,
+            q_dim,
+            kv_dim,
+        )?;
+
+        let need_bytes = (prep.arena_bytes.len() as u64).max(LORA_ARENA_DEFAULT_BYTES);
+        let need_realloc = self.lora_arena.as_ref().map_or(true, |b| b.size < need_bytes);
+        if need_realloc {
+            self.lora_arena = Some(self.gpu.alloc_vram(need_bytes)?);
+        }
+        let t_swap = Instant::now();
+        let arena_va = self.lora_arena.as_ref().unwrap().va_addr;
+
+        // Patch relative `a_f16`/`b_f16` offsets into absolute GPU virtual addresses
+        let desc_sz = std::mem::size_of::<QwenLayerLoraDesc>();
+        for (l, ld_lora) in prep.layer_descs.iter_mut().enumerate() {
+            for p in &mut ld_lora.projs {
+                if p.rank > 0 {
+                    p.a_f16 += arena_va;
+                    p.b_f16 += arena_va;
+                }
+            }
+            let src = unsafe {
+                std::slice::from_raw_parts(ld_lora as *const QwenLayerLoraDesc as *const u8, desc_sz)
+            };
+            prep.arena_bytes[l * desc_sz..(l + 1) * desc_sz].copy_from_slice(src);
+            self.layers_host[l].lora_ptr = if ld_lora.active_mask != 0 {
+                arena_va + (l * desc_sz) as u64
+            } else {
+                0
+            };
+        }
+
+        let arena_ref = self.lora_arena.as_ref().unwrap();
+        // Copy borrow before mutably calling `self.gpu.upload_to_vram`:
+        let arena_buf = VramBuffer {
+            va_addr: arena_ref.va_addr,
+            size: arena_ref.size,
+            paddrs: arena_ref.paddrs.clone(),
+        };
+        self.gpu.upload_to_vram(&arena_buf, 0, &prep.arena_bytes)?;
+
+        let layers_bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.layers_host.as_ptr() as *const u8,
+                self.layers_host.len() * std::mem::size_of::<QwenLayerDesc>(),
+            )
+        };
+        let layers_buf = VramBuffer {
+            va_addr: self.layers_gpu.va_addr,
+            size: self.layers_gpu.size,
+            paddrs: self.layers_gpu.paddrs.clone(),
+        };
+        self.gpu.upload_to_vram(&layers_buf, 0, layers_bytes)?;
+        self.reset_cache();
+
+        let swap_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
+        self.lora_descs_host = prep.layer_descs;
+        self.lora_status = LoraStatus {
+            active: true,
+            path: path.to_string(),
+            rank: prep.rank,
+            alpha: prep.alpha,
+            scale: prep.scale,
+            num_adapted_tensors: prep.num_adapted_tensors,
+            vram_bytes: prep.arena_bytes.len(),
+            swap_ms,
+        };
+        Ok(self.lora_status.clone())
+    }
+
+    pub fn clear_lora(&mut self) -> Result<LoraStatus, String> {
+        let t_swap = Instant::now();
+        for l in 0..self.cfg.num_layers {
+            self.layers_host[l].lora_ptr = 0;
+            self.lora_descs_host[l] = QwenLayerLoraDesc::default();
+        }
+        let layers_bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.layers_host.as_ptr() as *const u8,
+                self.layers_host.len() * std::mem::size_of::<QwenLayerDesc>(),
+            )
+        };
+        let layers_buf = VramBuffer {
+            va_addr: self.layers_gpu.va_addr,
+            size: self.layers_gpu.size,
+            paddrs: self.layers_gpu.paddrs.clone(),
+        };
+        self.gpu.upload_to_vram(&layers_buf, 0, layers_bytes)?;
+        self.reset_cache();
+        let swap_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
+        self.lora_status = LoraStatus {
+            active: false,
+            swap_ms,
+            ..Default::default()
+        };
+        Ok(self.lora_status.clone())
+    }
+
+    // -------------------------------------------------------------------------
+    // Co-Resident 100%-on-RTX-3080 `Qwen3-TTS-12Hz-1.7B` Engine
+    // -------------------------------------------------------------------------
+
+    pub fn ensure_tts_loaded(&mut self, talker_ref: &str) -> Result<(), String> {
+        let eff_ref = if talker_ref.trim().is_empty() { "1.7b" } else { talker_ref.trim() };
+        if let Some(ref existing) = self.tts {
+            if existing.talker_ref == eff_ref {
+                return Ok(());
+            }
+        }
+        let tts_engine = QwenTtsEngine::load(&mut self.gpu, eff_ref, None)?;
+        self.tts = Some(tts_engine);
+        Ok(())
+    }
+
+    pub fn synthesize_speech<F>(
+        &mut self,
+        talker_ref: &str,
+        params: &TtsSynthParams,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        on_chunk: F,
+    ) -> Result<(Vec<f32>, TtsStats), String>
+    where
+        F: FnMut(&[f32]) -> bool,
+    {
+        self.ensure_tts_loaded(talker_ref)?;
+        let tts = self.tts.as_mut().unwrap();
+        tts.synthesize(&mut self.gpu, &self.module, params, cancel, on_chunk)
+    }
+
+    // -------------------------------------------------------------------------
+    // Co-Resident 100%-on-RTX-3080 `Qwen3-ASR-1.7B` Speech-to-Text Engine
+    // -------------------------------------------------------------------------
+
+    pub fn ensure_asr_loaded(&mut self, asr_ref: &str) -> Result<(), String> {
+        let eff_ref = if asr_ref.trim().is_empty() { "1.7b" } else { asr_ref.trim() };
+        if let Some(ref existing) = self.asr {
+            if existing.asr_ref == eff_ref {
+                return Ok(());
+            }
+        }
+        let asr_engine = QwenAsrEngine::load(&mut self.gpu, eff_ref)?;
+        self.asr = Some(asr_engine);
+        Ok(())
+    }
+
+    pub fn transcribe_audio(
+        &mut self,
+        asr_ref: &str,
+        pcm_16k: &[f32],
+        language_hint: Option<&str>,
+    ) -> Result<AsrStats, String> {
+        self.ensure_asr_loaded(asr_ref)?;
+        let asr = self.asr.as_mut().unwrap();
+        asr.transcribe(&mut self.gpu, &self.module, pcm_16k, language_hint)
     }
 
     pub fn encode_chat(&self, messages: &[(String, String)], enable_thinking: bool) -> Vec<i32> {
@@ -639,10 +842,44 @@ impl QwenMegakernelEngine {
         let k_embed = &self.module.kernels["qwen_prefill_embed"];
         let k_rms = &self.module.kernels["qwen_prefill_rmsnorm_q8_1"];
         let k_gemm = &self.module.kernels["qwen_prefill_gemm"];
+        let k_lora = &self.module.kernels["qwen_prefill_lora_add"];
         let k_qknorm = &self.module.kernels["qwen_prefill_qknorm_rope_kv"];
         let k_flash = &self.module.kernels["qwen_prefill_flash_gqa"];
         let k_quant = &self.module.kernels["qwen_prefill_quant_q8_1"];
         let k_swiglu = &self.module.kernels["qwen_prefill_swiglu_q8_1"];
+
+        let push_lora_qmd = |gpu: &mut NvGpu,
+                             chain: &mut Vec<(u64, usize)>,
+                             out_va: u64,
+                             p: &crate::lora::QwenProjLora,
+                             x_q8_va: u64,
+                             x_ds_va: u64,
+                             m_rows: i32,
+                             out_stride: i32,
+                             col_off: i32| {
+            if p.rank <= 0 {
+                return;
+            }
+            let mut a = [0u8; 64];
+            put_u64(&mut a, 0, out_va);
+            put_u64(&mut a, 8, p.a_f16);
+            put_u64(&mut a, 16, p.b_f16);
+            put_u64(&mut a, 24, x_q8_va);
+            put_u64(&mut a, 32, x_ds_va);
+            put_u32(&mut a, 40, m_rows as u32);
+            put_u32(&mut a, 44, p.n_rows as u32);
+            put_u32(&mut a, 48, p.k_cols as u32);
+            put_u32(&mut a, 52, p.rank as u32);
+            put_u32(&mut a, 56, out_stride as u32);
+            put_u32(&mut a, 60, col_off as u32);
+            chain.push(gpu.prepare_qmd(
+                k_lora,
+                (((p.n_rows as u32) + 255) / 256, m_rows as u32, 1),
+                (256, 1, 1),
+                &a,
+                None,
+            ));
+        };
 
         let dim = self.cfg.dim as i32;
         let hidden_dim = self.cfg.hidden_dim as i32;
@@ -722,6 +959,18 @@ impl QwenMegakernelEngine {
                     &a_v,
                     None,
                 ));
+            }
+
+            if self.lora_status.active && (self.lora_descs_host[l].active_mask & 0x07) != 0 {
+                let ldesc = self.lora_descs_host[l];
+                let qk_stride = if ld.split_v == 0 { q_dim + 2 * kv_dim } else { q_dim + kv_dim };
+                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_qkv.va_addr, &ldesc.projs[0], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, qk_stride, 0);
+                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_qkv.va_addr, &ldesc.projs[1], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, qk_stride, q_dim);
+                if ld.split_v == 0 {
+                    push_lora_qmd(&mut self.gpu, &mut chain, self.ws_qkv.va_addr, &ldesc.projs[2], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, qk_stride, q_dim + kv_dim);
+                } else {
+                    push_lora_qmd(&mut self.gpu, &mut chain, self.ws_v_sep.va_addr, &ldesc.projs[2], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, kv_dim, 0);
+                }
             }
 
             // Fused QK-RMSNorm + RoPE + KV Cache Write
@@ -813,6 +1062,10 @@ impl QwenMegakernelEngine {
                 &a_wo,
                 None,
             ));
+            if self.lora_status.active && (self.lora_descs_host[l].active_mask & 0x08) != 0 {
+                let p = self.lora_descs_host[l].projs[3];
+                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_x_res2.va_addr, &p, self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, dim, 0);
+            }
 
             // FFN RMSNorm + Q8_1
             let mut a_rms2 = [0u8; 40];
@@ -844,6 +1097,11 @@ impl QwenMegakernelEngine {
                 &a_gu,
                 None,
             ));
+            if self.lora_status.active && (self.lora_descs_host[l].active_mask & 0x30) != 0 {
+                let ldesc = self.lora_descs_host[l];
+                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_gate_up.va_addr, &ldesc.projs[4], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, gu_n, 0);
+                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_gate_up.va_addr, &ldesc.projs[5], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, gu_n, hidden_dim);
+            }
 
             // SwiGLU + Q8_1
             let ffn_blks = (t_len * (hidden_dim as usize)) / 32;
@@ -880,6 +1138,10 @@ impl QwenMegakernelEngine {
                 &a_dn,
                 None,
             ));
+            if self.lora_status.active && (self.lora_descs_host[l].active_mask & 0x40) != 0 {
+                let p = self.lora_descs_host[l].projs[6];
+                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_x_res.va_addr, &p, self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, dim, 0);
+            }
         }
 
         // Attach timeline release0 to the tail QMD and link the entire chain in hardware!
@@ -987,6 +1249,7 @@ impl QwenMegakernelEngine {
                         (*ctrl_ptr).steps_completed = 0;
                         (*ctrl_ptr).spec_tokens_in = [cur_tok, draft[0], draft[1], draft[2]];
                         (*ctrl_ptr).spec_tokens_out = [0; 4];
+                        (*ctrl_ptr).export_logits = 0;
                     }
                     fence(Ordering::SeqCst);
 
@@ -1062,6 +1325,7 @@ impl QwenMegakernelEngine {
                 (*ctrl_ptr).error_code = 0;
                 (*ctrl_ptr).steps_completed = 0;
                 (*ctrl_ptr).stop_reason = 0;
+                (*ctrl_ptr).export_logits = 0;
             }
             fence(Ordering::SeqCst);
 

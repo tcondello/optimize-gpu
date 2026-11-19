@@ -1,8 +1,12 @@
-# `optimize-gpu` — 260 tok/s Qwen Inference on an Apple Silicon MacBook Pro + NVIDIA RTX 3080 Thunderbolt eGPU
+# `optimize-gpu` — 277 tok/s Qwen Text + 42.7x Real-Time STT + 6.0x Streaming TTS (`26 ms` TTFA) + Fused LoRA on an Apple Silicon MacBook Pro + NVIDIA RTX 3080 Thunderbolt eGPU
 
-**Zero Docker. Zero Python. Zero external Rust crates. Zero model modifications.**
+**Zero Docker. Zero Python. Zero external Rust crates. Zero model modifications. 100% of neural & DSP inference on the RTX 3080.**
 
-A native `aarch64-apple-darwin` Rust GPU runtime, persistent daemon, TrueColor Terminal UI (`qwen-tui`), and custom **NVIDIA Ampere (`GA102`, `sm_86`, 68 SMs) persistent CUDA megakernel** that takes `Qwen3-4B-Instruct-2507` (`Q4_K_M`, `2.50 GB`) on a Thunderbolt 3 RTX 3080 eGPU from **`8.51 tok/s` to `172.8 – 260.1 tok/s`** (`20.5x – 30.6x` speedup) while cutting warm invocation latency from **`10.5 s` to `< 2 ms`**.
+A native `aarch64-apple-darwin` Rust GPU runtime, persistent co-resident daemon, TrueColor Voice+Text Terminal UI ([`qwen-tui`](./qwen-tui)), CLI speech recognizer ([`qwen-listen`](./qwen-listen)), CLI speech synthesizer ([`qwen-speak`](./qwen-speak)), and custom **NVIDIA Ampere (`GA102`, `sm_86`, 68 SMs) persistent CUDA megakernel suite** running **co-resident inside 10 GB GDDR6X (`8.65 GB` used, `0 ms` swap)**:
+1. **`Qwen3-4B-Instruct-2507` (`Q4_K_M`, `2.50 GB`)** from `8.51 tok/s` to **`167.3 – 277.5 tok/s`** (`20.5x – 32.6x` speedup, `< 1 ms` warm daemon ping),
+2. **Fused Dynamic Rank-$r$ (`r \le 32`) PEFT LoRA** hot-swapping onto the base Thinker in **`5.1 ms` DMA / `44 µs` clear** (`0.0%` overhead when inactive, `96` registers preserved),
+3. **Co-Resident 100%-on-RTX-3080 `Qwen3-TTS-12Hz-1.7B` (`Q8_0`, `2.68 GB` w/ `BF16` `Code2Wav`)** streaming `24 kHz` speech at **`6.05x` real-time (`RTF = 0.165`)** with **`26.0 – 39.7 ms` Time-To-First-Audio (`43.6x – 144.9x` faster TTFA than M3 Pro Metal)**, and
+4. **Co-Resident 100%-on-RTX-3080 `Qwen3-ASR-1.7B` (`Q8_0`, `2.75 GB`, `1.62%` LibriSpeech WER)** transcribing `16 kHz` speech (including GPU Hann STFT + Slaney Mel + `NHWC` `Conv2d` + `24L` `AuT` Encoder + `28L` `Qwen3` Megakernel) at **`36.1x – 42.7x` real-time (`2.63x – 3.14x` faster than M3 Pro Metal)** with **`442 – 511 ms` total Speech-In $\rightarrow$ AI-Voice-Out turnaround**.
 
 ---
 
@@ -20,6 +24,46 @@ All Phase 2 numbers were measured with **Docker Desktop completely shut down (`0
 | **Phase 2**: Native Rust + `sm_86` Megakernel ([`qwen-nv`](./qwen-nv-rs)) | **NO (`0` containers)** | **5.97 ms CLI (`~1.9 ms` IPC)** | **2 (`1` prefill + `1` megakernel)** | **172.83 tok/s (`5.79 ms`, `174.2` e2e)** | **260.14 tok/s (`3.84 ms`, `4/4` exact)** | **431.6 GB/s (`56.8%` `T=1`) / `649.6 GB/s` eff.** | **20.5x – 30.6x** |
 
 > **100% Pure Serving Layer**: The model weights (`Qwen3-4B-Instruct-2507-Q4_K_M.gguf`, `2,497,281,120` bytes, SHA-256 `3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597`) are opened strictly read-only (`PROT_READ` `mmap`). Zero layers are pruned, zero weights are re-quantized, all 36 layers + FP16 KV cache run in full precision, and `BM=4` speculative verification is 100% mathematically lossless (`argmax` bit-identical to `T=1`).
+
+---
+
+## Phase 3 Verified Benchmark: Co-Resident `Qwen3-TTS-12Hz-1.7B` (`Q8_0`) + Fused Rank-16 LoRA
+
+Measured with **Docker Desktop completely OFF** via [`benchmark_phase3_tts.py`](./benchmark_phase3_tts.py) (raw telemetry in [`benchmark_phase3_results.json`](./benchmark_phase3_results.json)). Both engines ran on the **exact same GGUF files** (`qwen-talker-1.7b-customvoice-Q8_0.gguf` `1.95 GB` + `qwen-tokenizer-12hz-BF16.gguf` `342 MB`). Every neural layer (`28L` Talker + `5L x 15-step` `CodePredictor` + Split-RVQ + `8L` Sliding-Window Transformer + `2x` ConvNeXt + `4-stage` `SnakeBeta` `Code2Wav`) runs **100% on the RTX 3080** (`0.999990` cosine similarity / `46.80 dB` SNR vs `BF16` reference; `0.000000` streaming-vs-batch RMSE):
+
+| Utterance (`24 kHz` Mono) | Backend | 1st Frame Codes | Playable TTFA | AR (`Talker` + `15x CP`) | `Code2Wav` | Total Time | `RTF` | Speed vs Real-Time |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Short** (`~2.8s`) | Apple M3 Pro (`qwentts.cpp` `MTL0`) | 60.6 ms | 1,135.1 ms | 31.90 ms/f | 111.3 ms | 1,135.1 ms | 0.458 | 2.18x |
+| **Short** (`~2.8s`) | **RTX 3080 (`qwen-nv` `sm_86`)** | **19.9 ms** | **26.0 ms (`43.6x`)** | **11.05 ms/f (`2.89x`)** | **73.1 ms** | **505.7 ms** | **0.167** | **5.99x (`2.74x`)** |
+| **Medium** (`~6.0s`) | Apple M3 Pro (`qwentts.cpp` `MTL0`) | 61.6 ms | 2,863.1 ms | 31.77 ms/f | 265.3 ms | 2,863.1 ms | 0.443 | 2.26x |
+| **Medium** (`~6.0s`) | **RTX 3080 (`qwen-nv` `sm_86`)** | **24.6 ms** | **30.7 ms (`93.2x`)** | **11.09 ms/f (`2.86x`)** | **131.2 ms** | **925.6 ms** | **0.165** | **6.05x (`2.68x`)** |
+| **Long** (`~13.1s`) | Apple M3 Pro (`qwentts.cpp` `MTL0`) | 78.1 ms | 5,746.3 ms | 31.41 ms/f | 515.7 ms | 5,746.3 ms | 0.439 | 2.28x |
+| **Long** (`~13.1s`) | **RTX 3080 (`qwen-nv` `sm_86`)** | **33.5 ms** | **39.7 ms (`144.9x`)** | **11.18 ms/f (`2.81x`)** | **303.3 ms** | **2,163.2 ms** | **0.165** | **6.05x (`2.66x`)** |
+
+- **Co-Resident Live Voice Turn (`Qwen3-4B` $\rightarrow$ `Qwen3-TTS-1.7B`, `0 ms` Model Swap)**: `52`-token answer generated in `351.3 ms` + `36.2 ms` first-sentence TTS TTFA = **`387.6 ms` prompt-to-spoken-voice** while `Qwen3-4B` maintains **`268.7 tok/s`** (`BM=4`) / **`164.8–175.0 tok/s`** (`T=1`).
+- **Fused Dynamic Rank-16 PEFT LoRA**: `5.07 ms` PCIe DMA hot-swap (`144` FP16 matrices across 36 layers), **`44 µs` clear**, `148.8 tok/s` (`T=1`) / `188.4 tok/s` (`BM=4`) when active, `128/128` bit-exact token parity at `scale=0` and after `clear`.
+
+---
+
+## Phase 4 Verified Benchmark: Co-Resident `Qwen3-ASR-1.7B` (`Q8_0`) Speech-to-Text + Full Voice TUI Loop
+
+Measured with **Docker Desktop completely OFF** via [`benchmark_phase4_voice.py`](./benchmark_phase4_voice.py) (raw telemetry in [`benchmark_phase4_results.json`](./benchmark_phase4_results.json)). Both engines ran on the **exact same `Qwen3-ASR-1.7B-Q8_0.gguf` (`2.19 GB`)** file. Every single stage—including the `16 kHz` reflect-padded 400-pt Hann STFT, 128-bin `fp64` Slaney Mel filterbank, `3x` `NHWC` `float4` `Conv2d` subsampler, `24`-layer Bidirectional Flash-Attention `AuT` Encoder, and `28`-layer `Qwen3` persistent decode megakernel (`~265 tok/s`)—executes **100% on the RTX 3080**:
+
+| Speech Clip (`16 kHz` Mono) | Backend | Mel + Subsample | 24L `AuT` Encoder | 28L `Qwen3` Decoder | Total Time | `RTF` | Speed vs Real-Time | Exact Transcript |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| **Short Command** (`4.64s` EN) | Apple M3 Pro (`transcribe.cpp` `MTL0`) | 0.95 ms (CPU) | 36.49 ms | 366.94 ms | 404.40 ms | 0.0872 | 11.47x | — |
+| **Short Command** (`4.64s` EN) | **RTX 3080 (`qwen-nv` `sm_86`)** | **17.68 ms** | **9.13 ms (`4.00x`)** | **101.79 ms (`3.60x`)** | **128.61 ms** | **0.0277** | **36.08x (`3.14x`)** | **100% (`en`)** |
+| **Tech Question** (`5.52s` EN) | Apple M3 Pro (`transcribe.cpp` `MTL0`) | 1.98 ms (CPU) | 45.06 ms | 391.71 ms | 438.70 ms | 0.0795 | 12.58x | — |
+| **Tech Question** (`5.52s` EN) | **RTX 3080 (`qwen-nv` `sm_86`)** | **20.27 ms** | **10.35 ms (`4.35x`)** | **121.43 ms (`3.23x`)** | **152.05 ms** | **0.0275** | **36.30x (`2.89x`)** | **100% (`en`)** |
+| **FLEURS English** (`10.56s` EN) | Apple M3 Pro (`transcribe.cpp` `MTL0`) | 2.00 ms (CPU) | 59.48 ms | 607.98 ms | 669.50 ms | 0.0634 | 15.77x | — |
+| **FLEURS English** (`10.56s` EN) | **RTX 3080 (`qwen-nv` `sm_86`)** | **38.83 ms** | **18.36 ms (`3.24x`)** | **197.16 ms (`3.08x`)** | **254.37 ms** | **0.0241** | **41.51x (`2.63x`)** | **100% (`en`)** |
+| **JFK Speech** (`11.00s` EN) | Apple M3 Pro (`transcribe.cpp` `MTL0`) | 4.53 ms (CPU) | 66.38 ms | 683.39 ms | 754.30 ms | 0.0686 | 14.58x | — |
+| **JFK Speech** (`11.00s` EN) | **RTX 3080 (`qwen-nv` `sm_86`)** | **38.25 ms** | **19.01 ms (`3.49x`)** | **200.32 ms (`3.41x`)** | **257.59 ms** | **0.0234** | **42.70x (`2.93x`)** | **100% (`en`)** |
+| **FLEURS Spanish** (`9.72s` ES) | Apple M3 Pro (`transcribe.cpp` `MTL0`) | 5.74 ms (CPU) | 62.89 ms | 673.92 ms | 742.60 ms | 0.0764 | 13.09x | — |
+| **FLEURS Spanish** (`9.72s` ES) | **RTX 3080 (`qwen-nv` `sm_86`)** | **34.62 ms** | **16.81 ms (`3.74x`)** | **198.96 ms (`3.39x`)** | **250.40 ms** | **0.0258** | **38.82x (`2.97x`)** | **100% (`es`)** |
+
+- **3-Model Co-Resident Full Voice Loop (`Speech-In -> Qwen3-4B -> Speech-Out`, `8.65 GB / 10.24 GB` GDDR6X, `0 ms` Model Swap)**:
+  - `134.2 ms` `Qwen3-ASR-1.7B` STT + `275.3 ms` `Qwen3-4B` (`40` tokens @ `165.4 tok/s`) + `32.7 ms` `Qwen3-TTS-1.7B` TTFA = **`442.1 ms` total end-of-speech to first spoken AI audio** (`510.6 ms` on a 47-token technical answer), while `Qwen3-4B` sustains **`277.48 tok/s`** (`BM=4`) / **`167.34 tok/s`** (`T=1`).
 
 ---
 
@@ -77,39 +121,55 @@ flowchart LR
 - macOS on Apple Silicon + Thunderbolt 3/4 NVIDIA Ampere (`sm_86`) eGPU with [`TinyGPU.app`](https://github.com/tinygrad/tinygpu_releases) installed at `/Applications/TinyGPU.app`
 - Rust toolchain (`cargo`) — **no Docker and no external Rust crates required**
 
-### 1. Launch the Interactive TrueColor Rust TUI (`qwen-tui`)
+### 1. Launch the Interactive TrueColor Voice + Text Rust TUI (`qwen-tui`)
 ```bash
 ./qwen-tui
 ```
-Auto-builds `qwen-nv` on first run (~4 seconds), starts the persistent background GPU daemon if not already running, and opens the full-screen Terminal UI:
-- `/bench` (or `/bench t1`) — Run the live `~260 tok/s` `BM=4` or `~173 tok/s` `T=1` benchmark inside chat
+Auto-builds `qwen-nv` on first run (~8 seconds), starts the persistent background GPU daemon if not already running, and opens the full-screen Terminal UI:
+- **`Ctrl+R` or `/listen` (`/mic`)** — **Speak a question into your Mac microphone**: captures `16 kHz` audio with live VU meter & ~1s pause auto-VAD (or press `Enter` / `Ctrl+R` to send immediately), transcribes 100% on the RTX 3080 via `Qwen3-ASR-1.7B Q8_0`, logs `▸ YOU` and streams `◆ Qwen3-4B-Instruct-2507` live in the TUI chat window, and speaks the answer aloud at `24 kHz` via `Qwen3-TTS-1.7B Q8_0`!
+- **`/talk [on|off]`** — **Hands-free continuous voice conversation** (automatically re-opens the microphone after each spoken reply; `Esc` exits)
+- `/speak [on|off]` — Toggle live **100%-on-RTX-3080 `Qwen3-TTS-1.7B Q8_0`** spoken replies (`24 kHz` CoreAudio streaming)
+- `/say [text]` — Speak `<text>` (or the last assistant reply) aloud immediately │ `/voice <name>` — Switch speaker (`ryan`, `serena`, `vivian`, `aiden`, `uncle_fu`, `ono_anna`, `sohee`, `eric`, `dylan`)
+- `/lora <path|off>` — `< 6 ms` hot-swap a HuggingFace PEFT `.safetensors` Rank-$r$ (`r \le 32`) LoRA adapter onto `Qwen3-4B`
+- `/bench` (or `/bench t1`) — Run the live `~277 tok/s` `BM=4` or `~173 tok/s` `T=1` benchmark inside chat
 - `/verify` — Display loaded GGUF file path, exact byte size, & unmodified model architecture
 - `Ctrl+S` (`/spec`) — Toggle lossless `BM=4` speculative verification vs pure `T=1` megakernel
 - `Ctrl+Y` (`/copy` or `/copy code`) — Copy last reply or fenced code block to macOS clipboard
-- `Esc` — Cancel active GPU stream in `< 6 ms` │ `Ctrl+L` (`/clear`) — Reset KV cache │ `Ctrl+Q` — Quit TUI
+- `Esc` — Cancel active mic recording, GPU text stream, & speaker output in `< 1 ms` │ `Ctrl+L` (`/clear`) — Reset KV cache │ `Ctrl+Q` — Quit TUI
 
-### 2. CLI & OpenAI-Compatible HTTP Server (`qwen-nv`)
+### 2. CLI Speech-to-Text (`qwen-listen`), Streaming TTS (`qwen-speak`), LoRA, & OpenAI HTTP Server (`qwen-nv`)
 ```bash
-# Build native release binary
-(cd qwen-nv-rs && cargo build --release)
+# Transcribe a WAV file or live Mac microphone 100% on the RTX 3080 (36x - 42.7x real-time)
+./qwen-listen /path/to/question.wav
+./qwen-listen --mic
 
-# Start persistent background daemon (< 2 ms warm ping)
-./qwen-nv-rs/target/release/qwen-nv daemon --background --model qwen3:4b --ctx 4096
-./qwen-nv-rs/target/release/qwen-nv status
+# Full CLI voice round-trip (Mic -> Qwen3-ASR-1.7B -> Qwen3-4B -> Qwen3-TTS-1.7B voice reply!)
+./qwen-listen --mic --ask
 
-# Stream a prompt from CLI (--spec enabled by default; pass --no-spec for pure T=1)
+# Speak live through Mac speakers (26 ms TTFA, 6.0x real-time on RTX 3080) and optionally save WAV
+./qwen-speak "Hello Tim, the RTX 3080 text to speech engine is online."
+./qwen-speak --voice serena -o /tmp/serena.wav "Every neural layer runs natively on the external graphics card."
+
+# Dynamic Rank-r (r <= 32) PEFT LoRA hot-swap (< 6 ms DMA load, 44 us clear)
+./qwen-nv-rs/target/release/qwen-nv lora load /path/to/peft_adapter_dir
+./qwen-nv-rs/target/release/qwen-nv lora status
+./qwen-nv-rs/target/release/qwen-nv lora clear
+
+# Stream a text prompt from CLI (--spec enabled by default; pass --no-spec for pure T=1)
 ./qwen-nv-rs/target/release/qwen-nv run --json-stats -p "Explain CUDA warp shuffle in 2 short sentences."
 
-# Serve OpenAI-compatible `/v1/chat/completions` (streaming SSE + JSON) on port 8000
+# Serve OpenAI-compatible `/v1/chat/completions`, `/v1/audio/speech`, & `/v1/audio/transcriptions` on port 8000
 ./qwen-nv-rs/target/release/qwen-nv serve --port 8000
 
 # IMPORTANT: Always unload GSP-RM cleanly before unplugging the Thunderbolt cable!
 ./qwen-nv-rs/target/release/qwen-nv stop
 ```
 
-### 3. Reproduce the Head-to-Head Benchmark
+### 3. Reproduce the Head-to-Head Benchmarks
 ```bash
 python3 ./benchmark_phase2.py
+python3 ./benchmark_phase3_tts.py
+python3 ./benchmark_phase4_voice.py
 ```
 
 ---
@@ -139,24 +199,31 @@ We report both modes separately so the roofline math is completely transparent:
 
 ```text
 optimize-gpu/
-├── qwen-tui                                    # One-command launcher for the native Rust TUI
-├── qwen-nv-rs/                                 # Phase 2: Zero-crate, zero-Docker native Rust + sm_86 engine
+├── qwen-tui                                    # One-command launcher for the Voice + Text + LoRA Rust TUI (Ctrl+R, /talk, /speak, /lora)
+├── qwen-listen                                 # One-command CLI launcher for 100%-RTX-3080 Qwen3-ASR-1.7B STT (--mic, --ask)
+├── qwen-speak                                  # One-command CLI launcher for 100%-RTX-3080 Qwen3-TTS-1.7B streaming TTS
+├── qwen-nv-rs/                                 # Zero-crate, zero-Docker native Rust + sm_86 engine (v0.4.0)
 │   ├── Cargo.toml                              # 0 external crate dependencies
 │   ├── kernels/
-│   │   ├── qwen_sm86_megakernel.cu             # Custom 68-SM persistent T=1 + BM=4 megakernels & Flash-Prefill
+│   │   ├── qwen_sm86_megakernel.cu             # 68-SM T=1 + BM=4 + Rank-r LoRA + Qwen3-ASR + Qwen3-TTS + Code2Wav kernels
 │   │   └── qwen_sm86_megakernel.cubin          # Precompiled sm_86 SASS binary embedded via include_bytes!
 │   └── src/
-│       ├── main.rs                             # CLI entrypoint (tui, run, daemon, status, stop, serve, tokenize)
-│       ├── tui.rs                              # Zero-dep TrueColor Terminal UI (60 FPS sync output, Markdown, pbcopy)
-│       ├── daemon.rs                           # Persistent Unix-socket GPU daemon & OpenAI HTTP/SSE server
+│       ├── main.rs                             # CLI (tui, run, transcribe/listen, speak, lora, asr-warm, tts-warm, serve, ...)
+│       ├── tui.rs                              # TrueColor TUI with live Ctrl+R mic, /talk hands-free, /speak, & /lora
+│       ├── asr.rs                              # 100%-GPU Qwen3-ASR-1.7B STFT/Mel + NHWC Conv2d + 24L AuT + 28L Megakernel
+│       ├── tts.rs                              # 100%-GPU Qwen3-TTS-1.7B Talker + 15-step CodePredictor + Code2Wav
+│       ├── lora.rs                             # Zero-crate PEFT .safetensors parser & <6ms dynamic LoRA arena
+│       ├── audio.rs                            # Zero-crate macOS AudioToolbox 16 kHz mic VAD recorder & 24 kHz speaker player
+│       ├── daemon.rs                           # Co-resident Unix-socket daemon & OpenAI HTTP (/v1/audio/speech, /v1/audio/transcriptions)
 │       ├── engine.rs                           # VRAM slab loader, KV prefix cache, N-gram drafter, & rollout loop
-│       ├── gguf.rs                             # Read-only mmap GGUF v2/v3 parser & exact Qwen BPE tokenizer
+│       ├── gguf.rs                             # Read-only mmap GGUF v2/v3 parser, BF16/F32/Quant & BPE tokenizer
 │       ├── nv_hw.rs                            # Native GA102 GSP-RM booter, MMU v2 page tables, & QMDv3 launcher
 │       ├── nv_defs.rs                          # Ampere hardware constants, PTE/PDE encoders, & QMDv03_00 packer
 │       └── tinygpu_client.rs                   # Direct Unix socket + SCM_RIGHTS MAP_SYSMEM_FD DriverKit client
-├── qwen_engine.py                              # Phase 1: Python + tinygrad HCQGraph runner (117.7 - 126.2 tok/s)
-├── cuda_kernels.py                             # Phase 1: Custom __dp4a & Flash-Decoding kernels for tinygrad
-├── nvrtc_daemon.py                             # Phase 1: Zero-mount TCP NVRTC compiler + QMD L1_MEMBAR patch
-├── benchmark_phase2.py                         # Head-to-head hardware benchmark (Phase 2 vs Phase 1)
-└── benchmark_phase2_results.json               # Verified benchmark telemetry & token-parity output
+├── benchmark_phase4_voice.py                   # Phase 4 benchmark: RTX 3080 vs M3 Pro Metal STT + 3-Model Voice Loop E2E
+├── benchmark_phase4_results.json               # Verified Phase 4 telemetry & exact transcript parity metrics
+├── benchmark_phase3_tts.py                     # Phase 3 benchmark: RTX 3080 vs M3 Pro Metal TTS + LoRA + Voice E2E
+├── benchmark_phase3_results.json               # Verified Phase 3 telemetry & golden waveform parity metrics
+├── benchmark_phase2.py                         # Phase 2 benchmark: Native Rust Megakernel vs Phase 1 & Stock
+└── benchmark_phase2_results.json               # Verified Phase 2 telemetry & token-parity output
 ```
