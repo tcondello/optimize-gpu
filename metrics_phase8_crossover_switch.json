@@ -1,0 +1,43 @@
+{
+  "model": "Qwen3-8B-Q6_K.gguf",
+  "test_tokens": 2400,
+  "crossover_pos": 1536,
+  "bit_exact_parity_all_5_modes": true,
+  "modes": {
+    "pure_persistent_t1": {
+      "decode_tok_per_s": 77.84,
+      "kernel_launches": 3,
+      "spec_verify_calls": 0,
+      "spec_crossover_switched": false
+    },
+    "ngram_bm4_no_switch": {
+      "decode_tok_per_s": 80.27,
+      "kernel_launches": 668,
+      "spec_verify_calls": 394,
+      "spec_crossover_switched": false
+    },
+    "ngram_bm4_with_1536_switch": {
+      "decode_tok_per_s": 77.95,
+      "kernel_launches": 349,
+      "spec_verify_calls": 185,
+      "spec_crossover_switched": true
+    },
+    "drafter_0.6b_no_switch": {
+      "decode_tok_per_s": 89.48,
+      "kernel_launches": 714,
+      "spec_verify_calls": 712,
+      "spec_crossover_switched": false
+    },
+    "drafter_0.6b_with_1536_switch": {
+      "decode_tok_per_s": 84.22,
+      "kernel_launches": 451,
+      "spec_verify_calls": 448,
+      "spec_crossover_switched": true
+    }
+  },
+  "scale_aware_defaults": {
+    "qwen3_4b_dim_2560": 1536,
+    "qwen3_8b_dim_4096": 3072
+  },
+  "no_think_fast_tokens": 11
+}

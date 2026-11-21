@@ -2,10 +2,19 @@
 qwen-nv-rs/target/
 !qwen-nv-rs/kernels/*.cubin
 
-# Python bytecode & caches
+# Large model weights & >100MB binary blobs
+*.gguf
+checkpoints/**/*.safetensors
+checkpoints/**/rollback_backup.bin
+lora/qwen3-8b-embed-svd-r32/*.safetensors
+data/**/*hooks*.bin
+data/topic_lora_work/
+
+# Python, Jupyter & caches
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ipynb_checkpoints/
 .venv/
 
 # OS & editor files

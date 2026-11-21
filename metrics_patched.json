@@ -1,0 +1,62 @@
+{
+  "num_prompts": 100,
+  "accuracy": 0.38,
+  "correct_count": 38,
+  "avg_think_tokens": 1164.21,
+  "avg_completion_tokens": 1269.72,
+  "avg_hesitation_markers": 2.43,
+  "loop_or_bloat_rate": 0.54,
+  "truncated_no_end_think_rate": 0.46,
+  "premature_early_stop_rate": 0.0,
+  "total_failure_mode_rate": 0.55,
+  "failure_set_count": 55,
+  "clean_set_count": 33,
+  "tok_per_sec_t1": 127.93,
+  "tok_per_sec_eval_mode": 120.25,
+  "spec_acceptance_alpha": 0.6776,
+  "by_category": {
+    "algebra_numtheory": {
+      "count": 20,
+      "accuracy": 0.0,
+      "avg_think_tokens": 1472.0,
+      "loop_or_bloat_rate": 1.0
+    },
+    "algo_trace": {
+      "count": 20,
+      "accuracy": 0.5,
+      "avg_think_tokens": 1261.2,
+      "loop_or_bloat_rate": 0.5
+    },
+    "crt_deceptive": {
+      "count": 20,
+      "accuracy": 0.4,
+      "avg_think_tokens": 1136.65,
+      "loop_or_bloat_rate": 0.4
+    },
+    "gsm_math": {
+      "count": 20,
+      "accuracy": 1.0,
+      "avg_think_tokens": 579.75,
+      "loop_or_bloat_rate": 0.05
+    },
+    "logic_knights_grid": {
+      "count": 20,
+      "accuracy": 0.0,
+      "avg_think_tokens": 1371.45,
+      "loop_or_bloat_rate": 0.75
+    }
+  },
+  "patch_info": {
+    "status": "patched",
+    "out_dir": "/Users/tim/Code/optimize-gpu/checkpoints/qwen-patched",
+    "gguf_path": "/Users/tim/Code/optimize-gpu/checkpoints/qwen-patched/Qwen3-4B-Thinking-2507-Patched-Q8_0.gguf",
+    "num_tensors": 10,
+    "subspace_dof_params": 25600,
+    "subspace_dof_pct": 0.000636,
+    "mean_rel_frobenius_delta": 0.02373,
+    "elapsed_s": 2.373
+  },
+  "control_kl_nats": 0.01053,
+  "control_max_kl_nats": 0.12309,
+  "control_top1_agreement": 1.0
+}

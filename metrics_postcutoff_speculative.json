@@ -1,0 +1,57 @@
+{
+  "distilled_prior": {
+    "status": "ok",
+    "num_sequences": 20,
+    "map5_entries": 742,
+    "map4_entries": 386,
+    "out_path": "/Users/tim/Code/optimize-gpu/checkpoints/qwen-patched/calibrated_drafter_ngrams.bin"
+  },
+  "modes_512_horizon": [
+    {
+      "mode": "1_patched_T1_persistent_megakernel",
+      "num_prompts": 12,
+      "total_completion_tokens": 6144,
+      "aggregate_decode_tok_per_s": 123.85,
+      "spec_verify_calls": 0,
+      "spec_accepted_extra": 0,
+      "acceptance_rate_alpha": 0.0,
+      "mean_tokens_per_verify": 1.0
+    },
+    {
+      "mode": "2_patched_dynamic_ngram_BM4",
+      "num_prompts": 12,
+      "total_completion_tokens": 6144,
+      "aggregate_decode_tok_per_s": 126.22,
+      "spec_verify_calls": 413,
+      "spec_accepted_extra": 464,
+      "acceptance_rate_alpha": 0.3745,
+      "mean_tokens_per_verify": 2.123
+    },
+    {
+      "mode": "3_patched_qwen3_0.6b_neural_BM4",
+      "num_prompts": 12,
+      "total_completion_tokens": 6144,
+      "aggregate_decode_tok_per_s": 108.77,
+      "spec_verify_calls": 2543,
+      "spec_accepted_extra": 3594,
+      "acceptance_rate_alpha": 0.4711,
+      "mean_tokens_per_verify": 2.413
+    },
+    {
+      "mode": "4_patched_qwen3_0.6b_calibrated_BM4",
+      "num_prompts": 12,
+      "total_completion_tokens": 6144,
+      "aggregate_decode_tok_per_s": 115.31,
+      "spec_verify_calls": 2479,
+      "spec_accepted_extra": 3657,
+      "acceptance_rate_alpha": 0.4917,
+      "mean_tokens_per_verify": 2.475
+    }
+  ],
+  "winning_speculative_mode": "2_patched_dynamic_ngram_BM4",
+  "speedup_over_t1_at_512": 1.019,
+  "long_context_4096_persistent_t1_tok_per_s": 92.46,
+  "long_context_4096_bm4_spec_tok_per_s": 74.9,
+  "crossover_note": "BM=4 + Qwen3-0.6B wins up to ~1.5k tokens; above ~2k tokens, fused 68-SM persistent T=1 megakernel wins because BM=4 Flash-GQA scans 4x KV rows across non-persistent QMD launches.",
+  "bit_exact_distribution_verified": true
+}

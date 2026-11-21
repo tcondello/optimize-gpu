@@ -125,11 +125,47 @@ pub fn md5_hex(input: &[u8]) -> String {
 }
 
 pub fn resolve_model_path(model_ref: &str) -> Result<PathBuf, String> {
+    if matches!(model_ref, "qwen3-8b-patched" | "qwen8b-patched" | "default") {
+        let rel = PathBuf::from("checkpoints/qwen3-8b-patched/Qwen3-8B-Patched-Q6_K.gguf");
+        if rel.exists() {
+            return Ok(rel);
+        }
+        let p = PathBuf::from("/Users/tim/Code/optimize-gpu/checkpoints/qwen3-8b-patched/Qwen3-8B-Patched-Q6_K.gguf");
+        if p.exists() {
+            return Ok(p);
+        }
+        eprintln!(
+            "[qwen-nv] Note: patched checkpoint not found locally; falling back to qwen3-thinking:8b"
+        );
+        return resolve_model_path("qwen3-thinking:8b");
+    }
+    if matches!(model_ref, "qwen3-patched" | "qwen-patched" | "qwen3-4b-patched") {
+        let rel = PathBuf::from("checkpoints/qwen-patched/Qwen3-4B-Thinking-2507-Patched-Q8_0.gguf");
+        if rel.exists() {
+            return Ok(rel);
+        }
+        let p = PathBuf::from("/Users/tim/Code/optimize-gpu/checkpoints/qwen-patched/Qwen3-4B-Thinking-2507-Patched-Q8_0.gguf");
+        if p.exists() {
+            return Ok(p);
+        }
+    }
     let url_opt = match model_ref {
+        "qwen3-thinking:8b" | "qwen3-think:8b" | "qwen3:8b" | "qwen3:8b-q6" => {
+            Some("https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q6_K.gguf")
+        }
+        "qwen3:8b-q8" => Some("https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q8_0.gguf"),
+        "qwen3:8b-q4" => Some("https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"),
+        "qwen3-embed:8b" | "qwen3-embedding:8b" | "qwen3-embed:8b-q6" => {
+            Some("https://huggingface.co/Qwen/Qwen3-Embedding-8B-GGUF/resolve/main/Qwen3-Embedding-8B-Q6_K.gguf")
+        }
+        "qwen3-embed:8b-q8" => {
+            Some("https://huggingface.co/Qwen/Qwen3-Embedding-8B-GGUF/resolve/main/Qwen3-Embedding-8B-Q8_0.gguf")
+        }
         "qwen3:4b" => Some("https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"),
+        "qwen3-thinking:4b" | "qwen3-think:4b" => Some("https://huggingface.co/unsloth/Qwen3-4B-Thinking-2507-GGUF/resolve/main/Qwen3-4B-Thinking-2507-Q8_0.gguf"),
+        "qwen3-embed:4b" | "qwen3-embedding:4b" => Some("https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF/resolve/main/Qwen3-Embedding-4B-Q8_0.gguf"),
         "qwen3:0.6b" => Some("https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"),
         "qwen3:1.7b" => Some("https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf"),
-        "qwen3:8b" => Some("https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"),
         "qwen3:14b" => Some("https://huggingface.co/Qwen/Qwen3-14B-GGUF/resolve/main/Qwen3-14B-Q4_K_M.gguf"),
         "qwen2.5:3b" => Some("https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf"),
         "qwen2.5:7b" => Some("https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf"),
@@ -171,6 +207,16 @@ pub fn resolve_model_path(model_ref: &str) -> Result<PathBuf, String> {
     }
 
     let p = PathBuf::from(model_ref);
+    if p.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&p) {
+            for ent in entries.flatten() {
+                let ep = ent.path();
+                if ep.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                    return Ok(ep);
+                }
+            }
+        }
+    }
     if p.exists() {
         Ok(p)
     } else {
@@ -397,7 +443,7 @@ impl GgufFile {
 #[inline]
 pub fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h & 0x8000) as u32) << 16;
-    let mut exp = ((h >> 10) & 0x1f) as u32;
+    let mut exp = ((h >> 10) & 0x1f) as i32;
     let mut mant = (h & 0x03ff) as u32;
     let bits = if exp == 0 {
         if mant == 0 {
@@ -409,12 +455,12 @@ pub fn f16_to_f32(h: u16) -> f32 {
                 exp -= 1;
             }
             mant &= 0x03ff;
-            sign | ((exp + 127 - 15) << 23) | (mant << 13)
+            sign | (((exp + 127 - 15) as u32) << 23) | (mant << 13)
         }
     } else if exp == 31 {
         sign | 0x7f80_0000 | (mant << 13)
     } else {
-        sign | ((exp + 127 - 15) << 23) | (mant << 13)
+        sign | (((exp + 127 - 15) as u32) << 23) | (mant << 13)
     };
     f32::from_bits(bits)
 }
@@ -1070,6 +1116,7 @@ pub struct QwenModelConfig {
     pub vocab_size: usize,
     pub max_ctx: usize,
     pub has_qk_norm: bool,
+    pub thinking_template: bool,
     pub bos_id: Option<i32>,
     pub eos_id: i32,
     pub im_end_id: i32,
@@ -1139,6 +1186,26 @@ impl QwenModelConfig {
             .unwrap_or(fallback_stem)
             .to_string();
 
+        let chat_tmpl = gguf
+            .kv
+            .get("tokenizer.chat_template")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let lower_name = model_name.to_ascii_lowercase();
+        let lower_stem = fallback_stem.to_ascii_lowercase();
+        let is_embed = lower_name.contains("embed") || lower_stem.contains("embed");
+        let is_pure_instruct = (lower_name.contains("instruct") || lower_stem.contains("instruct"))
+            && !chat_tmpl.contains("enable_thinking")
+            && !lower_name.contains("thinking")
+            && !lower_stem.contains("thinking");
+        let thinking_template = !is_embed
+            && !is_pure_instruct
+            && (chat_tmpl.contains("assistant\\n<think>\\n")
+                || chat_tmpl.contains("assistant\n<think>\n")
+                || chat_tmpl.contains("enable_thinking")
+                || lower_name.contains("thinking")
+                || lower_stem.contains("thinking"));
+
         let add_bos = gguf
             .kv
             .get("tokenizer.ggml.add_bos_token")
@@ -1183,6 +1250,7 @@ impl QwenModelConfig {
             vocab_size,
             max_ctx,
             has_qk_norm,
+            thinking_template,
             bos_id,
             eos_id,
             im_end_id,

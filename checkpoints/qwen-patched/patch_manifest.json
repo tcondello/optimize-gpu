@@ -1,0 +1,14 @@
+{
+  "status": "patched",
+  "out_dir": "/Users/tim/Code/optimize-gpu/checkpoints/qwen-patched",
+  "gguf_path": "/Users/tim/Code/optimize-gpu/checkpoints/qwen-patched/Qwen3-4B-Thinking-2507-Patched-Q8_0.gguf",
+  "layers": [24, 25, 26, 27, 28, 29, 30, 31, 32, 33],
+  "rank_k": 1,
+  "alpha": 1.0000,
+  "rescale_row_norms": true,
+  "edited_tensors": ["model.layers.24.mlp.down_proj.weight", "model.layers.25.mlp.down_proj.weight", "model.layers.26.mlp.down_proj.weight", "model.layers.27.mlp.down_proj.weight", "model.layers.28.mlp.down_proj.weight", "model.layers.29.mlp.down_proj.weight", "model.layers.30.mlp.down_proj.weight", "model.layers.31.mlp.down_proj.weight", "model.layers.32.mlp.down_proj.weight", "model.layers.33.mlp.down_proj.weight"],
+  "subspace_dof_params": 25600,
+  "subspace_dof_pct": 0.000636,
+  "mean_rel_frobenius_delta": 0.019959,
+  "elapsed_s": 2.737
+}

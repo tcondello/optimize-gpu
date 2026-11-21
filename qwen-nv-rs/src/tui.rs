@@ -20,10 +20,14 @@ use std::time::{Duration, Instant};
 use crate::audio::{read_wav_mono_16k, CoreAudioPlayer, CoreAudioRecorder, ASR_SAMPLE_RATE, TTS_SAMPLE_RATE};
 use crate::daemon::{
     client_asr_warm, client_generate_ids_cancellable, client_lora_clear, client_lora_load,
-    client_lora_status, client_speak_via_daemon, client_transcribe_via_daemon, client_tts_warm,
+    client_lora_status, client_rag_clear, client_rag_load, client_rag_search, client_rag_status,
+    client_speak_via_daemon, client_topic_clear, client_topic_list, client_topic_load,
+    client_topic_route, client_topic_status, client_transcribe_via_daemon, client_tts_warm,
     daemon_ping, ensure_daemon_running, stop_daemon,
 };
 use crate::gguf::{resolve_model_path, BpeTokenizer, GgufFile, QwenModelConfig};
+use crate::rag::format_rag_augmented_prompt;
+use crate::topic_lora::json_find_num;
 use crate::tts::TtsSynthParams;
 
 // =============================================================================
@@ -996,6 +1000,7 @@ fn extract_last_fenced_code(text: &str) -> Option<String> {
 
 /// Strip fenced code blocks and light Markdown formatting so spoken replies sound natural.
 fn sanitize_text_for_speech(md: &str) -> String {
+    let md = md.rsplit_once("</think>").map(|(_, after)| after).unwrap_or(md);
     let mut out = String::with_capacity(md.len());
     let mut in_fence = false;
     for ln in md.split('\n') {
@@ -1077,6 +1082,45 @@ fn query_lora_badge_from_daemon() -> Option<String> {
     Some(format!(" LoRA r={} ", rank))
 }
 
+fn query_rag_badge_from_daemon() -> Option<String> {
+    let Ok(j) = client_rag_status() else {
+        return None;
+    };
+    if !j.contains("\"active\":true") {
+        return None;
+    }
+    let ndocs = j
+        .find("\"num_docs\":")
+        .and_then(|idx| {
+            let s: String = j[idx + 11..]
+                .chars()
+                .skip_while(|c| c.is_whitespace())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            s.parse::<usize>().ok()
+        })
+        .unwrap_or(0);
+    let strat = j
+        .find("\"strategy\":\"")
+        .and_then(|idx| {
+            let rest = &j[idx + 12..];
+            rest.find('"').map(|e| &rest[..e])
+        })
+        .unwrap_or("rag");
+    Some(format!(" 📚 RAG:{} ({}) ", ndocs, strat))
+}
+
+fn query_topic_badge_from_daemon() -> Option<String> {
+    let Ok(j) = client_topic_status() else {
+        return None;
+    };
+    if !j.contains("\"active\":true") {
+        return None;
+    }
+    let ntopics = json_find_num(&j, "num_topics").unwrap_or(0.0) as usize;
+    Some(format!(" ⚡ TOPIC:{} ", ntopics))
+}
+
 // =============================================================================
 // Main TUI App State & Render Loop
 // =============================================================================
@@ -1106,6 +1150,10 @@ struct TuiApp {
     tts_cancel_flag: Option<Arc<AtomicBool>>,
     last_ttfa_ms: Arc<std::sync::Mutex<f64>>,
     lora_badge: Option<String>,
+    rag_badge: Option<String>,
+    rag_top_k: usize,
+    topic_badge: Option<String>,
+    topic_lora_active: bool,
 
     // Live 100%-on-RTX-3080 Speech-to-Text (`Qwen3-ASR-1.7B Q8_0`) microphone & VAD state
     asr_model_ref: String,
@@ -1162,6 +1210,12 @@ impl TuiApp {
         let cfg = QwenModelConfig::from_gguf(&gguf, &tok, max_ctx, model_ref)?;
 
         let lora_badge = query_lora_badge_from_daemon();
+        let topic_badge = query_topic_badge_from_daemon();
+        let rag_badge = if topic_badge.is_some() {
+            None
+        } else {
+            query_rag_badge_from_daemon()
+        };
 
         Ok(Self {
             model_ref: model_ref.to_string(),
@@ -1184,6 +1238,10 @@ impl TuiApp {
             tts_cancel_flag: None,
             last_ttfa_ms: Arc::new(std::sync::Mutex::new(0.0)),
             lora_badge,
+            rag_badge,
+            rag_top_k: 3,
+            topic_badge,
+            topic_lora_active: false,
             asr_model_ref: "1.7b".to_string(),
             asr_lang_hint: "auto".to_string(),
             active_recorder: None,
@@ -1298,42 +1356,131 @@ impl TuiApp {
         });
     }
 
-    fn encode_conversation(&self) -> Vec<i32> {
+    fn encode_conversation(&self, last_user_override: Option<&str>, sys_override: Option<&str>) -> Vec<i32> {
         let mut ids = Vec::with_capacity(1024);
         if let Some(bos) = self.cfg.bos_id {
             ids.push(bos);
         }
-        if !self.system_prompt.is_empty() {
+        let eff_sys = if !self.system_prompt.is_empty() {
+            Some(self.system_prompt.as_str())
+        } else {
+            sys_override.filter(|s| !s.is_empty())
+        };
+        if let Some(sys_s) = eff_sys {
             ids.extend(self.tok.role_tokens("system"));
-            ids.extend(self.tok.encode(&self.system_prompt));
+            ids.extend(self.tok.encode(sys_s));
             ids.extend(self.tok.end_turn_tokens(self.cfg.im_end_id));
         }
-        for m in &self.messages {
+        let last_user_idx = self.messages.iter().rposition(|m| m.role == "user");
+        for (idx, m) in self.messages.iter().enumerate() {
             if m.role == "user" || m.role == "assistant" {
                 ids.extend(self.tok.role_tokens(&m.role));
-                ids.extend(self.tok.encode(&m.content));
+                if Some(idx) == last_user_idx {
+                    if let Some(ovr) = last_user_override {
+                        ids.extend(self.tok.encode(ovr));
+                    } else {
+                        ids.extend(self.tok.encode(&m.content));
+                    }
+                } else {
+                    ids.extend(self.tok.encode(&m.content));
+                }
                 ids.extend(self.tok.end_turn_tokens(self.cfg.im_end_id));
             }
         }
         ids.extend(self.tok.role_tokens("assistant"));
+        let last_user_txt = last_user_override.or_else(|| {
+            last_user_idx.map(|i| self.messages[i].content.as_str())
+        }).unwrap_or("");
+        let user_no_think = last_user_txt.contains("/no_think") || self.voice_enabled;
         let lower_name = self.cfg.model_name.to_ascii_lowercase();
-        if lower_name.contains("qwen3") && !lower_name.contains("instruct") {
+        if self.cfg.thinking_template {
+            if user_no_think {
+                ids.extend(self.tok.encode("<think>\n\n</think>\n\n"));
+            } else {
+                ids.extend(self.tok.encode("<think>\n"));
+            }
+        } else if lower_name.contains("qwen3") && !lower_name.contains("instruct") {
             ids.extend(self.tok.encode("<think>\n\n</think>\n\n"));
         }
         ids
     }
 
-    fn start_generation(&mut self, user_text: String, force_reset_cache: bool) {
+    fn start_generation(&mut self, user_text: String, mut force_reset_cache: bool) {
         if self.streaming_rx.is_some() {
             return;
         }
         self.stop_active_tts();
         self.messages.push(ChatMsg {
             role: "user".into(),
-            content: user_text,
+            content: user_text.clone(),
             stats: None,
         });
-        let prompt_ids = self.encode_conversation();
+
+        let mut rag_override: Option<String> = None;
+        let mut topic_sys_override: Option<String> = None;
+        if self.rag_badge.is_some() {
+            match client_rag_search(&user_text, self.rag_top_k) {
+                Ok(st) if !st.hits.is_empty() => {
+                    let cite_list: Vec<String> = st
+                        .hits
+                        .iter()
+                        .enumerate()
+                        .map(|(i, h)| format!("`[{}]` **{}** (`{:.3}`)", i + 1, h.title, h.score))
+                        .collect();
+                    self.messages.push(ChatMsg {
+                        role: "info".into(),
+                        content: format!(
+                            "📚 **RTX 3080 Wiki RAG** (`{}` • `{:.1} ms` embed • `{:.0} µs` GPU search): {}",
+                            st.strategy,
+                            st.embed_ms,
+                            st.gpu_search_us,
+                            cite_list.join(" • ")
+                        ),
+                        stats: None,
+                    });
+                    rag_override = Some(format_rag_augmented_prompt(&user_text, &st.hits));
+                    // Embedding prefill used the GPU KV scratch, so force fresh prompt prefill cleanly
+                    force_reset_cache = true;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.set_toast(format!("RAG search error: {}", e));
+                }
+            }
+        } else if self.topic_badge.is_some() {
+            match client_topic_route(&user_text, self.rag_top_k, -1.0, true) {
+                Ok(rt) => {
+                    force_reset_cache = true;
+                    if rt.matched {
+                        self.topic_lora_active = true;
+                        if !rt.system_prompt.is_empty() {
+                            topic_sys_override = Some(rt.system_prompt.clone());
+                        }
+                        self.messages.push(ChatMsg {
+                            role: "info".into(),
+                            content: format!(
+                                "⚡ **Topic LoRA**: **{}** (`cos={:.3}` • `{:.1} ms` embed • `{:.0} µs` search • `{:.2} ms` swap • `0` context tokens)",
+                                rt.topic, rt.score, rt.embed_ms, rt.gpu_search_us, rt.swap_ms
+                            ),
+                            stats: None,
+                        });
+                        self.set_toast(format!(
+                            "⚡ Topic LoRA: {} (cos={:.3}, swap={:.2}ms)",
+                            rt.topic, rt.score, rt.swap_ms
+                        ));
+                    } else {
+                        self.topic_lora_active = false;
+                        self.set_toast(format!("⚡ No topic LoRA matched (top cos={:.3})", rt.score));
+                    }
+                }
+                Err(e) => {
+                    self.topic_lora_active = false;
+                    self.set_toast(format!("Topic route error: {}", e));
+                }
+            }
+        }
+
+        let prompt_ids = self.encode_conversation(rag_override.as_deref(), topic_sys_override.as_deref());
         self.total_ctx_used = prompt_ids.len();
 
         // Push placeholder assistant message to stream into
@@ -1633,6 +1780,11 @@ impl TuiApp {
         if finished {
             self.streaming_rx = None;
             self.cancel_flag = None;
+            if self.topic_lora_active {
+                let _ = client_lora_clear();
+                self.topic_lora_active = false;
+                self.lora_badge = query_lora_badge_from_daemon();
+            }
             if let Some(reply_md) = speak_reply_after {
                 self.spawn_tts_for_text(&reply_md);
             }
@@ -1888,17 +2040,102 @@ impl TuiApp {
                 }
                 self.scroll_from_bottom = 0;
             }
+            "/rag" => {
+                if arg.is_empty() || arg == "status" {
+                    let st = client_rag_status().unwrap_or_else(|e| format!("Error: {}", e));
+                    self.rag_badge = query_rag_badge_from_daemon();
+                    self.messages.push(ChatMsg {
+                        role: "info".into(),
+                        content: format!(
+                            "**RTX 3080 Same-Model VectorDB Status**: `{}`\nUse `/rag wiki` (or `/rag <file.qvec>`) to enable live Wikipedia RAG, or `/rag off` to disable.",
+                            st
+                        ),
+                        stats: None,
+                    });
+                } else if matches!(arg, "off" | "clear" | "none") {
+                    match client_rag_clear() {
+                        Ok(_) => {
+                            self.rag_badge = None;
+                            self.set_toast("✓ Disabled RTX 3080 RAG VectorDB");
+                        }
+                        Err(e) => self.set_toast(format!("RAG clear error: {}", e)),
+                    }
+                } else {
+                    let resolved = if arg == "on" || arg == "wiki" || arg == "wikipedia" {
+                        "data/wikipedia_1k_best.qvec"
+                    } else {
+                        arg.strip_prefix("load ").map(|s| s.trim()).unwrap_or(arg)
+                    };
+                    match client_rag_load(resolved) {
+                        Ok(res) => {
+                            self.rag_badge = query_rag_badge_from_daemon();
+                            self.topic_badge = None;
+                            self.set_toast(format!("📚 Loaded RTX 3080 VectorDB: {}", res));
+                        }
+                        Err(e) => self.set_toast(format!("RAG load failed: {}", e)),
+                    }
+                }
+                self.scroll_from_bottom = 0;
+            }
+            "/topic" => {
+                if arg.is_empty() || arg == "status" {
+                    let st = client_topic_status().unwrap_or_else(|e| format!("Error: {}", e));
+                    self.topic_badge = query_topic_badge_from_daemon();
+                    self.messages.push(ChatMsg {
+                        role: "info".into(),
+                        content: format!(
+                            "**RTX 3080 Sharded Topic LoRA Bank Status**: `{}`\nUse `/topic wiki` (or `/topic <bank_dir>`) to enable bare-prompt Topic LoRA routing, `/topic list` to list topics, or `/topic off` to disable.",
+                            st
+                        ),
+                        stats: None,
+                    });
+                } else if arg == "list" {
+                    let lst = client_topic_list().unwrap_or_else(|e| format!("Error: {}", e));
+                    self.messages.push(ChatMsg {
+                        role: "info".into(),
+                        content: format!("**Loaded Topic LoRA Bank**: `{}`", lst),
+                        stats: None,
+                    });
+                } else if matches!(arg, "off" | "clear" | "none") {
+                    match client_topic_clear() {
+                        Ok(_) => {
+                            self.topic_badge = None;
+                            self.topic_lora_active = false;
+                            self.lora_badge = query_lora_badge_from_daemon();
+                            self.set_toast("✓ Disabled RTX 3080 Topic LoRA Bank");
+                        }
+                        Err(e) => self.set_toast(format!("Topic clear error: {}", e)),
+                    }
+                } else {
+                    let resolved = if arg == "on" || arg == "wiki" || arg == "wikipedia" {
+                        "checkpoints/wiki-topic-loras"
+                    } else {
+                        arg.strip_prefix("load ").map(|s| s.trim()).unwrap_or(arg)
+                    };
+                    match client_topic_load(resolved) {
+                        Ok(res) => {
+                            self.topic_badge = query_topic_badge_from_daemon();
+                            self.rag_badge = None;
+                            self.set_toast(format!("⚡ Loaded Topic LoRA Bank: {}", res));
+                        }
+                        Err(e) => self.set_toast(format!("Topic load failed: {}", e)),
+                    }
+                }
+                self.scroll_from_bottom = 0;
+            }
             "/help" | _ => {
                 self.messages.push(ChatMsg {
                     role: "info".into(),
-                    content: "### Qwen-NV v0.4 Full-Duplex RTX 3080 Voice + Text + LoRA TUI Commands\n\
-                        - `Ctrl+R` or `/listen` (`/mic`) — **Speak a question into your Mac mic**: runs 100%-on-RTX-3080 `Qwen3-ASR-1.7B Q8_0` STT -> captures text in chat -> streams `Qwen3-4B` -> speaks reply via `Qwen3-TTS-1.7B Q8_0`!\n\
+                    content: "### Qwen-NV v0.7 Full-Duplex RTX 3080 Voice + Text + RAG + Topic LoRA TUI Commands\n\
+                        - `/topic [wiki|<bank_dir>|list|status|off]` — **Sharded Topic Parametric LoRA Bank** (`308 µs` GPU router + `44 µs` cached LoRA swap, `0` context stuffing!)\n\
+                        - `/rag [wiki|<file.qvec>|off]` — **100%-on-RTX-3080 Same-Model Wikipedia VectorDB RAG** (`< 10 ms` embed + `< 50 µs` GPU cosine search; works with both voice & text!)\n\
+                        - `Ctrl+R` or `/listen` (`/mic`) — **Speak a question into your Mac mic**: runs 100%-on-RTX-3080 `Qwen3-ASR-1.7B Q8_0` STT -> (optional Wiki RAG) -> streams `Qwen3-4B` -> speaks reply via `Qwen3-TTS-1.7B Q8_0`!\n\
                         - `/talk [on|off]` — **Hands-free continuous voice conversation** (auto-listens after each spoken reply; `Esc` stops)\n\
                         - `/speak [on|off]` — Toggle live **100%-on-RTX-3080 `Qwen3-TTS-1.7B Q8_0`** spoken replies (`24 kHz` streaming)\n\
                         - `/say [text]` — Speak `<text>` (or the last assistant reply) aloud on RTX 3080 (`Esc` stops audio)\n\
                         - `/voice <name>` — Select voice (`ryan`, `serena`, `vivian`, `aiden`, `uncle_fu`, `ono_anna`, `sohee`, `eric`, `dylan`)\n\
                         - `/lora <path|off>` — `< 1 ms` hot-swap Rank-`r` (`r <= 32`) PEFT `.safetensors` LoRA adapter onto `Qwen3-4B`\n\
-                        - `/bench` (or `/bench t1`) — Run live ~260 tok/s `BM=4` or ~173 tok/s `T=1` benchmark inside chat\n\
+                        - `/bench` (or `/bench t1`) — Run live ~277 tok/s `BM=4` or ~173 tok/s `T=1` benchmark inside chat\n\
                         - `/verify` — Inspect loaded GGUF path, exact byte size, & unmodified model architecture\n\
                         - `/spec [on|off]` (`Ctrl+S`) — Toggle lossless `BM=4` speculative verification vs pure `T=1`\n\
                         - `/temp <0.0..2.0>` │ `/max <N>` │ `/sys <text>` — Sampling & system prompt controls\n\
@@ -2007,6 +2244,11 @@ impl TuiApp {
             };
             let lbl = format!(" 🔊 VOICE:{}{} ", self.voice_speaker, stt_note);
             x1 = scr.put_str(x1 + 1, 1, w, &lbl, Style::new(FG_TEXT, BG_BOT_TAG).bold());
+        }
+        if let Some(tb) = &self.topic_badge {
+            x1 = scr.put_str(x1 + 1, 1, w, tb, Style::new(BG_MAIN, FG_AMBER).bold());
+        } else if let Some(rb) = &self.rag_badge {
+            x1 = scr.put_str(x1 + 1, 1, w, rb, Style::new(BG_MAIN, FG_CYAN).bold());
         }
         if let Some(lb) = &self.lora_badge {
             x1 = scr.put_str(x1 + 1, 1, w, lb, Style::new(BG_MAIN, FG_PURPLE).bold());

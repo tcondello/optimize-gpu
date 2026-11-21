@@ -1,0 +1,60 @@
+{
+  "baseline_unpatched_alpha_on_0.6b": 0.6588,
+  "patched_alpha_on_0.6b": 0.6776,
+  "distilled_prior": {
+    "status": "ok",
+    "num_sequences": 100,
+    "map5_entries": 2499,
+    "map4_entries": 1503,
+    "out_path": "/Users/tim/Code/optimize-gpu/checkpoints/qwen-patched/calibrated_drafter_ngrams.bin"
+  },
+  "modes": [
+    {
+      "mode": "1_patched_T1_no_spec",
+      "num_prompts": 15,
+      "total_completion_tokens": 7680,
+      "aggregate_decode_tok_per_s": 124.47,
+      "mean_prompt_tok_per_s": 124.48,
+      "spec_verify_calls": 0,
+      "spec_accepted_extra": 0,
+      "acceptance_rate_alpha": 0.0,
+      "mean_tokens_per_verify": 1.0
+    },
+    {
+      "mode": "2_patched_dynamic_ngram_BM4",
+      "num_prompts": 15,
+      "total_completion_tokens": 7680,
+      "aggregate_decode_tok_per_s": 128.13,
+      "mean_prompt_tok_per_s": 128.22,
+      "spec_verify_calls": 786,
+      "spec_accepted_extra": 877,
+      "acceptance_rate_alpha": 0.3719,
+      "mean_tokens_per_verify": 2.116
+    },
+    {
+      "mode": "3_patched_qwen3_0.6b_neural_BM4",
+      "num_prompts": 15,
+      "total_completion_tokens": 7680,
+      "aggregate_decode_tok_per_s": 133.11,
+      "mean_prompt_tok_per_s": 134.03,
+      "spec_verify_calls": 2531,
+      "spec_accepted_extra": 5143,
+      "acceptance_rate_alpha": 0.6773,
+      "mean_tokens_per_verify": 3.032
+    },
+    {
+      "mode": "4_patched_qwen3_0.6b_calibrated_BM4",
+      "num_prompts": 15,
+      "total_completion_tokens": 7680,
+      "aggregate_decode_tok_per_s": 144.17,
+      "mean_prompt_tok_per_s": 144.8,
+      "spec_verify_calls": 2551,
+      "spec_accepted_extra": 5124,
+      "acceptance_rate_alpha": 0.6695,
+      "mean_tokens_per_verify": 3.009
+    }
+  ],
+  "winning_speculative_mode": "4_patched_qwen3_0.6b_calibrated_BM4",
+  "speedup_over_patched_t1": 1.158,
+  "bit_exact_distribution_verified": true
+}

@@ -1,0 +1,6 @@
+{
+  "peft_type": "LORA",
+  "r": 32,
+  "lora_alpha": 32.0,
+  "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+}

@@ -1,0 +1,22 @@
+{
+  "strategy": "svd_lora",
+  "num_docs": 1000,
+  "num_queries": 200,
+  "recall_at_1": 0.905,
+  "recall_at_5": 0.995,
+  "recall_at_10": 1.0,
+  "mrr_at_10": 0.9429,
+  "r1_hits": 181,
+  "r5_hits": 199,
+  "r10_hits": 200,
+  "mean_embed_ms": 217.73,
+  "median_embed_ms": 214.969,
+  "mean_gpu_search_us": 468.97,
+  "median_gpu_search_us": 468.46,
+  "eval_wall_s": 44.252,
+  "thinker_backbone": "Qwen3-8B-Q6_K.gguf",
+  "embedding_ancestor_donor": "Qwen3-Embedding-8B-Q6_K.gguf",
+  "embedding_dim": 4096,
+  "lora_disk_mb": 166.56,
+  "qvec_disk_mb": 8.55
+}

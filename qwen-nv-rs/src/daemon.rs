@@ -17,6 +17,8 @@ use crate::audio::{encode_wav_pcm16, parse_wav_bytes_mono_16k, TTS_SAMPLE_RATE};
 use crate::engine::{GenerationStats, QwenMegakernelEngine};
 use crate::gguf::Utf8StreamDecoder;
 use crate::lora::LoraStatus;
+use crate::rag::{load_jsonl_corpus, EmbedStrategy, RagHit, RagSearchStats};
+use crate::topic_lora::{json_find_num, json_find_str};
 use crate::tts::TtsSynthParams;
 
 static SHUTDOWN_REQ: AtomicBool = AtomicBool::new(false);
@@ -59,7 +61,8 @@ pub fn format_stats_json(stats: &GenerationStats, token_ids: &[i32]) -> String {
         "{{\"prompt_tokens\":{},\"cached_prefix_tokens\":{},\"prefill_new_tokens\":{},\"completion_tokens\":{},\
           \"prefill_ms\":{:.3},\"decode_ms\":{:.3},\"ttft_ms\":{:.3},\"total_ms\":{:.3},\
           \"decode_tok_per_s\":{:.2},\"prefill_tok_per_s\":{:.2},\"kernel_launches\":{},\
-          \"spec_verify_calls\":{},\"spec_accepted_extra\":{},\"stop_reason\":\"{}\",\"token_ids\":[{}]}}",
+          \"spec_verify_calls\":{},\"spec_accepted_extra\":{},\"spec_crossover_pos\":{},\"spec_crossover_switched\":{},\
+          \"stop_reason\":\"{}\",\"token_ids\":[{}]}}",
         stats.prompt_tokens,
         stats.cached_prefix_tokens,
         stats.prefill_new_tokens,
@@ -73,6 +76,8 @@ pub fn format_stats_json(stats: &GenerationStats, token_ids: &[i32]) -> String {
         stats.kernel_launches,
         stats.spec_verify_calls,
         stats.spec_accepted_extra,
+        stats.spec_crossover_pos,
+        stats.spec_crossover_switched,
         stats.stop_reason,
         ids_str.join(",")
     )
@@ -288,6 +293,499 @@ fn handle_daemon_client(engine: &mut QwenMegakernelEngine, mut stream: UnixStrea
             }
             Ok(false)
         }
+        "EMBED" => {
+            // EMBED \t strategy \t is_query("0"|"1") \t text_len \t lora_path + `<text_len>` UTF-8 bytes
+            if parts.len() < 5 {
+                let _ = stream.write_all(b"ERR\tMalformed EMBED header\n");
+                return Ok(false);
+            }
+            let strat_str = parts[1];
+            let is_query = parts[2] == "1";
+            let text_len: usize = parts[3].parse().unwrap_or(0);
+            let lora_path = parts[4..].join("\t");
+            let mut tbuf = vec![0u8; text_len];
+            if text_len > 0 {
+                stream.read_exact(&mut tbuf).map_err(|e| e.to_string())?;
+            }
+            let text = String::from_utf8_lossy(&tbuf);
+            let res = EmbedStrategy::from_str(strat_str).and_then(|strat| {
+                engine.embed_text(
+                    strat,
+                    &text,
+                    is_query,
+                    if lora_path.is_empty() { None } else { Some(lora_path.as_str()) },
+                )
+            });
+            match res {
+                Ok((vec_f32, ms)) => {
+                    let hdr = format!("OK\t{:.3}\t{}\n", ms, vec_f32.len());
+                    let mut resp = Vec::with_capacity(hdr.len() + vec_f32.len() * 4);
+                    resp.extend_from_slice(hdr.as_bytes());
+                    for &v in &vec_f32 {
+                        resp.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                    let _ = stream.write_all(&resp);
+                    let _ = stream.flush();
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+            Ok(false)
+        }
+        "RAG_STATUS" => {
+            let j = if let Some(ref db) = engine.rag_db {
+                format!(
+                    "{{\"active\":true,\"path\":\"{}\",\"strategy\":\"{}\",\"num_docs\":{},\"dim\":{},\"vram_mb\":{:.2},\"lora_path\":\"{}\"}}",
+                    json_escape(&db.path),
+                    db.strategy.as_str(),
+                    db.docs.len(),
+                    db.dim,
+                    db.vram_mb(),
+                    json_escape(&db.lora_path)
+                )
+            } else {
+                "{\"active\":false,\"num_docs\":0}".to_string()
+            };
+            let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+            Ok(false)
+        }
+        "RAG_CLEAR" => {
+            engine.clear_rag_qvec();
+            let _ = stream.write_all(b"OK\t{\"active\":false,\"num_docs\":0}\n");
+            Ok(false)
+        }
+        "DRAFTER_STATUS" => {
+            let j = if let Some(ref dr) = engine.drafter {
+                let (n5, n4, ppath) = if let Some(ref pr) = dr.calibrated_prior {
+                    (pr.map5.len(), pr.map4.len(), pr.source_path.as_str())
+                } else {
+                    (0, 0, "")
+                };
+                format!(
+                    "{{\"active\":true,\"model_ref\":\"{}\",\"model_name\":\"{}\",\"vram_mb\":{:.2},\"prior_5grams\":{},\"prior_4grams\":{},\"prior_path\":\"{}\"}}",
+                    json_escape(&dr.model_ref),
+                    json_escape(&dr.cfg.model_name),
+                    (dr.vram_bytes as f64) / (1024.0 * 1024.0),
+                    n5,
+                    n4,
+                    json_escape(ppath)
+                )
+            } else {
+                "{\"active\":false}".to_string()
+            };
+            let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+            Ok(false)
+        }
+        "DRAFTER_CLEAR" => {
+            engine.clear_drafter();
+            let _ = stream.write_all(b"OK\t{\"active\":false}\n");
+            Ok(false)
+        }
+        "DRAFTER_LOAD" => {
+            let d_ref = parts.get(1).copied().unwrap_or("qwen3:0.6b");
+            let prior_p = parts.get(2).copied().unwrap_or("");
+            let t0 = Instant::now();
+            let res = engine.ensure_drafter_loaded(d_ref).and_then(|_| {
+                if !prior_p.is_empty() {
+                    let _ = engine.load_drafter_prior(std::path::Path::new(prior_p))?;
+                }
+                Ok(())
+            });
+            match res {
+                Ok(()) => {
+                    let dr = engine.drafter.as_ref().unwrap();
+                    let (n5, n4) = dr
+                        .calibrated_prior
+                        .as_ref()
+                        .map_or((0, 0), |p| (p.map5.len(), p.map4.len()));
+                    let j = format!(
+                        "{{\"active\":true,\"model_ref\":\"{}\",\"model_name\":\"{}\",\"vram_mb\":{:.2},\"prior_5grams\":{},\"prior_4grams\":{},\"load_ms\":{:.2}}}",
+                        json_escape(&dr.model_ref),
+                        json_escape(&dr.cfg.model_name),
+                        (dr.vram_bytes as f64) / (1024.0 * 1024.0),
+                        n5,
+                        n4,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                    let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                }
+            }
+            Ok(false)
+        }
+        "HOOKS_EXTRACT" => {
+            if parts.len() < 2 {
+                let _ = stream.write_all(b"ERR\tMalformed HOOKS_EXTRACT\n");
+                return Ok(false);
+            }
+            let n_toks: usize = parts[1].parse().unwrap_or(0);
+            let mut raw = vec![0u8; n_toks * 4];
+            if !raw.is_empty() {
+                stream.read_exact(&mut raw).map_err(|e| e.to_string())?;
+            }
+            let toks: Vec<i32> = raw
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            match engine.extract_residual_hooks(&toks) {
+                Ok(vec_f32) => {
+                    let hdr = format!("OK\t{}\n", vec_f32.len());
+                    let mut resp = Vec::with_capacity(hdr.len() + vec_f32.len() * 4);
+                    resp.extend_from_slice(hdr.as_bytes());
+                    for &v in &vec_f32 {
+                        resp.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                    let _ = stream.write_all(&resp);
+                    let _ = stream.flush();
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+            Ok(false)
+        }
+        "LOGITS_EVAL" => {
+            if parts.len() < 2 {
+                let _ = stream.write_all(b"ERR\tMalformed LOGITS_EVAL\n");
+                return Ok(false);
+            }
+            let n_toks: usize = parts[1].parse().unwrap_or(0);
+            let mut raw = vec![0u8; n_toks * 4];
+            if !raw.is_empty() {
+                stream.read_exact(&mut raw).map_err(|e| e.to_string())?;
+            }
+            let toks: Vec<i32> = raw
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            match engine.eval_next_token_logits(&toks) {
+                Ok(logits) => {
+                    let hdr = format!("OK\t{}\n", logits.len());
+                    let mut resp = Vec::with_capacity(hdr.len() + logits.len() * 4);
+                    resp.extend_from_slice(hdr.as_bytes());
+                    for &v in &logits {
+                        resp.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                    let _ = stream.write_all(&resp);
+                    let _ = stream.flush();
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+            Ok(false)
+        }
+        "MLP_KV_EXTRACT" => {
+            // MLP_KV_EXTRACT \t n_toks \t pos_start \t pos_count \t layer_csv + raw `[n_toks]` i32 LE
+            if parts.len() < 5 {
+                let _ = stream.write_all(b"ERR\tMalformed MLP_KV_EXTRACT\n");
+                return Ok(false);
+            }
+            let n_toks: usize = parts[1].parse().unwrap_or(0);
+            let pos_start: usize = parts[2].parse().unwrap_or(0);
+            let pos_count: usize = parts[3].parse().unwrap_or(0);
+            let layers: Vec<usize> = parts[4]
+                .split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .collect();
+            let mut raw = vec![0u8; n_toks * 4];
+            if !raw.is_empty() {
+                stream.read_exact(&mut raw).map_err(|e| e.to_string())?;
+            }
+            let toks: Vec<i32> = raw
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            match engine.extract_mlp_kv_hooks(&toks, &layers, pos_start, pos_count) {
+                Ok((keys_f32, res_f32)) => {
+                    let hdr = format!("OK\t{}\t{}\n", keys_f32.len(), res_f32.len());
+                    let mut resp = Vec::with_capacity(hdr.len() + (keys_f32.len() + res_f32.len()) * 4);
+                    resp.extend_from_slice(hdr.as_bytes());
+                    for &v in &keys_f32 {
+                        resp.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                    for &v in &res_f32 {
+                        resp.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                    let _ = stream.write_all(&resp);
+                    let _ = stream.flush();
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+            Ok(false)
+        }
+        "TOPIC_LOAD" => {
+            if parts.len() < 2 {
+                let _ = stream.write_all(b"ERR\tMalformed TOPIC_LOAD\n");
+                return Ok(false);
+            }
+            let bank_dir = parts[1..].join("\t");
+            let t0 = Instant::now();
+            match engine.load_topic_bank(std::path::Path::new(&bank_dir)) {
+                Ok((canonical, n_topics, n_docs)) => {
+                    let (used_slots, max_slots, embed_pinned) = engine.lora_cache_summary();
+                    let j = format!(
+                        "{{\"active\":true,\"bank_dir\":\"{}\",\"num_topics\":{},\"num_docs\":{},\"cached_topic_slots\":{},\"max_topic_slots\":{},\"embed_lora_pinned\":{},\"load_ms\":{:.2}}}",
+                        json_escape(&canonical),
+                        n_topics,
+                        n_docs,
+                        used_slots,
+                        max_slots,
+                        embed_pinned,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                    let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                }
+            }
+            Ok(false)
+        }
+        "TOPIC_STATUS" => {
+            let (used_slots, max_slots, embed_pinned) = engine.lora_cache_summary();
+            let j = if let Some((ref dir, ref man)) = engine.topic_bank {
+                format!(
+                    "{{\"active\":true,\"bank_dir\":\"{}\",\"num_topics\":{},\"router_qvec\":\"{}\",\"min_score\":{:.4},\"system_prompt\":\"{}\",\"cached_topic_slots\":{},\"max_topic_slots\":{},\"embed_lora_pinned\":{},\"active_lora\":{}}}",
+                    json_escape(dir),
+                    man.topics.len(),
+                    json_escape(&man.router_qvec),
+                    man.min_score,
+                    json_escape(&man.system_prompt),
+                    used_slots,
+                    max_slots,
+                    embed_pinned,
+                    format_lora_json(&engine.lora_status)
+                )
+            } else {
+                format!(
+                    "{{\"active\":false,\"num_topics\":0,\"cached_topic_slots\":{},\"max_topic_slots\":{},\"embed_lora_pinned\":{},\"active_lora\":{}}}",
+                    used_slots,
+                    max_slots,
+                    embed_pinned,
+                    format_lora_json(&engine.lora_status)
+                )
+            };
+            let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+            Ok(false)
+        }
+        "TOPIC_LIST" => {
+            let j = if let Some((_, ref man)) = engine.topic_bank {
+                let items: Vec<String> = man
+                    .topics
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "{{\"title\":\"{}\",\"slug\":\"{}\",\"num_facts\":{},\"rank\":{},\"mean_fit_err\":{:.6},\"kl_nats\":{:.6}}}",
+                            json_escape(&t.title),
+                            json_escape(&t.slug),
+                            t.num_facts,
+                            t.rank,
+                            t.mean_fit_err,
+                            t.kl_nats
+                        )
+                    })
+                    .collect();
+                format!("[{}]", items.join(","))
+            } else {
+                "[]".to_string()
+            };
+            let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+            Ok(false)
+        }
+        "TOPIC_CLEAR" => {
+            let _ = engine.clear_topic_bank();
+            let _ = stream.write_all(b"OK\t{\"active\":false,\"num_topics\":0}\n");
+            Ok(false)
+        }
+        "TOPIC_ROUTE" => {
+            // TOPIC_ROUTE \t auto_load("0"|"1") \t top_k \t min_score \t qlen + `<qlen>` UTF-8 bytes
+            if parts.len() < 5 {
+                let _ = stream.write_all(b"ERR\tMalformed TOPIC_ROUTE\n");
+                return Ok(false);
+            }
+            let auto_load = parts[1] == "1";
+            let top_k: usize = parts[2].parse().unwrap_or(3);
+            let min_score_raw: f32 = parts[3].parse().unwrap_or(-1.0);
+            let min_score_opt = if min_score_raw >= 0.0 {
+                Some(min_score_raw)
+            } else {
+                None
+            };
+            let qlen: usize = parts[4].parse().unwrap_or(0);
+            let mut qbuf = vec![0u8; qlen];
+            if qlen > 0 {
+                stream.read_exact(&mut qbuf).map_err(|e| e.to_string())?;
+            }
+            let query = String::from_utf8_lossy(&qbuf);
+            match engine.topic_route(&query, top_k, min_score_opt, auto_load) {
+                Ok(rt) => {
+                    let (t_title, t_slug) = rt
+                        .topic
+                        .as_ref()
+                        .map(|t| (t.title.as_str(), t.slug.as_str()))
+                        .unwrap_or(("", ""));
+                    let hits_j: Vec<String> = rt
+                        .hits
+                        .iter()
+                        .map(|h| {
+                            format!(
+                                "{{\"id\":{},\"title\":\"{}\",\"score\":{:.4}}}",
+                                h.id,
+                                json_escape(&h.title),
+                                h.score
+                            )
+                        })
+                        .collect();
+                    let (used_slots, max_slots, embed_pinned) = engine.lora_cache_summary();
+                    let j = format!(
+                        "{{\"matched\":{},\"topic\":\"{}\",\"slug\":\"{}\",\"score\":{:.6},\"lora_dir\":\"{}\",\"system_prompt\":\"{}\",\"embed_ms\":{:.3},\"gpu_search_us\":{:.2},\"swap_ms\":{:.3},\"cached_topic_slots\":{},\"max_topic_slots\":{},\"embed_lora_pinned\":{},\"hits\":[{}]}}",
+                        rt.matched,
+                        json_escape(t_title),
+                        json_escape(t_slug),
+                        rt.score,
+                        json_escape(&rt.lora_dir),
+                        json_escape(&rt.system_prompt),
+                        rt.embed_ms,
+                        rt.gpu_search_us,
+                        rt.swap_ms,
+                        used_slots,
+                        max_slots,
+                        embed_pinned,
+                        hits_j.join(",")
+                    );
+                    let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                }
+            }
+            Ok(false)
+        }
+        "RAG_LOAD" => {
+            if parts.len() < 2 {
+                let _ = stream.write_all(b"ERR\tMalformed RAG_LOAD\n");
+                return Ok(false);
+            }
+            let qvec_path = parts[1..].join("\t");
+            let t0 = Instant::now();
+            match engine.load_rag_qvec(std::path::Path::new(&qvec_path)) {
+                Ok(()) => {
+                    let db = engine.rag_db.as_ref().unwrap();
+                    let j = format!(
+                        "{{\"active\":true,\"path\":\"{}\",\"strategy\":\"{}\",\"num_docs\":{},\"dim\":{},\"vram_mb\":{:.2},\"load_ms\":{:.2}}}",
+                        json_escape(&db.path),
+                        db.strategy.as_str(),
+                        db.docs.len(),
+                        db.dim,
+                        db.vram_mb(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                    let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                }
+            }
+            Ok(false)
+        }
+        "RAG_INDEX" => {
+            // RAG_INDEX \t strategy \t load_flag("0"|"1") \t jsonl_path \t out_qvec_path \t lora_path
+            if parts.len() < 5 {
+                let _ = stream.write_all(b"ERR\tMalformed RAG_INDEX\n");
+                return Ok(false);
+            }
+            let strat_str = parts[1];
+            let load_into_vram = parts[2] == "1";
+            let jsonl_path = parts[3];
+            let out_qvec_path = parts[4];
+            let lora_path = if parts.len() > 5 { parts[5..].join("\t") } else { String::new() };
+
+            let res = EmbedStrategy::from_str(strat_str).and_then(|strat| {
+                let docs = load_jsonl_corpus(std::path::Path::new(jsonl_path))?;
+                let n_docs = docs.len();
+                let (tot_ms, dps) = engine.build_qvec_index(
+                    &docs,
+                    strat,
+                    &lora_path,
+                    std::path::Path::new(out_qvec_path),
+                    load_into_vram,
+                )?;
+                Ok((n_docs, strat.as_str(), tot_ms, dps))
+            });
+            match res {
+                Ok((n_docs, sname, tot_ms, dps)) => {
+                    let j = format!(
+                        "{{\"status\":\"ok\",\"strategy\":\"{}\",\"num_docs\":{},\"out_path\":\"{}\",\"total_ms\":{:.2},\"passages_per_s\":{:.2}}}",
+                        sname,
+                        n_docs,
+                        json_escape(out_qvec_path),
+                        tot_ms,
+                        dps
+                    );
+                    let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                }
+            }
+            Ok(false)
+        }
+        "RAG_SEARCH" => {
+            // RAG_SEARCH \t top_k \t query_len + `<query_len>` UTF-8 bytes
+            if parts.len() < 3 {
+                let _ = stream.write_all(b"ERR\tMalformed RAG_SEARCH\n");
+                return Ok(false);
+            }
+            let top_k: usize = parts[1].parse().unwrap_or(3);
+            let qlen: usize = parts[2].parse().unwrap_or(0);
+            let mut qbuf = vec![0u8; qlen];
+            if qlen > 0 {
+                stream.read_exact(&mut qbuf).map_err(|e| e.to_string())?;
+            }
+            let query = String::from_utf8_lossy(&qbuf);
+            match engine.rag_search(&query, top_k) {
+                Ok(st) => {
+                    let hdr = format!(
+                        "OK\t{}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\n",
+                        st.hits.len(),
+                        st.embed_ms,
+                        st.gpu_search_us,
+                        st.total_ms,
+                        st.num_docs,
+                        st.strategy
+                    );
+                    let mut resp = Vec::with_capacity(hdr.len() + st.hits.len() * 512);
+                    resp.extend_from_slice(hdr.as_bytes());
+                    for h in &st.hits {
+                        let tb = h.title.as_bytes();
+                        let xb = h.text.as_bytes();
+                        resp.extend_from_slice(&h.id.to_le_bytes());
+                        resp.extend_from_slice(&h.score.to_bits().to_le_bytes());
+                        resp.extend_from_slice(&(tb.len() as u32).to_le_bytes());
+                        resp.extend_from_slice(tb);
+                        resp.extend_from_slice(&(xb.len() as u32).to_le_bytes());
+                        resp.extend_from_slice(xb);
+                    }
+                    let _ = stream.write_all(&resp);
+                    let _ = stream.flush();
+                }
+                Err(e) => {
+                    let _ = stream.write_all(format!("ERR\t{}\n", e.replace('\n', " ")).as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+            Ok(false)
+        }
         "CODEC_DECODE" => {
             // CODEC_DECODE \t talker_ref \t n_frames + raw `[n_frames * 16]` i32s
             if parts.len() < 3 {
@@ -442,6 +940,14 @@ fn handle_daemon_client(engine: &mut QwenMegakernelEngine, mut stream: UnixStrea
             let spec: bool = parts[3] == "1";
             let reset: bool = parts[4] == "1";
             let mode = parts[5];
+            let saved_crossover = engine.spec_crossover_pos;
+            if let Some(co_s) = parts.get(6) {
+                if !co_s.is_empty() {
+                    if let Ok(co_v) = co_s.parse::<usize>() {
+                        engine.spec_crossover_pos = co_v;
+                    }
+                }
+            }
 
             let mut len_b = [0u8; 4];
             stream.read_exact(&mut len_b).map_err(|e| e.to_string())?;
@@ -468,11 +974,22 @@ fn handle_daemon_client(engine: &mut QwenMegakernelEngine, mut stream: UnixStrea
                 }
                 v.extend(engine.tok.encode(&s));
                 v
+            } else if mode == "chat_sys" && payload.len() >= 4 {
+                let sys_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+                let sys_end = (4 + sys_len).min(payload.len());
+                let sys_s = String::from_utf8_lossy(&payload[4..sys_end]).into_owned();
+                let usr_s = String::from_utf8_lossy(&payload[sys_end..]).into_owned();
+                let mut msgs = Vec::with_capacity(2);
+                if !sys_s.is_empty() {
+                    msgs.push(("system".to_string(), sys_s));
+                }
+                msgs.push(("user".to_string(), usr_s));
+                engine.encode_chat(&msgs, false)
             } else {
                 // "chat": tab-separated lines `role\tcontent` or single user prompt
                 let s = String::from_utf8_lossy(&payload);
                 let msgs = vec![("user".to_string(), s.into_owned())];
-                engine.encode_chat(&msgs, false)
+                engine.encode_chat(&msgs, true)
             };
 
             let mut utf8_dec = Utf8StreamDecoder::new();
@@ -504,6 +1021,7 @@ fn handle_daemon_client(engine: &mut QwenMegakernelEngine, mut stream: UnixStrea
                     true
                 },
             );
+            engine.spec_crossover_pos = saved_crossover;
 
             if !client_alive {
                 return Ok(false);
@@ -623,7 +1141,7 @@ pub fn ensure_daemon_running(model_ref: &str, max_ctx: usize) -> Result<(), Stri
         .map_err(|e| format!("Failed to spawn daemon: {}", e))?;
 
     let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(30) {
+    while t0.elapsed() < Duration::from_secs(60) {
         if daemon_ping().is_ok() {
             return Ok(());
         }
@@ -633,11 +1151,11 @@ pub fn ensure_daemon_running(model_ref: &str, max_ctx: usize) -> Result<(), Stri
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Err("Timed out waiting 30s for background GPU daemon to initialize".into())
+    Err("Timed out waiting 60s for background GPU daemon to initialize".into())
 }
 
-pub fn client_generate_via_daemon<F>(
-    prompt: &str,
+fn client_generate_via_daemon_raw<F>(
+    payload: &[u8],
     mode: &str,
     max_tokens: usize,
     temp: f32,
@@ -652,19 +1170,20 @@ where
     let mut s = UnixStream::connect(&sock_path)
         .map_err(|e| format!("Failed to connect to daemon {}: {}", sock_path.display(), e))?;
 
+    let co_override = std::env::var("QWEN_NV_SPEC_CROSSOVER").unwrap_or_default();
     let hdr = format!(
-        "GEN\t{}\t{:.4}\t{}\t{}\t{}\n",
+        "GEN\t{}\t{:.4}\t{}\t{}\t{}\t{}\n",
         max_tokens,
         temp,
         u8::from(spec),
         u8::from(reset_cache),
-        mode
+        mode,
+        co_override
     );
-    let pb = prompt.as_bytes();
-    let mut req = Vec::with_capacity(hdr.len() + 4 + pb.len());
+    let mut req = Vec::with_capacity(hdr.len() + 4 + payload.len());
     req.extend_from_slice(hdr.as_bytes());
-    req.extend_from_slice(&(pb.len() as u32).to_le_bytes());
-    req.extend_from_slice(pb);
+    req.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    req.extend_from_slice(payload);
     s.write_all(&req).map_err(|e| e.to_string())?;
     s.flush().map_err(|e| e.to_string())?;
 
@@ -705,6 +1224,58 @@ where
     }
 }
 
+pub fn client_generate_via_daemon<F>(
+    prompt: &str,
+    mode: &str,
+    max_tokens: usize,
+    temp: f32,
+    spec: bool,
+    reset_cache: bool,
+    on_piece: F,
+) -> Result<String, String>
+where
+    F: FnMut(i32, &str),
+{
+    client_generate_via_daemon_raw(
+        prompt.as_bytes(),
+        mode,
+        max_tokens,
+        temp,
+        spec,
+        reset_cache,
+        on_piece,
+    )
+}
+
+pub fn client_generate_chat_sys_via_daemon<F>(
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: usize,
+    temp: f32,
+    spec: bool,
+    reset_cache: bool,
+    on_piece: F,
+) -> Result<String, String>
+where
+    F: FnMut(i32, &str),
+{
+    let sb = system_prompt.as_bytes();
+    let ub = user_prompt.as_bytes();
+    let mut payload = Vec::with_capacity(4 + sb.len() + ub.len());
+    payload.extend_from_slice(&(sb.len() as u32).to_le_bytes());
+    payload.extend_from_slice(sb);
+    payload.extend_from_slice(ub);
+    client_generate_via_daemon_raw(
+        &payload,
+        "chat_sys",
+        max_tokens,
+        temp,
+        spec,
+        reset_cache,
+        on_piece,
+    )
+}
+
 pub fn client_simple_cmd(cmd_line: &str) -> Result<String, String> {
     let sock_path = daemon_sock_path();
     let mut s = UnixStream::connect(&sock_path)
@@ -743,6 +1314,365 @@ pub fn client_tts_warm(talker_ref: &str) -> Result<String, String> {
 
 pub fn client_asr_warm(asr_ref: &str) -> Result<String, String> {
     client_simple_cmd(&format!("ASR_WARM\t{}\n", asr_ref))
+}
+
+pub fn client_rag_status() -> Result<String, String> {
+    client_simple_cmd("RAG_STATUS\n")
+}
+
+pub fn client_rag_clear() -> Result<String, String> {
+    client_simple_cmd("RAG_CLEAR\n")
+}
+
+pub fn client_rag_load(qvec_path: &str) -> Result<String, String> {
+    client_simple_cmd(&format!("RAG_LOAD\t{}\n", qvec_path))
+}
+
+pub fn client_drafter_status() -> Result<String, String> {
+    client_simple_cmd("DRAFTER_STATUS\n")
+}
+
+pub fn client_drafter_clear() -> Result<String, String> {
+    client_simple_cmd("DRAFTER_CLEAR\n")
+}
+
+pub fn client_drafter_load(draft_ref: &str, prior_path: &str) -> Result<String, String> {
+    client_simple_cmd(&format!("DRAFTER_LOAD\t{}\t{}\n", draft_ref, prior_path))
+}
+
+pub fn client_vec_f32_cmd(cmd_prefix: &str, tok_ids: &[i32]) -> Result<Vec<f32>, String> {
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path)
+        .map_err(|e| format!("Failed to connect to daemon {}: {}", sock_path.display(), e))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(120)));
+    let hdr = format!("{}\t{}\n", cmd_prefix, tok_ids.len());
+    let mut req = Vec::with_capacity(hdr.len() + tok_ids.len() * 4);
+    req.extend_from_slice(hdr.as_bytes());
+    for &t in tok_ids {
+        req.extend_from_slice(&t.to_le_bytes());
+    }
+    s.write_all(&req).map_err(|e| e.to_string())?;
+    s.flush().map_err(|e| e.to_string())?;
+
+    let mut rdr = BufReader::new(s);
+    let mut line = String::new();
+    rdr.read_line(&mut line).map_err(|e| e.to_string())?;
+    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(err) = trimmed.strip_prefix("ERR\t") {
+        return Err(err.to_string());
+    }
+    let rest = trimmed
+        .strip_prefix("OK\t")
+        .ok_or_else(|| format!("Unexpected {} reply: {}", cmd_prefix, trimmed))?;
+    let n_floats: usize = rest.trim().parse().unwrap_or(0);
+    let mut raw = vec![0u8; n_floats * 4];
+    rdr.read_exact(&mut raw).map_err(|e| e.to_string())?;
+    Ok(raw
+        .chunks_exact(4)
+        .map(|c| f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))
+        .collect())
+}
+
+pub fn client_extract_hooks(tok_ids: &[i32]) -> Result<Vec<f32>, String> {
+    client_vec_f32_cmd("HOOKS_EXTRACT", tok_ids)
+}
+
+pub fn client_eval_logits(tok_ids: &[i32]) -> Result<Vec<f32>, String> {
+    client_vec_f32_cmd("LOGITS_EVAL", tok_ids)
+}
+
+pub fn client_extract_mlp_kv(
+    tok_ids: &[i32],
+    layers: &[usize],
+    pos_start: usize,
+    pos_count: usize,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path)
+        .map_err(|e| format!("Failed to connect to daemon {}: {}", sock_path.display(), e))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(120)));
+    let lcsv: Vec<String> = layers.iter().map(|l| l.to_string()).collect();
+    let hdr = format!(
+        "MLP_KV_EXTRACT\t{}\t{}\t{}\t{}\n",
+        tok_ids.len(),
+        pos_start,
+        pos_count,
+        lcsv.join(",")
+    );
+    let mut req = Vec::with_capacity(hdr.len() + tok_ids.len() * 4);
+    req.extend_from_slice(hdr.as_bytes());
+    for &t in tok_ids {
+        req.extend_from_slice(&t.to_le_bytes());
+    }
+    s.write_all(&req).map_err(|e| e.to_string())?;
+    s.flush().map_err(|e| e.to_string())?;
+
+    let mut rdr = BufReader::new(s);
+    let mut line = String::new();
+    rdr.read_line(&mut line).map_err(|e| e.to_string())?;
+    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(err) = trimmed.strip_prefix("ERR\t") {
+        return Err(err.to_string());
+    }
+    let rest = trimmed
+        .strip_prefix("OK\t")
+        .ok_or_else(|| format!("Unexpected MLP_KV_EXTRACT reply: {}", trimmed))?;
+    let p: Vec<&str> = rest.split('\t').collect();
+    if p.len() < 2 {
+        return Err(format!("Malformed MLP_KV_EXTRACT header: {}", trimmed));
+    }
+    let k_len: usize = p[0].parse().unwrap_or(0);
+    let r_len: usize = p[1].parse().unwrap_or(0);
+    let mut raw_k = vec![0u8; k_len * 4];
+    let mut raw_r = vec![0u8; r_len * 4];
+    if !raw_k.is_empty() {
+        rdr.read_exact(&mut raw_k).map_err(|e| e.to_string())?;
+    }
+    if !raw_r.is_empty() {
+        rdr.read_exact(&mut raw_r).map_err(|e| e.to_string())?;
+    }
+    let keys = raw_k
+        .chunks_exact(4)
+        .map(|c| f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))
+        .collect();
+    let res = raw_r
+        .chunks_exact(4)
+        .map(|c| f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))
+        .collect();
+    Ok((keys, res))
+}
+
+#[derive(Clone, Debug)]
+pub struct TopicRouteClientReply {
+    pub matched: bool,
+    pub topic: String,
+    pub slug: String,
+    pub score: f32,
+    pub lora_dir: String,
+    pub system_prompt: String,
+    pub embed_ms: f64,
+    pub gpu_search_us: f64,
+    pub swap_ms: f64,
+    pub raw_json: String,
+}
+
+pub fn client_topic_load(bank_dir: &str) -> Result<String, String> {
+    client_simple_cmd(&format!("TOPIC_LOAD\t{}\n", bank_dir))
+}
+
+pub fn client_topic_status() -> Result<String, String> {
+    client_simple_cmd("TOPIC_STATUS\n")
+}
+
+pub fn client_topic_list() -> Result<String, String> {
+    client_simple_cmd("TOPIC_LIST\n")
+}
+
+pub fn client_topic_clear() -> Result<String, String> {
+    client_simple_cmd("TOPIC_CLEAR\n")
+}
+
+pub fn client_topic_route(
+    query: &str,
+    top_k: usize,
+    min_score: f32,
+    auto_load: bool,
+) -> Result<TopicRouteClientReply, String> {
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path)
+        .map_err(|e| format!("Failed to connect to daemon {}: {}", sock_path.display(), e))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+    let qb = query.as_bytes();
+    let hdr = format!(
+        "TOPIC_ROUTE\t{}\t{}\t{:.4}\t{}\n",
+        u8::from(auto_load),
+        top_k,
+        min_score,
+        qb.len()
+    );
+    let mut req = Vec::with_capacity(hdr.len() + qb.len());
+    req.extend_from_slice(hdr.as_bytes());
+    req.extend_from_slice(qb);
+    s.write_all(&req).map_err(|e| e.to_string())?;
+    s.flush().map_err(|e| e.to_string())?;
+
+    let mut rdr = BufReader::new(s);
+    let mut line = String::new();
+    rdr.read_line(&mut line).map_err(|e| e.to_string())?;
+    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(err) = trimmed.strip_prefix("ERR\t") {
+        return Err(err.to_string());
+    }
+    let j = trimmed
+        .strip_prefix("OK\t")
+        .ok_or_else(|| format!("Unexpected TOPIC_ROUTE reply: {}", trimmed))?
+        .to_string();
+
+    Ok(TopicRouteClientReply {
+        matched: j.contains("\"matched\":true"),
+        topic: json_find_str(&j, "topic").unwrap_or_default(),
+        slug: json_find_str(&j, "slug").unwrap_or_default(),
+        score: json_find_num(&j, "score").unwrap_or(0.0) as f32,
+        lora_dir: json_find_str(&j, "lora_dir").unwrap_or_default(),
+        system_prompt: json_find_str(&j, "system_prompt").unwrap_or_default(),
+        embed_ms: json_find_num(&j, "embed_ms").unwrap_or(0.0),
+        gpu_search_us: json_find_num(&j, "gpu_search_us").unwrap_or(0.0),
+        swap_ms: json_find_num(&j, "swap_ms").unwrap_or(0.0),
+        raw_json: j,
+    })
+}
+
+pub fn client_rag_index(
+    strategy: &str,
+    jsonl_path: &str,
+    out_qvec_path: &str,
+    lora_path: &str,
+    load_into_vram: bool,
+) -> Result<String, String> {
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path)
+        .map_err(|e| format!("Failed to connect to daemon {}: {}", sock_path.display(), e))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2400)));
+    let cmd = format!(
+        "RAG_INDEX\t{}\t{}\t{}\t{}\t{}\n",
+        strategy,
+        u8::from(load_into_vram),
+        jsonl_path,
+        out_qvec_path,
+        lora_path
+    );
+    s.write_all(cmd.as_bytes()).map_err(|e| e.to_string())?;
+    s.flush().map_err(|e| e.to_string())?;
+    let mut rdr = BufReader::new(s);
+    let mut reply = String::new();
+    rdr.read_line(&mut reply).map_err(|e| e.to_string())?;
+    let trimmed = reply.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(rest) = trimmed.strip_prefix("OK\t") {
+        Ok(rest.to_string())
+    } else if let Some(err) = trimmed.strip_prefix("ERR\t") {
+        Err(err.to_string())
+    } else {
+        Err(format!("Unexpected RAG_INDEX reply: {}", trimmed))
+    }
+}
+
+pub fn client_embed_via_daemon(
+    strategy: &str,
+    is_query: bool,
+    lora_path: &str,
+    text: &str,
+) -> Result<(Vec<f32>, f64), String> {
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path)
+        .map_err(|e| format!("Failed to connect to daemon {}: {}", sock_path.display(), e))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+    let tb = text.as_bytes();
+    let hdr = format!(
+        "EMBED\t{}\t{}\t{}\t{}\n",
+        strategy,
+        u8::from(is_query),
+        tb.len(),
+        lora_path
+    );
+    let mut req = Vec::with_capacity(hdr.len() + tb.len());
+    req.extend_from_slice(hdr.as_bytes());
+    req.extend_from_slice(tb);
+    s.write_all(&req).map_err(|e| e.to_string())?;
+    s.flush().map_err(|e| e.to_string())?;
+
+    let mut rdr = BufReader::new(s);
+    let mut line = String::new();
+    rdr.read_line(&mut line).map_err(|e| e.to_string())?;
+    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(err) = trimmed.strip_prefix("ERR\t") {
+        return Err(err.to_string());
+    }
+    let rest = trimmed
+        .strip_prefix("OK\t")
+        .ok_or_else(|| format!("Unexpected EMBED reply: {}", trimmed))?;
+    let parts: Vec<&str> = rest.split('\t').collect();
+    if parts.len() < 2 {
+        return Err(format!("Malformed EMBED reply: {}", trimmed));
+    }
+    let ms: f64 = parts[0].parse().unwrap_or(0.0);
+    let dim: usize = parts[1].parse().unwrap_or(0);
+    let mut raw = vec![0u8; dim * 4];
+    rdr.read_exact(&mut raw).map_err(|e| e.to_string())?;
+    let vec_f32: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|c| f32::from_bits(u32::from_le_bytes(c.try_into().unwrap())))
+        .collect();
+    Ok((vec_f32, ms))
+}
+
+pub fn client_rag_search(query: &str, top_k: usize) -> Result<RagSearchStats, String> {
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path)
+        .map_err(|e| format!("Failed to connect to daemon {}: {}", sock_path.display(), e))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+    let qb = query.as_bytes();
+    let hdr = format!("RAG_SEARCH\t{}\t{}\n", top_k, qb.len());
+    let mut req = Vec::with_capacity(hdr.len() + qb.len());
+    req.extend_from_slice(hdr.as_bytes());
+    req.extend_from_slice(qb);
+    s.write_all(&req).map_err(|e| e.to_string())?;
+    s.flush().map_err(|e| e.to_string())?;
+
+    let mut rdr = BufReader::new(s);
+    let mut line = String::new();
+    rdr.read_line(&mut line).map_err(|e| e.to_string())?;
+    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(err) = trimmed.strip_prefix("ERR\t") {
+        return Err(err.to_string());
+    }
+    let rest = trimmed
+        .strip_prefix("OK\t")
+        .ok_or_else(|| format!("Unexpected RAG_SEARCH reply: {}", trimmed))?;
+    let parts: Vec<&str> = rest.split('\t').collect();
+    if parts.len() < 6 {
+        return Err(format!("Malformed RAG_SEARCH header: {}", trimmed));
+    }
+    let hit_cnt: usize = parts[0].parse().unwrap_or(0);
+    let embed_ms: f64 = parts[1].parse().unwrap_or(0.0);
+    let gpu_search_us: f64 = parts[2].parse().unwrap_or(0.0);
+    let total_ms: f64 = parts[3].parse().unwrap_or(0.0);
+    let num_docs: usize = parts[4].parse().unwrap_or(0);
+    let strategy = parts[5].to_string();
+
+    let mut hits = Vec::with_capacity(hit_cnt);
+    for _ in 0..hit_cnt {
+        let mut meta = [0u8; 12];
+        rdr.read_exact(&mut meta).map_err(|e| e.to_string())?;
+        let id = u32::from_le_bytes(meta[0..4].try_into().unwrap());
+        let score = f32::from_bits(u32::from_le_bytes(meta[4..8].try_into().unwrap()));
+        let tlen = u32::from_le_bytes(meta[8..12].try_into().unwrap()) as usize;
+        let mut tbuf = vec![0u8; tlen];
+        if tlen > 0 {
+            rdr.read_exact(&mut tbuf).map_err(|e| e.to_string())?;
+        }
+        let mut xlen_b = [0u8; 4];
+        rdr.read_exact(&mut xlen_b).map_err(|e| e.to_string())?;
+        let xlen = u32::from_le_bytes(xlen_b) as usize;
+        let mut xbuf = vec![0u8; xlen];
+        if xlen > 0 {
+            rdr.read_exact(&mut xbuf).map_err(|e| e.to_string())?;
+        }
+        hits.push(RagHit {
+            id,
+            title: String::from_utf8_lossy(&tbuf).into_owned(),
+            text: String::from_utf8_lossy(&xbuf).into_owned(),
+            score,
+        });
+    }
+
+    Ok(RagSearchStats {
+        hits,
+        embed_ms,
+        gpu_search_us,
+        total_ms,
+        strategy,
+        num_docs,
+    })
 }
 
 pub fn client_transcribe_via_daemon(
@@ -1242,7 +2172,7 @@ fn handle_http_conn(engine: &mut QwenMegakernelEngine, mut stream: TcpStream, sp
             let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
             return Ok(());
         }
-        let prompt_ids = engine.encode_chat(&msgs, false);
+        let prompt_ids = engine.encode_chat(&msgs, true);
         let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let model_id = json_escape(&engine.cfg.model_name);
 
@@ -1395,6 +2325,51 @@ fn handle_http_conn(engine: &mut QwenMegakernelEngine, mut stream: TcpStream, sp
                     json_escape(&stats.detected_language),
                     stats.audio_sec,
                     stats.total_ms
+                );
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                    resp_j.len(),
+                    resp_j
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+            }
+            Err(e) => {
+                let err_j = format!("{{\"error\":\"{}\"}}", json_escape(&e));
+                let hdr = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    err_j.len(),
+                    err_j
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+            }
+        }
+        return Ok(());
+    }
+
+    if method == "POST" && path.starts_with("/v1/embeddings") {
+        let body_str = String::from_utf8_lossy(&body);
+        let input = body_str
+            .find("\"input\"")
+            .and_then(|i| extract_json_str_after(&body_str[i + 7..]))
+            .unwrap_or_default();
+        if input.trim().is_empty() {
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            return Ok(());
+        }
+        let strat_str = body_str
+            .find("\"strategy\"")
+            .and_then(|i| extract_json_str_after(&body_str[i + 10..]))
+            .unwrap_or_else(|| "echo".into());
+        let strat = EmbedStrategy::from_str(&strat_str).unwrap_or(EmbedStrategy::Echo);
+        match engine.embed_text(strat, &input, true, None) {
+            Ok((vec_f32, ms)) => {
+                let nums: Vec<String> = vec_f32.iter().map(|v| format!("{:.6}", v)).collect();
+                let resp_j = format!(
+                    "{{\"object\":\"list\",\"data\":[{{\"object\":\"embedding\",\"index\":0,\"embedding\":[{}]}}],\"model\":\"{}\",\"strategy\":\"{}\",\"embed_ms\":{:.2}}}",
+                    nums.join(","),
+                    json_escape(&engine.cfg.model_name),
+                    strat.as_str(),
+                    ms
                 );
                 let hdr = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",

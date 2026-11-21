@@ -1,0 +1,69 @@
+{
+  "num_prompts": 20,
+  "max_gen_tokens": 4096,
+  "accuracy": 0.1,
+  "correct_count": 2,
+  "end_think_completion_rate": 0.25,
+  "truncated_no_end_think_rate": 0.75,
+  "avg_think_tokens": 3686.25,
+  "avg_completion_tokens": 3824.75,
+  "avg_hesitation_markers": 4.95,
+  "loop_or_bloat_rate": 0.95,
+  "premature_early_stop_rate": 0.0,
+  "total_failure_mode_rate": 0.95,
+  "failure_set_count": 19,
+  "clean_set_count": 1,
+  "tok_per_sec_t1": 94.07,
+  "tok_per_sec_eval_mode": 94.07,
+  "spec_acceptance_alpha": 0.0,
+  "by_category": {
+    "aime_feb2026": {
+      "count": 4,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.25,
+      "avg_think_tokens": 3886.25,
+      "avg_hesitation_markers": 5.75,
+      "loop_or_bloat_rate": 1.0
+    },
+    "amc12_nov2025": {
+      "count": 8,
+      "correct": 2,
+      "accuracy": 0.25,
+      "end_think_completion_rate": 0.375,
+      "avg_think_tokens": 3227.5,
+      "avg_hesitation_markers": 4.62,
+      "loop_or_bloat_rate": 0.875
+    },
+    "arxiv_math2026": {
+      "count": 4,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.25,
+      "avg_think_tokens": 3994.0,
+      "avg_hesitation_markers": 4.0,
+      "loop_or_bloat_rate": 1.0
+    },
+    "hmmt_nov2025": {
+      "count": 4,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.0,
+      "avg_think_tokens": 4096.0,
+      "avg_hesitation_markers": 5.75,
+      "loop_or_bloat_rate": 1.0
+    }
+  },
+  "patch_info": {
+    "status": "patched",
+    "out_dir": "/Users/tim/Code/optimize-gpu/checkpoints/qwen-patched",
+    "gguf_path": "/Users/tim/Code/optimize-gpu/checkpoints/qwen-patched/Qwen3-4B-Thinking-2507-Patched-Q8_0.gguf",
+    "num_tensors": 10,
+    "subspace_dof_params": 25600,
+    "subspace_dof_pct": 0.000636,
+    "mean_rel_frobenius_delta": 0.019959,
+    "elapsed_s": 2.737
+  },
+  "control_kl_nats": 0.091734,
+  "control_top1_agreement": 0.95
+}

@@ -1,0 +1,57 @@
+{
+  "num_prompts": 24,
+  "max_gen_tokens": 4096,
+  "accuracy": 0.0833,
+  "correct_count": 2,
+  "end_think_completion_rate": 0.0833,
+  "truncated_no_end_think_rate": 0.9167,
+  "avg_think_tokens": 3916.79,
+  "avg_completion_tokens": 3970.04,
+  "avg_hesitation_markers": 10.08,
+  "loop_or_bloat_rate": 0.9167,
+  "premature_early_stop_rate": 0.0,
+  "total_failure_mode_rate": 0.9167,
+  "failure_set_count": 22,
+  "clean_set_count": 2,
+  "tok_per_sec_t1": 92.7,
+  "tok_per_sec_eval_mode": 92.7,
+  "spec_acceptance_alpha": 0.0,
+  "by_category": {
+    "aime_feb2026": {
+      "count": 5,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.0,
+      "avg_think_tokens": 4096.0,
+      "avg_hesitation_markers": 10.4,
+      "loop_or_bloat_rate": 1.0
+    },
+    "amc12_nov2025": {
+      "count": 8,
+      "correct": 2,
+      "accuracy": 0.25,
+      "end_think_completion_rate": 0.25,
+      "avg_think_tokens": 3558.38,
+      "avg_hesitation_markers": 7.62,
+      "loop_or_bloat_rate": 0.75
+    },
+    "arxiv_math2026": {
+      "count": 5,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.0,
+      "avg_think_tokens": 4096.0,
+      "avg_hesitation_markers": 14.8,
+      "loop_or_bloat_rate": 1.0
+    },
+    "hmmt_nov2025": {
+      "count": 6,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.0,
+      "avg_think_tokens": 4096.0,
+      "avg_hesitation_markers": 9.17,
+      "loop_or_bloat_rate": 1.0
+    }
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "num_prompts": 24,
+  "max_gen_tokens": 4096,
+  "accuracy": 0.1667,
+  "correct_count": 4,
+  "end_think_completion_rate": 0.2083,
+  "truncated_no_end_think_rate": 0.7917,
+  "avg_think_tokens": 3710.88,
+  "avg_completion_tokens": 3881.46,
+  "avg_hesitation_markers": 1.83,
+  "loop_or_bloat_rate": 0.9583,
+  "premature_early_stop_rate": 0.0,
+  "total_failure_mode_rate": 0.9583,
+  "failure_set_count": 23,
+  "clean_set_count": 1,
+  "tok_per_sec_t1": 72.99,
+  "tok_per_sec_eval_mode": 72.99,
+  "spec_acceptance_alpha": 0.6862,
+  "by_category": {
+    "aime_feb2026": {
+      "count": 5,
+      "correct": 1,
+      "accuracy": 0.2,
+      "end_think_completion_rate": 0.4,
+      "avg_think_tokens": 3670.8,
+      "avg_hesitation_markers": 1.2,
+      "loop_or_bloat_rate": 1.0
+    },
+    "amc12_nov2025": {
+      "count": 8,
+      "correct": 3,
+      "accuracy": 0.375,
+      "end_think_completion_rate": 0.375,
+      "avg_think_tokens": 3206.38,
+      "avg_hesitation_markers": 1.62,
+      "loop_or_bloat_rate": 0.875
+    },
+    "arxiv_math2026": {
+      "count": 5,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.0,
+      "avg_think_tokens": 4096.0,
+      "avg_hesitation_markers": 2.8,
+      "loop_or_bloat_rate": 1.0
+    },
+    "hmmt_nov2025": {
+      "count": 6,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.0,
+      "avg_think_tokens": 4096.0,
+      "avg_hesitation_markers": 1.83,
+      "loop_or_bloat_rate": 1.0
+    }
+  },
+  "model": "Qwen3-8B-Patched-Q6_K.gguf",
+  "accepted_candidate": "8b_L24_33_down_a0.85",
+  "patch_info": {
+    "status": "patched",
+    "out_dir": "/Users/tim/Code/optimize-gpu/checkpoints/qwen3-8b-patched",
+    "gguf_path": "/Users/tim/Code/optimize-gpu/checkpoints/qwen3-8b-patched/Qwen3-8B-Patched-Q6_K.gguf",
+    "num_tensors": 10,
+    "subspace_dof_params": 40960,
+    "subspace_dof_pct": 0.0005,
+    "mean_rel_frobenius_delta": 0.015376,
+    "elapsed_s": 4.979
+  },
+  "control_kl_nats": 0.01294,
+  "spec_crossover_pos": 3072
+}

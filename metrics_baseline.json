@@ -1,0 +1,49 @@
+{
+  "num_prompts": 100,
+  "accuracy": 0.2,
+  "correct_count": 20,
+  "avg_think_tokens": 1334.0,
+  "avg_completion_tokens": 1394.11,
+  "avg_hesitation_markers": 8.98,
+  "loop_or_bloat_rate": 0.92,
+  "truncated_no_end_think_rate": 0.76,
+  "premature_early_stop_rate": 0.0,
+  "total_failure_mode_rate": 0.92,
+  "failure_set_count": 92,
+  "clean_set_count": 8,
+  "tok_per_sec_t1": 128.73,
+  "tok_per_sec_eval_mode": 115.49,
+  "spec_acceptance_alpha": 0.6588,
+  "by_category": {
+    "algebra_numtheory": {
+      "count": 20,
+      "accuracy": 0.0,
+      "avg_think_tokens": 1472.0,
+      "loop_or_bloat_rate": 1.0
+    },
+    "algo_trace": {
+      "count": 20,
+      "accuracy": 0.0,
+      "avg_think_tokens": 1472.0,
+      "loop_or_bloat_rate": 1.0
+    },
+    "crt_deceptive": {
+      "count": 20,
+      "accuracy": 0.05,
+      "avg_think_tokens": 1419.55,
+      "loop_or_bloat_rate": 1.0
+    },
+    "gsm_math": {
+      "count": 20,
+      "accuracy": 0.95,
+      "avg_think_tokens": 834.45,
+      "loop_or_bloat_rate": 0.6
+    },
+    "logic_knights_grid": {
+      "count": 20,
+      "accuracy": 0.0,
+      "avg_think_tokens": 1472.0,
+      "loop_or_bloat_rate": 1.0
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "target_model": "Qwen/Qwen3-4B-Thinking-2507",
+  "model_cutoff": "2025-08-01",
+  "earliest_problem_release_date": "2025-11-08",
+  "latest_problem_release_date": "2026-08-31",
+  "total_problems": 120,
+  "calib_count": 60,
+  "test_count": 60,
+  "calib_by_category": {
+    "amc12_nov2025": 18,
+    "hmmt_nov2025": 12,
+    "aime_feb2026": 15,
+    "arxiv_math2026": 15
+  },
+  "test_by_category": {
+    "amc12_nov2025": 18,
+    "hmmt_nov2025": 12,
+    "aime_feb2026": 15,
+    "arxiv_math2026": 15
+  },
+  "max_prompt_tokens": 387,
+  "mean_prompt_tokens": 130.9
+}

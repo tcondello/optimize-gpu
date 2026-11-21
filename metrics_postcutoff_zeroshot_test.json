@@ -1,0 +1,94 @@
+{
+  "num_prompts": 60,
+  "max_gen_tokens": 2560,
+  "accuracy": 0.0167,
+  "correct_count": 1,
+  "end_think_completion_rate": 0.05,
+  "truncated_no_end_think_rate": 0.95,
+  "avg_think_tokens": 2535.27,
+  "avg_completion_tokens": 2555.37,
+  "avg_hesitation_markers": 7.72,
+  "loop_or_bloat_rate": 0.9667,
+  "premature_early_stop_rate": 0.0,
+  "total_failure_mode_rate": 0.9667,
+  "failure_set_count": 58,
+  "clean_set_count": 1,
+  "tok_per_sec_t1": 89.18,
+  "tok_per_sec_eval_mode": 89.18,
+  "spec_acceptance_alpha": 0.4944,
+  "by_category": {
+    "aime_feb2026": {
+      "count": 15,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.0,
+      "avg_think_tokens": 2560.0,
+      "avg_hesitation_markers": 7.33,
+      "loop_or_bloat_rate": 1.0
+    },
+    "amc12_nov2025": {
+      "count": 18,
+      "correct": 1,
+      "accuracy": 0.0556,
+      "end_think_completion_rate": 0.1667,
+      "avg_think_tokens": 2477.56,
+      "avg_hesitation_markers": 7.11,
+      "loop_or_bloat_rate": 0.8889
+    },
+    "arxiv_math2026": {
+      "count": 15,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.0,
+      "avg_think_tokens": 2560.0,
+      "avg_hesitation_markers": 8.67,
+      "loop_or_bloat_rate": 1.0
+    },
+    "hmmt_nov2025": {
+      "count": 12,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.0,
+      "avg_think_tokens": 2560.0,
+      "avg_hesitation_markers": 7.92,
+      "loop_or_bloat_rate": 1.0
+    }
+  },
+  "source_patch": "synthetic_val_prompts_L24_33_down_a1.0",
+  "patch_manifest": {
+    "status": "patched",
+    "out_dir": "/Users/tim/Code/optimize-gpu/checkpoints/qwen-patched",
+    "gguf_path": "/Users/tim/Code/optimize-gpu/checkpoints/qwen-patched/Qwen3-4B-Thinking-2507-Patched-Q8_0.gguf",
+    "layers": [
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33
+    ],
+    "rank_k": 1,
+    "alpha": 1.0,
+    "rescale_row_norms": true,
+    "edited_tensors": [
+      "model.layers.24.mlp.down_proj.weight",
+      "model.layers.25.mlp.down_proj.weight",
+      "model.layers.26.mlp.down_proj.weight",
+      "model.layers.27.mlp.down_proj.weight",
+      "model.layers.28.mlp.down_proj.weight",
+      "model.layers.29.mlp.down_proj.weight",
+      "model.layers.30.mlp.down_proj.weight",
+      "model.layers.31.mlp.down_proj.weight",
+      "model.layers.32.mlp.down_proj.weight",
+      "model.layers.33.mlp.down_proj.weight"
+    ],
+    "subspace_dof_params": 25600,
+    "subspace_dof_pct": 0.000636,
+    "mean_rel_frobenius_delta": 0.02373,
+    "elapsed_s": 2.373
+  }
+}

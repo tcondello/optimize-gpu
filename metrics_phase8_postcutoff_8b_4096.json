@@ -1,0 +1,60 @@
+{
+  "num_prompts": 24,
+  "max_gen_tokens": 4096,
+  "accuracy": 0.0833,
+  "correct_count": 2,
+  "end_think_completion_rate": 0.1667,
+  "truncated_no_end_think_rate": 0.8333,
+  "avg_think_tokens": 3930.5,
+  "avg_completion_tokens": 3997.38,
+  "avg_hesitation_markers": 22.54,
+  "loop_or_bloat_rate": 1.0,
+  "premature_early_stop_rate": 0.0,
+  "total_failure_mode_rate": 1.0,
+  "failure_set_count": 24,
+  "clean_set_count": 0,
+  "tok_per_sec_t1": 72.47,
+  "tok_per_sec_eval_mode": 72.47,
+  "spec_acceptance_alpha": 0.7031,
+  "by_category": {
+    "aime_feb2026": {
+      "count": 5,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.2,
+      "avg_think_tokens": 4013.6,
+      "avg_hesitation_markers": 16.2,
+      "loop_or_bloat_rate": 1.0
+    },
+    "amc12_nov2025": {
+      "count": 8,
+      "correct": 2,
+      "accuracy": 0.25,
+      "end_think_completion_rate": 0.375,
+      "avg_think_tokens": 3651.0,
+      "avg_hesitation_markers": 15.5,
+      "loop_or_bloat_rate": 1.0
+    },
+    "arxiv_math2026": {
+      "count": 5,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.0,
+      "avg_think_tokens": 4096.0,
+      "avg_hesitation_markers": 33.6,
+      "loop_or_bloat_rate": 1.0
+    },
+    "hmmt_nov2025": {
+      "count": 6,
+      "correct": 0,
+      "accuracy": 0.0,
+      "end_think_completion_rate": 0.0,
+      "avg_think_tokens": 4096.0,
+      "avg_hesitation_markers": 28.0,
+      "loop_or_bloat_rate": 1.0
+    }
+  },
+  "model": "Qwen3-8B-Q6_K.gguf",
+  "spec_crossover_pos": 3072,
+  "spec_crossover_switched_count": 23
+}
