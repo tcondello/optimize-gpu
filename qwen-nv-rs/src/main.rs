@@ -593,10 +593,6 @@ fn run_cli() -> Result<(), String> {
         i += 1;
     }
 
-    if effective_cmd == "topic" && !model_explicit {
-        model_ref = "qwen3:4b".to_string();
-    }
-
     let ensure_client_daemon = |mref: &str, m_exp: bool, ctx: usize| -> Result<(), String> {
         if !m_exp && daemon_ping().is_ok() {
             Ok(())

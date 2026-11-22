@@ -1,0 +1,6 @@
+{
+  "peft_type": "LORA",
+  "r": 30,
+  "lora_alpha": 30.0,
+  "target_modules": ["down_proj"]
+}

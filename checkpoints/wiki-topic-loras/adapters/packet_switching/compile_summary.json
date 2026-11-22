@@ -1,0 +1,19 @@
+{
+  "status": "ok",
+  "out_dir": "/Users/tim/Code/optimize-gpu/checkpoints/wiki-topic-loras/adapters/packet_switching",
+  "layers": [
+    30,
+    31,
+    32,
+    33,
+    34,
+    35
+  ],
+  "rank": 32,
+  "num_positions": 202,
+  "mean_fit_rel_err": 0.564087,
+  "mean_bg_leak_rms": 0.036161,
+  "mean_delta_frob": 20.5376,
+  "safetensors_bytes": 6293024,
+  "elapsed_s": 1.867
+}

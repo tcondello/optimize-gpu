@@ -1,0 +1,808 @@
+{
+  "router_qvec": "/Users/tim/Code/optimize-gpu/data/wikipedia_1k_8b_best.qvec",
+  "min_score": 0.2,
+  "system_prompt": "Answer the question concisely in one short phrase or sentence.",
+  "compiler_config": {
+    "name": "late6_g20_l1e-2_2x",
+    "layers": [
+      30,
+      31,
+      32,
+      33,
+      34,
+      35
+    ],
+    "gamma": 20.0,
+    "lambda": 0.01,
+    "aug": true,
+    "direct_acc": 0.88,
+    "para_acc": 1.0,
+    "mean_kl_nats": 8.3e-05,
+    "mean_fit_rel_err": 0.528117,
+    "wall_s": 273.57
+  },
+  "topics": [
+    {
+      "title": "Computational complexity theory",
+      "slug": "computational_complexity_theory",
+      "lora_dir": "adapters/computational_complexity_theory",
+      "num_facts": 7,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.674935,
+      "kl_nats": 0.000113
+    },
+    {
+      "title": "Teacher",
+      "slug": "teacher",
+      "lora_dir": "adapters/teacher",
+      "num_facts": 2,
+      "rank": 30,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.290547,
+      "kl_nats": 9.3e-05
+    },
+    {
+      "title": "Sky (United Kingdom)",
+      "slug": "sky_united_kingdom",
+      "lora_dir": "adapters/sky_united_kingdom",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.18114,
+      "kl_nats": 0.000112
+    },
+    {
+      "title": "Victoria (Australia)",
+      "slug": "victoria_australia",
+      "lora_dir": "adapters/victoria_australia",
+      "num_facts": 7,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.746458,
+      "kl_nats": 0.00014
+    },
+    {
+      "title": "Newcastle upon Tyne",
+      "slug": "newcastle_upon_tyne",
+      "lora_dir": "adapters/newcastle_upon_tyne",
+      "num_facts": 6,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.66502,
+      "kl_nats": 8.8e-05
+    },
+    {
+      "title": "Genghis Khan",
+      "slug": "genghis_khan",
+      "lora_dir": "adapters/genghis_khan",
+      "num_facts": 3,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.419169,
+      "kl_nats": 9.6e-05
+    },
+    {
+      "title": "Immune system",
+      "slug": "immune_system",
+      "lora_dir": "adapters/immune_system",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.469029,
+      "kl_nats": 0.000188
+    },
+    {
+      "title": "Yuan dynasty",
+      "slug": "yuan_dynasty",
+      "lora_dir": "adapters/yuan_dynasty",
+      "num_facts": 6,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.704424,
+      "kl_nats": 0.000113
+    },
+    {
+      "title": "United Methodist Church",
+      "slug": "united_methodist_church",
+      "lora_dir": "adapters/united_methodist_church",
+      "num_facts": 5,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.487762,
+      "kl_nats": 0.000154
+    },
+    {
+      "title": "Normans",
+      "slug": "normans",
+      "lora_dir": "adapters/normans",
+      "num_facts": 6,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.571615,
+      "kl_nats": 0.000131
+    },
+    {
+      "title": "Martin Luther",
+      "slug": "martin_luther",
+      "lora_dir": "adapters/martin_luther",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.675197,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Black Death",
+      "slug": "black_death",
+      "lora_dir": "adapters/black_death",
+      "num_facts": 5,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.715563,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Victoria and Albert Museum",
+      "slug": "victoria_and_albert_museum",
+      "lora_dir": "adapters/victoria_and_albert_museum",
+      "num_facts": 3,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.423507,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Civil disobedience",
+      "slug": "civil_disobedience",
+      "lora_dir": "adapters/civil_disobedience",
+      "num_facts": 7,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.646022,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Intergovernmental Panel on Climate Change",
+      "slug": "intergovernmental_panel_on_climate_change",
+      "lora_dir": "adapters/intergovernmental_panel_on_climate_change",
+      "num_facts": 5,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.617964,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Warsaw",
+      "slug": "warsaw",
+      "lora_dir": "adapters/warsaw",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.462718,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Southern California",
+      "slug": "southern_california",
+      "lora_dir": "adapters/southern_california",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.429606,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Steam engine",
+      "slug": "steam_engine",
+      "lora_dir": "adapters/steam_engine",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.523046,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Amazon rainforest",
+      "slug": "amazon_rainforest",
+      "lora_dir": "adapters/amazon_rainforest",
+      "num_facts": 6,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.728901,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Packet switching",
+      "slug": "packet_switching",
+      "lora_dir": "adapters/packet_switching",
+      "num_facts": 5,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.564087,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Jacksonville, Florida",
+      "slug": "jacksonville_florida",
+      "lora_dir": "adapters/jacksonville_florida",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.615081,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Imperialism",
+      "slug": "imperialism",
+      "lora_dir": "adapters/imperialism",
+      "num_facts": 5,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.609101,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Force",
+      "slug": "force",
+      "lora_dir": "adapters/force",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.565641,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Huguenot",
+      "slug": "huguenot",
+      "lora_dir": "adapters/huguenot",
+      "num_facts": 3,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.371693,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Apollo program",
+      "slug": "apollo_program",
+      "lora_dir": "adapters/apollo_program",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.578126,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Geology",
+      "slug": "geology",
+      "lora_dir": "adapters/geology",
+      "num_facts": 6,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.516091,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "American Broadcasting Company",
+      "slug": "american_broadcasting_company",
+      "lora_dir": "adapters/american_broadcasting_company",
+      "num_facts": 5,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.66146,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Harvard University",
+      "slug": "harvard_university",
+      "lora_dir": "adapters/harvard_university",
+      "num_facts": 5,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.644341,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "French and Indian War",
+      "slug": "french_and_indian_war",
+      "lora_dir": "adapters/french_and_indian_war",
+      "num_facts": 2,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.241753,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Oxygen",
+      "slug": "oxygen",
+      "lora_dir": "adapters/oxygen",
+      "num_facts": 5,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.67138,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "European Union law",
+      "slug": "european_union_law",
+      "lora_dir": "adapters/european_union_law",
+      "num_facts": 5,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.674716,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Doctor Who",
+      "slug": "doctor_who",
+      "lora_dir": "adapters/doctor_who",
+      "num_facts": 5,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.588382,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Pharmacy",
+      "slug": "pharmacy",
+      "lora_dir": "adapters/pharmacy",
+      "num_facts": 3,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.229577,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Prime number",
+      "slug": "prime_number",
+      "lora_dir": "adapters/prime_number",
+      "num_facts": 3,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.246195,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Scottish Parliament",
+      "slug": "scottish_parliament",
+      "lora_dir": "adapters/scottish_parliament",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.626407,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Nikola Tesla",
+      "slug": "nikola_tesla",
+      "lora_dir": "adapters/nikola_tesla",
+      "num_facts": 7,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.690762,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Chloroplast",
+      "slug": "chloroplast",
+      "lora_dir": "adapters/chloroplast",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.676298,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Super Bowl 50",
+      "slug": "super_bowl_50",
+      "lora_dir": "adapters/super_bowl_50",
+      "num_facts": 4,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.604042,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Construction",
+      "slug": "construction",
+      "lora_dir": "adapters/construction",
+      "num_facts": 5,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.505971,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Private school",
+      "slug": "private_school",
+      "lora_dir": "adapters/private_school",
+      "num_facts": 7,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.726579,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Rhine",
+      "slug": "rhine",
+      "lora_dir": "adapters/rhine",
+      "num_facts": 3,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.18375,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Islamism",
+      "slug": "islamism",
+      "lora_dir": "adapters/islamism",
+      "num_facts": 2,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.203973,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "1973 oil crisis",
+      "slug": "1973_oil_crisis",
+      "lora_dir": "adapters/1973_oil_crisis",
+      "num_facts": 2,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.402864,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Kenya",
+      "slug": "kenya",
+      "lora_dir": "adapters/kenya",
+      "num_facts": 2,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.182904,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Fresno, California",
+      "slug": "fresno_california",
+      "lora_dir": "adapters/fresno_california",
+      "num_facts": 2,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.281628,
+      "kl_nats": 0.0
+    },
+    {
+      "title": "Economic inequality",
+      "slug": "economic_inequality",
+      "lora_dir": "adapters/economic_inequality",
+      "num_facts": 2,
+      "rank": 32,
+      "layers": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "mean_fit_err": 0.156099,
+      "kl_nats": 0.0
+    }
+  ]
+}

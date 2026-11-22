@@ -1,0 +1,19 @@
+{
+  "status": "ok",
+  "out_dir": "/Users/tim/Code/optimize-gpu/checkpoints/wiki-topic-loras/adapters/intergovernmental_panel_on_climate_change",
+  "layers": [
+    30,
+    31,
+    32,
+    33,
+    34,
+    35
+  ],
+  "rank": 32,
+  "num_positions": 140,
+  "mean_fit_rel_err": 0.617964,
+  "mean_bg_leak_rms": 0.017946,
+  "mean_delta_frob": 14.8221,
+  "safetensors_bytes": 6293024,
+  "elapsed_s": 0.841
+}

@@ -1,0 +1,19 @@
+{
+  "status": "ok",
+  "out_dir": "/Users/tim/Code/optimize-gpu/checkpoints/wiki-topic-loras/adapters/economic_inequality",
+  "layers": [
+    30,
+    31,
+    32,
+    33,
+    34,
+    35
+  ],
+  "rank": 32,
+  "num_positions": 38,
+  "mean_fit_rel_err": 0.156099,
+  "mean_bg_leak_rms": 0.00773,
+  "mean_delta_frob": 6.4913,
+  "safetensors_bytes": 6293024,
+  "elapsed_s": 0.135
+}

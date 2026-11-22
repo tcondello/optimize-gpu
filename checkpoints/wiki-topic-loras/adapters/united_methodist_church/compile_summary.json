@@ -1,0 +1,19 @@
+{
+  "status": "ok",
+  "out_dir": "/Users/tim/Code/optimize-gpu/checkpoints/wiki-topic-loras/adapters/united_methodist_church",
+  "layers": [
+    30,
+    31,
+    32,
+    33,
+    34,
+    35
+  ],
+  "rank": 32,
+  "num_positions": 86,
+  "mean_fit_rel_err": 0.487762,
+  "mean_bg_leak_rms": 0.021619,
+  "mean_delta_frob": 15.0177,
+  "safetensors_bytes": 6293024,
+  "elapsed_s": 0.374
+}

@@ -1391,7 +1391,7 @@ impl TuiApp {
         let last_user_txt = last_user_override.or_else(|| {
             last_user_idx.map(|i| self.messages[i].content.as_str())
         }).unwrap_or("");
-        let user_no_think = last_user_txt.contains("/no_think") || self.voice_enabled;
+        let user_no_think = last_user_txt.contains("/no_think") || self.voice_enabled || self.topic_lora_active;
         let lower_name = self.cfg.model_name.to_ascii_lowercase();
         if self.cfg.thinking_template {
             if user_no_think {

@@ -2,12 +2,12 @@
 """
 Phase 8: Sharded Topic Parametric LoRA Bank Builder & Head-to-Head Benchmark (`Option B`)
 
-Compiles a 46-article Wikipedia Topic LoRA Bank on `Qwen3-4B-Instruct-2507-Q4_K_M` (`qwen3:4b`)
+Compiles a 46-article Wikipedia Topic LoRA Bank on `Qwen3-8B-Patched-Q6_K` (`qwen3-8b-patched`)
 using Zero-Backprop Contextual State Transfer + Closed-Form Push-Through Null-Space AlphaEdit
 entirely on the RTX 3080 + Apple Accelerate (0 PyTorch, 0 Docker, 0 external crates, 0 `.cu` edits).
 
 Stages:
-  1. Baseline (no context), Contextual Oracle (gold passage), & Phase 5 Text RAG (`wikipedia_1k_best.qvec`)
+  1. Baseline (no context), Contextual Oracle (gold passage), & Phase 8 Text RAG (`wikipedia_1k_8b_best.qvec`)
      evaluation on `wikipedia_eval_200.jsonl` + curated unseen `wikipedia_paraphrase_40.jsonl`.
   2. Background Null-Space SwiGLU Keys (`BG.qmkv`) from non-Wikipedia prompts + `control_kl_40.jsonl`.
   3. Closed-loop sequential multi-layer calibration sweep on 5 diverse articles (`gamma`, `lambda`,
@@ -15,9 +15,9 @@ Stages:
   4. Full 46-article Topic LoRA Bank compilation -> `checkpoints/wiki-topic-loras/`.
   5. End-to-end verification & head-to-head benchmark (`metrics_topic_lora_bank.json`), including:
      - `qwen-nv topic ask` on all 200 direct Q&As & 40 unseen paraphrases,
-     - Dual-slot cache verification (`126 MB` Retrieval SVD LoRA pinned + `~44 us` Topic LoRA swaps),
+     - Dual-slot cache verification (`167 MB` Retrieval SVD LoRA pinned + `~44 us` Topic LoRA swaps),
      - Control `kl-eval` + `0.000000 nats` bit-exact clear verification,
-     - 10 GB VRAM co-residency check with warm `Qwen3-ASR-1.7B` + `Qwen3-TTS-1.7B`.
+     - 10 GB VRAM co-residency check (`qwen3-8b-patched` + `Qwen3-0.6B` drafter + pinned 8B SVD LoRA + Topic Pool + `.qvec`).
 """
 
 import argparse
@@ -39,13 +39,13 @@ CORPUS_JSONL = DATA_DIR / "wikipedia_1k.jsonl"
 EVAL_JSONL = DATA_DIR / "wikipedia_eval_200.jsonl"
 PARA_JSONL = DATA_DIR / "wikipedia_paraphrase_40.jsonl"
 VAL_PROMPTS_JSONL = DATA_DIR / "val_prompts.jsonl"
-BEST_QVEC = DATA_DIR / "wikipedia_1k_best.qvec"
+BEST_QVEC = DATA_DIR / "wikipedia_1k_8b_best.qvec"
 
 WORK_DIR = DATA_DIR / "topic_lora_work"
 BANK_DIR = ROOT / "checkpoints" / "wiki-topic-loras"
 OUT_METRICS = ROOT / "metrics_topic_lora_bank.json"
 
-MODEL_REF = "qwen3:4b"
+MODEL_REF = "qwen3-8b-patched"
 DAEMON_CTX = 4096
 SYS_PROMPT = "Answer the question concisely in one short phrase or sentence."
 IM_END_ID = 151645
@@ -196,7 +196,7 @@ def format_chatml_prompt(user_text: str, sys_prompt: str = SYS_PROMPT) -> str:
     return (
         f"<|im_start|>system\n{sys_prompt}<|im_end|>\n"
         f"<|im_start|>user\n{user_text}<|im_end|>\n"
-        f"<|im_start|>assistant\n"
+        f"<|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
 
 
@@ -892,7 +892,7 @@ def stage5_benchmark_and_verify(
     stage3: dict,
 ) -> dict:
     print("\n" + "=" * 88)
-    print("STAGE 5: Full 200-Q&A + 40-Paraphrase Benchmark, Dual-Slot Cache, KL & 10GB Voice Co-Residency")
+    print("STAGE 5: Full 200-Q&A + 40-Paraphrase Benchmark, Dual-Slot Cache, KL & 10GB Co-Residency")
     print("=" * 88, flush=True)
 
     load_out, _, _ = run_cmd(["topic", "load", str(BANK_DIR)], timeout=60)
@@ -939,15 +939,15 @@ def stage5_benchmark_and_verify(
     clear_parity = parse_last_json(base_probe_out)["token_ids"] == parse_last_json(after_clear_out)["token_ids"]
     print(f"[clear parity] bit-exact after lora clear = {clear_parity}", flush=True)
 
-    # 4. 10 GB VRAM Co-Residency Check (Qwen3-4B + Retrieval SVD LoRA + Topic Pool + Qwen3-TTS-1.7B + Qwen3-ASR-1.7B)
-    tts_w, _, _ = run_cmd(["tts-warm", "--tts-model", "1.7b"], timeout=120)
-    asr_w, _, _ = run_cmd(["asr-warm", "--asr-model", "1.7b"], timeout=120)
+    # 4. 10 GB VRAM Co-Residency Check (qwen3-8b-patched + Retrieval SVD LoRA + Topic Pool + .qvec + Qwen3-0.6B drafter)
+    drafter_w, _, _ = run_cmd(["drafter", "load", "qwen3:0.6b"], timeout=60)
+    st_out, _, _ = run_cmd(["status"], timeout=15)
     co_out, _, _ = run_cmd(["topic", "ask", "--json-stats", "--max-tokens", "32", qas[4]["question"]], timeout=60)
     co_meta = parse_last_json(co_out)
     co_pred = "\n".join(co_out.splitlines()[:-1]).strip()
     coresidency = {
-        "tts_warm": tts_w.strip(),
-        "asr_warm": asr_w.strip(),
+        "drafter_load": drafter_w.strip(),
+        "daemon_status": st_out.strip(),
         "live_topic_ask_pred": co_pred,
         "live_topic_ask_matched": co_meta["matched"],
         "live_topic_ask_topic": co_meta["topic"],
