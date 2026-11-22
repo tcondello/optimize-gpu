@@ -150,6 +150,9 @@ pub fn resolve_model_path(model_ref: &str) -> Result<PathBuf, String> {
         }
     }
     let url_opt = match model_ref {
+        "inkling" | "inkling:mini" | "inkling-2-mini" | "inkling2" | "inkling2:mini" => {
+            Some("https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-AD-IQ2_M.gguf")
+        }
         "qwen3-thinking:8b" | "qwen3-think:8b" | "qwen3:8b" | "qwen3:8b-q6" => {
             Some("https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q6_K.gguf")
         }
@@ -371,6 +374,13 @@ impl GgufFile {
                         for _ in 0..n {
                             v.push(get_u32(buf, *c) as i32);
                             *c += 4;
+                        }
+                        GgufVal::IntArr(v)
+                    } else if et == 7 && n <= 64 {
+                        let mut v = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            v.push(if buf[*c] != 0 { 1 } else { 0 });
+                            *c += 1;
                         }
                         GgufVal::IntArr(v)
                     } else {
@@ -966,7 +976,44 @@ impl BpeTokenizer {
             .collect()
     }
 
+    fn match_contraction_len(chars: &[(usize, char)], pos: usize) -> usize {
+        let n = chars.len();
+        if pos + 1 < n && chars[pos].1 == '\'' {
+            let c1 = chars[pos + 1].1.to_ascii_lowercase();
+            if pos + 2 < n {
+                let c2 = chars[pos + 2].1.to_ascii_lowercase();
+                if (c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l') {
+                    return 3;
+                }
+            }
+            if matches!(c1, 's' | 't' | 'm' | 'd') {
+                return 2;
+            }
+        }
+        0
+    }
+
     fn encode_sentence(&self, chunk: &str, out: &mut Vec<i32>) {
+        if matches!(self.preset.as_str(), "inkling2" | "gpt-4o") {
+            let words = Self::split_to_words(chunk);
+            let mut k = 0usize;
+            while k < words.len() {
+                if k + 1 < words.len()
+                    && words[k + 1].starts_with('\'')
+                    && words[k].chars().last().map(is_ucat_l).unwrap_or(false)
+                {
+                    let mut combined = Vec::with_capacity(words[k].len() + words[k + 1].len());
+                    combined.extend_from_slice(words[k].as_bytes());
+                    combined.extend_from_slice(words[k + 1].as_bytes());
+                    out.extend(self.encode_word(&combined));
+                    k += 2;
+                    continue;
+                }
+                out.extend(self.encode_word(words[k].as_bytes()));
+                k += 1;
+            }
+            return;
+        }
         for w in Self::split_to_words(chunk) {
             out.extend(self.encode_word(w.as_bytes()));
         }

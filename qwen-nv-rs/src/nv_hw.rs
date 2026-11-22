@@ -477,7 +477,7 @@ pub struct NvGpu {
     cmdq_buf: HostMappedBuffer,
     cmdq_wptr_bytes: usize,
     kernargs_buf: HostMappedBuffer,
-    kernargs_wptr: usize,
+    pub kernargs_wptr: usize,
 
     pub timeline_buf: HostMappedBuffer,
     pub timeline_value: u64,
@@ -487,23 +487,33 @@ pub struct NvGpu {
 
 impl NvGpu {
     pub fn init() -> Result<Self, String> {
-        match Self::init_once() {
-            Ok(gpu) => Ok(gpu),
-            Err(e) => {
-                eprintln!("[qwen-nv] Retrying GPU init after transient PCIe ASPM wakeup ({})...", e);
-                thread::sleep(Duration::from_millis(300));
-                Self::init_once()
+        let mut last_err = String::new();
+        for attempt in 0..4 {
+            match Self::init_once() {
+                Ok(gpu) => return Ok(gpu),
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 < 4 {
+                        eprintln!(
+                            "[qwen-nv] Retrying GPU init ({}/3) after transient PCIe ASPM wakeup ({})...",
+                            attempt + 1,
+                            last_err
+                        );
+                        thread::sleep(Duration::from_millis(400 * (attempt as u64 + 1)));
+                    }
+                }
             }
         }
+        Err(last_err)
     }
 
     fn init_once() -> Result<Self, String> {
         let t0 = Instant::now();
         let mut pci = TinyGpuClient::connect()?;
 
-        // Enable PCI Bus Master
+        // Enable PCI Memory Space (0x2) + Bus Master (0x4)
         let pci_cmd = pci.read_config(PCI_COMMAND, 2)?;
-        pci.write_config(PCI_COMMAND, pci_cmd | PCI_COMMAND_MASTER, 2)?;
+        pci.write_config(PCI_COMMAND, pci_cmd | PCI_COMMAND_MASTER | 0x2, 2)?;
 
         // If WPR2 is still locked from an unclean prior process, issue a PCI reset and wait for GFW boot!
         let wpr2_hi = pci.rreg(NV_PFB_PRI_MMU_WPR2_ADDR_HI)?;

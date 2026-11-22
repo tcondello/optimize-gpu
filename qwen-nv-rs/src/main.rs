@@ -4,6 +4,7 @@ mod daemon;
 mod drafter;
 mod engine;
 mod gguf;
+mod inkling;
 mod lora;
 mod mech_patch;
 mod nv_defs;
@@ -39,6 +40,7 @@ use daemon::{
 use drafter::CalibratedNgramPrior;
 use engine::QwenMegakernelEngine;
 use gguf::{resolve_model_path, BpeTokenizer, GgufFile, QwenModelConfig, Utf8StreamDecoder};
+use inkling::InklingEngine;
 use lora::{extract_svd_peft_adapter, write_synthetic_peft_adapter};
 use mech_patch::{
     apply_surgical_weight_patch, build_ablation_lora_from_bf16, kl_divergence_from_logits,
@@ -122,6 +124,7 @@ fn print_usage() {
          USAGE:\n  \
            qwen-nv tui        [OPTIONS]                Launch interactive TrueColor Rust TUI (`Ctrl+R` mic, `/rag wiki`, `/talk`, `/speak`, `/lora`)\n  \
            qwen-nv run        [OPTIONS] <PROMPT>       Generate text response (uses persistent <1ms daemon by default)\n  \
+           qwen-nv inkling    [OPTIONS] <PROMPT>       100%-on-RTX-3080 Inkling-2-Mini (26.4B Looped Sparse MoE, 48 logical layers)\n  \
            qwen-nv mech       <extract-hooks|extract-kv|localize|make-lora|solve-topic-lora|patch|rollback|kl-eval> Zero-retraining mechanistic surgery\n  \
            qwen-nv topic      <load|status|list|route|ask|clear> Sharded Topic Parametric LoRA Bank (`308 us` router + `44 us` swap)\n  \
            qwen-nv drafter    <load|clear|status|distill> Co-resident 100%-GPU Qwen3-0.6B neural speculative drafter\n  \
@@ -286,12 +289,16 @@ fn run_cli() -> Result<(), String> {
     let mut drafter_prior_path = String::new();
     let mut min_support = 2u32;
     let mut min_prob = 0.85f32;
+    let mut inkling_passes: Option<usize> = None;
+    let mut inkling_effort: Option<String> = None;
+    let mut inkling_suite = false;
 
     let mut positional = Vec::<String>::new();
 
     let start_idx = if matches!(
         subcmd,
         "run"
+            | "inkling"
             | "tui"
             | "chat"
             | "mech"
@@ -562,6 +569,19 @@ fn run_cli() -> Result<(), String> {
                     sys_prompt_opt = Some(args[i].clone());
                 }
             }
+            "--passes" => {
+                i += 1;
+                if i < args.len() {
+                    inkling_passes = args[i].parse().ok();
+                }
+            }
+            "--effort" => {
+                i += 1;
+                if i < args.len() {
+                    inkling_effort = Some(args[i].clone());
+                }
+            }
+            "--suite" => inkling_suite = true,
             "--doc" | "--passage" => embed_is_query = false,
             "--query" => embed_is_query = true,
             "--attn-only" => attn_only = true,
@@ -1470,10 +1490,10 @@ fn run_cli() -> Result<(), String> {
             let path = resolve_model_path(&model_ref)?;
             let gguf = GgufFile::open(&path)?;
             let tok = BpeTokenizer::from_gguf(&gguf)?;
-            let cfg = QwenModelConfig::from_gguf(&gguf, &tok, max_ctx, "qwen")?;
             let ids = if raw_mode {
                 tok.encode(&text)
             } else {
+                let cfg = QwenModelConfig::from_gguf(&gguf, &tok, max_ctx, "qwen")?;
                 let mut v = Vec::new();
                 if let Some(bos) = cfg.bos_id {
                     v.push(bos);
@@ -1491,10 +1511,238 @@ fn run_cli() -> Result<(), String> {
             println!("[{}]", strs.join(", "));
             Ok(())
         }
+        "inkling" => {
+            let eff_model = if model_explicit {
+                model_ref.as_str()
+            } else {
+                "inkling"
+            };
+            let _ = stop_daemon();
+            install_signal_handlers();
+            let mut engine = InklingEngine::new(eff_model, max_ctx)?;
+            let eff_seed = seed.unwrap_or(42);
+            let eff_temp = if temp_explicit { temp } else { 0.0 };
+            let eff_max_toks = if max_tokens_explicit { max_tokens } else { 512 };
+
+            if inkling_suite {
+                let bench_cases: &[(&str, &str, &str, usize, usize)] = &[
+                    (
+                        "concise_factual_effort0",
+                        "What are the three main architectural innovations in a looped Mixture-of-Experts transformer? Reply in 3 concise bullet points.",
+                        "0",
+                        3,
+                        384,
+                    ),
+                    (
+                        "math_amc12_nut_mix_thinking",
+                        "A box contains 10 pounds of a nut mix that is 50% peanuts, 20% cashews, and 30% almonds. A second nut mix containing 20% peanuts, 40% cashews, and 40% almonds is added to the box resulting in a new nut mix that is 40% peanuts. How many pounds of cashews are now in the box? Give the exact final number.",
+                        "0.2",
+                        3,
+                        640,
+                    ),
+                    (
+                        "coding_rust_fn_effort0",
+                        "Write a concise zero-dependency Rust function `is_prime(n: u64) -> bool`.",
+                        "0",
+                        3,
+                        384,
+                    ),
+                    (
+                        "loop_ablation_1pass",
+                        "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?",
+                        "0.2",
+                        1,
+                        256,
+                    ),
+                    (
+                        "loop_ablation_2pass",
+                        "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?",
+                        "0.2",
+                        2,
+                        256,
+                    ),
+                    (
+                        "loop_ablation_3pass",
+                        "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?",
+                        "0.2",
+                        3,
+                        256,
+                    ),
+                ];
+
+                let mut rows_json = Vec::new();
+                for &(name, prompt_s, eff_str, n_pass, m_toks) in bench_cases {
+                    eprintln!("\n=== [Inkling Suite: {} (passes={}, effort={})] ===", name, n_pass, eff_str);
+                    let p_ids = engine.format_chat_prompt(prompt_s, sys_prompt_opt.as_deref(), Some(eff_str));
+                    let mut reply = String::new();
+                    let mut out_stdout = io::stdout();
+                    let st = engine.generate(
+                        &p_ids,
+                        m_toks,
+                        0.0,
+                        eff_seed,
+                        Some(n_pass),
+                        false,
+                        |_, piece| {
+                            reply.push_str(piece);
+                            if !quiet {
+                                let _ = out_stdout.write_all(piece.as_bytes());
+                                let _ = out_stdout.flush();
+                            }
+                        },
+                    )?;
+                    if !quiet {
+                        println!();
+                    }
+                    let esc_rep = reply
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('\n', "\\n")
+                        .replace('\r', "");
+                    rows_json.push(format!(
+                        "{{\"case\":\"{}\",\"passes\":{},\"logical_layers\":{},\"effort\":\"{}\",\"prompt_tokens\":{},\"completion_tokens\":{},\"prefill_ms\":{:.2},\"prefill_tok_per_s\":{:.2},\"decode_ms\":{:.2},\"decode_tok_per_s\":{:.2},\"ttft_ms\":{:.2},\"vram_weights_mb\":{:.2},\"vram_kv_conv_mb\":{:.2},\"response\":\"{}\"}}",
+                        name,
+                        st.loop_passes,
+                        st.logical_layers_per_tok,
+                        eff_str,
+                        st.prompt_tokens,
+                        st.completion_tokens,
+                        st.prefill_ms,
+                        st.prefill_tok_per_s,
+                        st.decode_ms,
+                        st.decode_tok_per_s,
+                        st.ttft_ms,
+                        st.vram_weights_mb,
+                        st.vram_kv_conv_mb,
+                        esc_rep
+                    ));
+                }
+                let summary_json = format!("{{\"model\":\"{}\",\"gpu\":\"NVIDIA GeForce RTX 3080 (GA102, sm_86, 68 SMs, 10GB GDDR6X)\",\"results\":[{}]}}", engine.cfg.model_name, rows_json.join(","));
+                if let Some(ref out_p) = output_path {
+                    fs::write(out_p, &summary_json).map_err(|e| e.to_string())?;
+                }
+                if json_stats {
+                    println!("{}", summary_json);
+                }
+                engine.gpu.shutdown_clean();
+                return Ok(());
+            }
+
+            let prompt = positional.join(" ");
+            if prompt.is_empty() {
+                engine.gpu.shutdown_clean();
+                return Err("Usage: qwen-nv inkling [--passes 1|2|3] [--effort 0|0.2|0.9] [--max-tokens N] <PROMPT>".into());
+            }
+            let prompt_ids = if raw_mode {
+                engine.tok.encode(&prompt)
+            } else {
+                engine.format_chat_prompt(&prompt, sys_prompt_opt.as_deref(), inkling_effort.as_deref())
+            };
+            let mut out_stdout = io::stdout();
+            let st = engine.generate(
+                &prompt_ids,
+                eff_max_toks,
+                eff_temp,
+                eff_seed,
+                inkling_passes,
+                raw_mode,
+                |_, piece| {
+                    if !quiet && !piece.is_empty() {
+                        let _ = out_stdout.write_all(piece.as_bytes());
+                        let _ = out_stdout.flush();
+                    }
+                },
+            )?;
+            if !quiet {
+                println!();
+            }
+            if json_stats {
+                println!(
+                    "{{\"model\":\"{}\",\"loop_passes\":{},\"logical_layers\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\"prefill_ms\":{:.3},\"prefill_tok_per_s\":{:.2},\"decode_ms\":{:.3},\"decode_tok_per_s\":{:.2},\"ttft_ms\":{:.3},\"vram_weights_mb\":{:.2},\"vram_kv_conv_mb\":{:.2}}}",
+                    st.model_name,
+                    st.loop_passes,
+                    st.logical_layers_per_tok,
+                    st.prompt_tokens,
+                    st.completion_tokens,
+                    st.prefill_ms,
+                    st.prefill_tok_per_s,
+                    st.decode_ms,
+                    st.decode_tok_per_s,
+                    st.ttft_ms,
+                    st.vram_weights_mb,
+                    st.vram_kv_conv_mb
+                );
+            } else if !quiet {
+                eprintln!(
+                    "[inkling-nv] {} passes ({} logical layers) | prompt={} ({:.1} tok/s) | gen={} @ {:.2} tok/s | TTFT={:.1} ms | VRAM={:.0}+{:.0} MiB",
+                    st.loop_passes,
+                    st.logical_layers_per_tok,
+                    st.prompt_tokens,
+                    st.prefill_tok_per_s,
+                    st.completion_tokens,
+                    st.decode_tok_per_s,
+                    st.ttft_ms,
+                    st.vram_weights_mb,
+                    st.vram_kv_conv_mb
+                );
+            }
+            engine.gpu.shutdown_clean();
+            Ok(())
+        }
         "run" => {
             let prompt = positional.join(" ");
             if prompt.is_empty() {
                 Err("Missing prompt text (pass prompt argument)".into())
+            } else if model_ref.to_ascii_lowercase().contains("inkling")
+                || resolve_model_path(&model_ref)
+                    .map(|p| InklingEngine::is_inkling_gguf(&p))
+                    .unwrap_or(false)
+            {
+                let _ = stop_daemon();
+                install_signal_handlers();
+                let mut engine = InklingEngine::new(&model_ref, max_ctx)?;
+                let prompt_ids = if raw_mode {
+                    engine.tok.encode(&prompt)
+                } else {
+                    engine.format_chat_prompt(&prompt, sys_prompt_opt.as_deref(), inkling_effort.as_deref())
+                };
+                let mut out_stdout = io::stdout();
+                let st = engine.generate(
+                    &prompt_ids,
+                    max_tokens,
+                    temp,
+                    seed.unwrap_or(42),
+                    inkling_passes,
+                    raw_mode,
+                    |_, piece| {
+                        if !quiet && !piece.is_empty() {
+                            let _ = out_stdout.write_all(piece.as_bytes());
+                            let _ = out_stdout.flush();
+                        }
+                    },
+                )?;
+                if !quiet {
+                    println!();
+                }
+                if json_stats {
+                    println!(
+                        "{{\"model\":\"{}\",\"loop_passes\":{},\"logical_layers\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\"prefill_ms\":{:.3},\"prefill_tok_per_s\":{:.2},\"decode_ms\":{:.3},\"decode_tok_per_s\":{:.2},\"ttft_ms\":{:.3},\"vram_weights_mb\":{:.2},\"vram_kv_conv_mb\":{:.2}}}",
+                        st.model_name,
+                        st.loop_passes,
+                        st.logical_layers_per_tok,
+                        st.prompt_tokens,
+                        st.completion_tokens,
+                        st.prefill_ms,
+                        st.prefill_tok_per_s,
+                        st.decode_ms,
+                        st.decode_tok_per_s,
+                        st.ttft_ms,
+                        st.vram_weights_mb,
+                        st.vram_kv_conv_mb
+                    );
+                }
+                engine.gpu.shutdown_clean();
+                Ok(())
             } else if direct {
                 install_signal_handlers();
                 let mut engine = QwenMegakernelEngine::load(&model_ref, max_ctx)?;
