@@ -2037,7 +2037,9 @@ impl InklingEngine {
                     return on_piece(tid, &piece);
                 }
                 match tid {
-                    TOK_MSG_MODEL => true,
+                    TOK_MSG_MODEL | TOK_CONTENT_TEXT | TOK_END_SAMPLING | TOK_EOT => {
+                        on_piece(tid, "")
+                    }
                     TOK_CONTENT_THINK => {
                         *in_th = true;
                         on_piece(tid, "<think>\n")
@@ -2047,18 +2049,12 @@ impl InklingEngine {
                             *in_th = false;
                             on_piece(tid, "\n</think>\n\n")
                         } else {
-                            true
+                            on_piece(tid, "")
                         }
                     }
-                    TOK_CONTENT_TEXT => true,
-                    TOK_END_SAMPLING | TOK_EOT => true,
                     _ => {
                         let piece = dec.push(tok.token_bytes(tid));
-                        if !piece.is_empty() {
-                            on_piece(tid, &piece)
-                        } else {
-                            true
-                        }
+                        on_piece(tid, &piece)
                     }
                 }
             };

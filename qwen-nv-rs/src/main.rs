@@ -144,7 +144,7 @@ fn print_usage() {
          TEXT & DAEMON OPTIONS:\n  \
            --model <REF>        Thinker GGUF alias (inkling, qwen3-8b-patched, qwen3-thinking:8b, qwen3-embed:8b, qwen3:4b, ...) or path [default: qwen3-8b-patched]\n  \
            --effort <VAL>       Inkling-2-Mini thinking effort: 0 (instant ~120 tok/s), 0.1, 0.2, 0.7, 0.9 [default: 0.2]\n  \
-           --gamma <1..7>       Inkling-2-Mini DSpark speculative draft length when --spec is active [default: 3]\n  \
+           --gamma <1..7>       Inkling-2-Mini DSpark speculative draft length when --spec is active [default: 7]\n  \
            --max-tokens <N>     Maximum tokens to generate [default: 256]\n  \
            --temp <F>           Sampling temperature (0.0 = greedy for text; 0.9 default for speak)\n  \
            --ctx <N>            Maximum KV context length [default: 4096]\n  \
@@ -684,6 +684,9 @@ fn run_cli() -> Result<(), String> {
             let tui_spec = if is_ink && !spec_explicit { false } else { spec };
             if let Some(ref eff) = inkling_effort {
                 std::env::set_var("INKLING_EFFORT", eff);
+            }
+            if let Some(g) = inkling_gamma {
+                std::env::set_var("INKLING_GAMMA", g.clamp(1, 7).to_string());
             }
             tui::run_tui(
                 &model_ref,
@@ -1515,6 +1518,17 @@ fn run_cli() -> Result<(), String> {
             let tok = BpeTokenizer::from_gguf(&gguf)?;
             let ids = if raw_mode {
                 tok.encode(&text)
+            } else if tok.preset == "inkling2" {
+                let eff = InklingEngine::normalize_effort(inkling_effort.as_deref().unwrap_or("0.2"));
+                let mut s = format!(
+                    "<|message_system|><|content_text|>Thinking effort level: {}<|end_message|><|message_user|><|content_text|>{}<|end_message|>",
+                    eff,
+                    text.trim()
+                );
+                if eff == "0" {
+                    s.push_str("<|message_model|><|content_text|>");
+                }
+                tok.encode(&s)
             } else {
                 let cfg = QwenModelConfig::from_gguf(&gguf, &tok, max_ctx, "qwen")?;
                 let mut v = Vec::new();

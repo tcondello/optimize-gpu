@@ -26,7 +26,7 @@ use crate::daemon::{
     client_transcribe_via_daemon, client_tts_warm, daemon_ping, ensure_daemon_running, stop_daemon,
 };
 use crate::gguf::{resolve_model_path, BpeTokenizer, GgufFile, QwenModelConfig};
-use crate::inkling::InklingEngine;
+use crate::inkling::{InklingEngine, TOK_CONTENT_TEXT, TOK_END_MESSAGE, TOK_MSG_MODEL};
 use crate::rag::format_rag_augmented_prompt;
 use crate::topic_lora::json_find_num;
 use crate::tts::TtsSynthParams;
@@ -1235,6 +1235,14 @@ impl TuiApp {
             .ok()
             .map(|s| InklingEngine::normalize_effort(&s).to_string())
             .unwrap_or_else(|| "0.2".to_string());
+        let init_gamma = std::env::var("INKLING_GAMMA")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(7)
+            .clamp(1, 7);
+        if is_inkling {
+            let _ = client_inkling_set_gamma(init_gamma);
+        }
 
         let lora_badge = if is_inkling { None } else { query_lora_badge_from_daemon() };
         let topic_badge = if is_inkling { None } else { query_topic_badge_from_daemon() };
@@ -1251,7 +1259,7 @@ impl TuiApp {
             active_gb_per_tok,
             is_inkling,
             inkling_effort: init_effort,
-            inkling_gamma: 7,
+            inkling_gamma: init_gamma,
             tok,
             cfg,
             active_sms,
@@ -1432,13 +1440,13 @@ impl TuiApp {
                     ids.extend(self.tok.encode(&u_blk));
                 } else if m.role == "assistant" {
                     if !m.raw_token_ids.is_empty() {
-                        if m.raw_token_ids[0] != 200004 {
-                            ids.push(200004); // `<|message_model|>`
-                            ids.push(200005); // `<|content_text|>`
+                        if m.raw_token_ids[0] != TOK_MSG_MODEL {
+                            ids.push(TOK_MSG_MODEL);
+                            ids.push(TOK_CONTENT_TEXT);
                         }
                         ids.extend_from_slice(&m.raw_token_ids);
-                        if m.raw_token_ids.last().copied() != Some(200001) {
-                            ids.push(200001); // `<|end_message|>`
+                        if m.raw_token_ids.last().copied() != Some(TOK_END_MESSAGE) {
+                            ids.push(TOK_END_MESSAGE);
                         }
                     } else {
                         let trimmed = m.content.trim();
@@ -1464,8 +1472,8 @@ impl TuiApp {
                 }
             }
             if self.inkling_effort == "0" || user_no_think {
-                ids.push(200004); // `<|message_model|>`
-                ids.push(200005); // `<|content_text|>`
+                ids.push(TOK_MSG_MODEL);
+                ids.push(TOK_CONTENT_TEXT);
             }
             return ids;
         }
@@ -3279,7 +3287,7 @@ fn run_tui_voice_self_test(model_ref: &str, max_ctx: usize, spec: bool, temp: f3
 mod tests {
     use super::*;
     use crate::daemon::format_inkling_stats_json;
-    use crate::inkling::InklingGenStats;
+    use crate::inkling::{InklingGenStats, TOK_CONTENT_THINK};
 
     #[test]
     fn test_inkling_stats_json_and_multiturn_tui_prefix_cache() {
@@ -3394,6 +3402,17 @@ mod tests {
         assert!(scr.render_ansi(cur1).len() > 500);
         app.messages.clear();
 
+        // Verify GGUF special-token constants match `BpeTokenizer::encode` 100%
+        assert_eq!(
+            app.tok.encode("<|message_model|><|content_text|>"),
+            vec![TOK_MSG_MODEL, TOK_CONTENT_TEXT]
+        );
+        assert_eq!(
+            app.tok.encode("<|message_model|><|content_thinking|>"),
+            vec![TOK_MSG_MODEL, TOK_CONTENT_THINK]
+        );
+        assert_eq!(app.tok.encode("<|end_message|>"), vec![TOK_END_MESSAGE]);
+
         // Verify Turn 1 -> Turn 2 bit-exact prefix match on `effort = "0.2"` (thinking tokens)
         app.messages.push(ChatMsg {
             role: "user".into(),
@@ -3402,7 +3421,18 @@ mod tests {
             stats: None,
         });
         let p1 = app.encode_conversation(None, None);
-        let sim_gen1 = vec![200004, 200007, 17, 10, 17, 200001, 200004, 200005, 19, 200001];
+        let sim_gen1 = vec![
+            TOK_MSG_MODEL,
+            TOK_CONTENT_THINK,
+            17,
+            10,
+            17,
+            TOK_END_MESSAGE,
+            TOK_MSG_MODEL,
+            TOK_CONTENT_TEXT,
+            19,
+            TOK_END_MESSAGE,
+        ];
         let mut engine_cached_1 = p1.clone();
         engine_cached_1.extend_from_slice(&sim_gen1);
 
@@ -3432,8 +3462,11 @@ mod tests {
             stats: None,
         });
         let p1_e0 = app.encode_conversation(None, None);
-        assert_eq!(&p1_e0[p1_e0.len() - 2..], &[200004, 200005]);
-        let sim_gen_e0 = vec![9906, 200001];
+        assert_eq!(
+            &p1_e0[p1_e0.len() - 2..],
+            &[TOK_MSG_MODEL, TOK_CONTENT_TEXT]
+        );
+        let sim_gen_e0 = vec![9906, TOK_END_MESSAGE];
         let mut engine_cached_e0 = p1_e0.clone();
         engine_cached_e0.extend_from_slice(&sim_gen_e0);
         app.messages.push(ChatMsg {
@@ -3450,5 +3483,209 @@ mod tests {
         });
         let p2_e0 = app.encode_conversation(None, None);
         assert_eq!(&p2_e0[..engine_cached_e0.len()], engine_cached_e0.as_slice());
+    }
+
+    #[test]
+    fn test_inkling_tui_live_unix_socket_end_to_end() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let Ok(gguf_path) = resolve_model_path("inkling") else {
+            return;
+        };
+        if !gguf_path.exists() {
+            return;
+        }
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "qwen_nv_test_inkling_{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind temp unix socket");
+        std::env::set_var("QWEN_NV_DAEMON_SOCK", &sock_path);
+
+        let srv = std::thread::spawn(move || {
+            let mut active_gamma = 7usize;
+            let mut gen_calls = 0usize;
+            let mut turn1_prompt_plus_gen: Vec<i32> = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut hdr = Vec::new();
+                let mut b = [0u8; 1];
+                while stream.read(&mut b).unwrap_or(0) == 1 {
+                    if b[0] == b'\n' {
+                        break;
+                    }
+                    hdr.push(b[0]);
+                }
+                if hdr.is_empty() {
+                    continue;
+                }
+                let line = String::from_utf8_lossy(&hdr);
+                let parts: Vec<&str> = line.split('\t').collect();
+                match parts[0] {
+                    "PING" => {
+                        let _ = stream.write_all(b"PONG\tinkling\tInkling-2-Mini\t68\n");
+                    }
+                    "INKLING_CFG" => {
+                        if let Some(gs) = parts.get(1) {
+                            active_gamma = gs.trim().parse().unwrap_or(7);
+                        }
+                        let _ = stream.write_all(
+                            format!("OK\t{{\"gamma\":{},\"dspark_loaded\":true}}\n", active_gamma)
+                                .as_bytes(),
+                        );
+                    }
+                    "RESET" => {
+                        let _ = stream.write_all(b"OK\n");
+                    }
+                    "DRAFTER_STATUS" => {
+                        let _ = stream.write_all(
+                            format!(
+                                "OK\t{{\"active\":true,\"model_ref\":\"dspark\",\"model_name\":\"Inkling2MTP-Block8\",\"gamma\":{}}}\n",
+                                active_gamma
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    "GEN" => {
+                        let spec_flag = parts[3] == "1";
+                        let mut lb = [0u8; 4];
+                        stream.read_exact(&mut lb).unwrap();
+                        let plen = u32::from_le_bytes(lb) as usize;
+                        let mut payload = vec![0u8; plen];
+                        stream.read_exact(&mut payload).unwrap();
+                        let prompt_ids: Vec<i32> = payload
+                            .chunks_exact(4)
+                            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+
+                        gen_calls += 1;
+                        let sim_tokens: &[(i32, &str)] = if gen_calls == 1 {
+                            assert!(!spec_flag, "Turn 1 default must be persistent B=1 (spec=false)");
+                            &[
+                                (TOK_MSG_MODEL, ""),
+                                (TOK_CONTENT_THINK, "<think>\n"),
+                                (2219, "6*7=42"),
+                                (TOK_END_MESSAGE, "\n</think>\n\n"),
+                                (TOK_MSG_MODEL, ""),
+                                (TOK_CONTENT_TEXT, ""),
+                                (2983, "42"),
+                                (TOK_END_MESSAGE, ""),
+                            ]
+                        } else {
+                            assert!(spec_flag, "Turn 2 after /spec on must pass spec=true");
+                            assert!(
+                                prompt_ids.len() > turn1_prompt_plus_gen.len(),
+                                "Turn 2 prompt must extend Turn 1 cached sequence"
+                            );
+                            assert_eq!(
+                                &prompt_ids[..turn1_prompt_plus_gen.len()],
+                                turn1_prompt_plus_gen.as_slice(),
+                                "Turn 2 must match 100% of Turn 1 KV+ShortConv prefix"
+                            );
+                            &[
+                                (TOK_MSG_MODEL, ""),
+                                (TOK_CONTENT_TEXT, ""),
+                                (5192, "{\"ok\":true}"),
+                                (TOK_END_MESSAGE, ""),
+                            ]
+                        };
+
+                        let mut gen_ids = Vec::new();
+                        for &(tid, piece) in sim_tokens {
+                            gen_ids.push(tid);
+                            let pb = piece.as_bytes();
+                            let mut fr = Vec::with_capacity(7 + pb.len());
+                            fr.push(0x01);
+                            fr.extend_from_slice(&tid.to_le_bytes());
+                            fr.extend_from_slice(&(pb.len() as u16).to_le_bytes());
+                            fr.extend_from_slice(pb);
+                            stream.write_all(&fr).unwrap();
+                        }
+                        if gen_calls == 1 {
+                            turn1_prompt_plus_gen = prompt_ids.clone();
+                            turn1_prompt_plus_gen.extend_from_slice(&gen_ids);
+                        }
+                        let st = crate::inkling::InklingGenStats {
+                            model_name: "Inkling-2-Mini".into(),
+                            loop_passes: 3,
+                            logical_layers_per_tok: 48,
+                            prompt_tokens: prompt_ids.len(),
+                            cached_prefix_tokens: if gen_calls == 1 { 0 } else { turn1_prompt_plus_gen.len() },
+                            completion_tokens: gen_ids.len(),
+                            prefill_ms: 14.0,
+                            prefill_tok_per_s: 1200.0,
+                            decode_ms: 58.0,
+                            decode_tok_per_s: if spec_flag { 138.00 } else { 120.35 },
+                            total_ms: 72.0,
+                            ttft_ms: 14.0,
+                            gpu_launches: 2,
+                            spec_verify_calls: if spec_flag { 1 } else { 0 },
+                            spec_accepted_extra: if spec_flag { 3 } else { 0 },
+                            stop_reason: "stop",
+                            token_ids: gen_ids,
+                            vram_weights_mb: 7534.7,
+                            vram_kv_conv_mb: 451.7,
+                        };
+                        let sj = crate::daemon::format_inkling_stats_json(&st);
+                        let sb = sj.as_bytes();
+                        let mut done = Vec::with_capacity(5 + sb.len());
+                        done.push(0x02);
+                        done.extend_from_slice(&(sb.len() as u32).to_le_bytes());
+                        done.extend_from_slice(sb);
+                        stream.write_all(&done).unwrap();
+                    }
+                    "STOP" => {
+                        let _ = stream.write_all(b"BYE\n");
+                        break;
+                    }
+                    _ => {
+                        let _ = stream.write_all(b"OK\t{}\n");
+                    }
+                }
+            }
+            active_gamma
+        });
+
+        let mut app = TuiApp::new("inkling", 2048, false, 0.0, 256).expect("TuiApp::new over live socket");
+        assert!(app.is_inkling);
+        assert!(!app.spec_enabled);
+        assert_eq!(app.inkling_gamma, 7);
+
+        // Turn 1: Persistent B=1 with thinking (`effort = "0.2"`)
+        app.start_generation("What is 6 * 7?".into(), false);
+        while app.streaming_rx.is_some() {
+            app.pump_stream();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!((app.last_tps - 120.35).abs() < 0.05);
+        assert!(app.messages.last().unwrap().content.contains("42"));
+        assert_eq!(app.messages.last().unwrap().raw_token_ids.len(), 8);
+
+        // Switch to DSpark speculative mode + gamma=5 + Turn 2 prefix-cached follow-up
+        let _ = app.handle_slash_command("/spec on", None);
+        let _ = app.handle_slash_command("/gamma 5", None);
+        assert!(app.spec_enabled);
+        assert_eq!(app.inkling_gamma, 5);
+
+        app.start_generation("Now format as JSON.".into(), false);
+        while app.streaming_rx.is_some() {
+            app.pump_stream();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!((app.last_tps - 138.00).abs() < 0.05);
+        assert!(app.last_cached_prefix > 0);
+        assert!(app.messages.last().unwrap().content.contains("{\"ok\":true}"));
+
+        let mut scr = ScreenBuf::new(120, 36);
+        let cur = app.draw(&mut scr);
+        assert!(scr.render_ansi(cur).len() > 800);
+
+        let _ = crate::daemon::stop_daemon();
+        let final_gamma = srv.join().expect("join mock daemon");
+        assert_eq!(final_gamma, 5);
+        let _ = std::fs::remove_file(&sock_path);
+        std::env::remove_var("QWEN_NV_DAEMON_SOCK");
     }
 }
