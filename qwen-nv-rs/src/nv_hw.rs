@@ -2280,6 +2280,24 @@ impl NvGpu {
         Ok(())
     }
 
+    /// Lightweight `< 25 us` Compute GPFIFO WFI+semaphore heartbeat so GA102 PGRAPH / Thunderbolt PCIe ASPM
+    /// never deep-sleeps `compute_gpfifo` across multi-hour daemon idle periods.
+    pub fn keepalive_compute_tick(&mut self) -> Result<(), String> {
+        let sig_va = self.timeline_buf.va_addr;
+        self.timeline_value += 1;
+        let v = self.timeline_value;
+        let mut c_cmds = Vec::with_capacity(8);
+        Self::push_nvm(&mut c_cmds, 0, NVC56F_SEM_ADDR_LO, &[
+            (sig_va & 0xffff_ffff) as u32,
+            (sig_va >> 32) as u32,
+            (v & 0xffff_ffff) as u32,
+            (v >> 32) as u32,
+            NVC56F_SEM_EXEC_REL_WFI_64_TS,
+        ]);
+        self.submit_gpfifo_cmds(true, &c_cmds)?;
+        self.wait_timeline(v, Duration::from_secs(2))
+    }
+
     pub fn ensure_local_memory(&mut self, required_bytes: u32) -> Result<(), String> {
         if self.slm_per_thread >= required_bytes {
             return Ok(());

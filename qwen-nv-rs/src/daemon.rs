@@ -168,6 +168,7 @@ pub fn run_daemon_foreground(model_ref: &str, max_ctx: usize) -> Result<(), Stri
         engine.gpu.active_sms
     );
 
+    let mut last_gpu_tick = Instant::now();
     while !SHUTDOWN_REQ.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -177,8 +178,13 @@ pub fn run_daemon_foreground(model_ref: &str, max_ctx: usize) -> Result<(), Stri
                         break;
                     }
                 }
+                last_gpu_tick = Instant::now();
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if last_gpu_tick.elapsed() >= Duration::from_secs(25) {
+                    let _ = engine.gpu.keepalive_compute_tick();
+                    last_gpu_tick = Instant::now();
+                }
                 thread::sleep(Duration::from_millis(2));
             }
             Err(e) => {
@@ -228,6 +234,7 @@ fn run_inkling_daemon_foreground(
         engine.gpu.active_sms
     );
 
+    let mut last_gpu_tick = Instant::now();
     while !SHUTDOWN_REQ.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -237,8 +244,19 @@ fn run_inkling_daemon_foreground(
                         break;
                     }
                 }
+                last_gpu_tick = Instant::now();
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if last_gpu_tick.elapsed() >= Duration::from_secs(25) {
+                    if let Err(e) = engine.gpu.keepalive_compute_tick() {
+                        eprintln!("[qwen-nv daemon] Compute keepalive error ({}); re-initializing GPU...", e);
+                        engine.gpu.shutdown_clean();
+                        if let Ok(fresh) = InklingEngine::new(model_ref, max_ctx) {
+                            engine = fresh;
+                        }
+                    }
+                    last_gpu_tick = Instant::now();
+                }
                 thread::sleep(Duration::from_millis(2));
             }
             Err(e) => {

@@ -1947,14 +1947,22 @@ impl TuiApp {
                     _ => !self.spec_enabled,
                 };
                 if self.is_inkling {
-                    self.set_toast(if self.spec_enabled {
+                    let msg = if self.spec_enabled {
                         format!(
-                            "✓ DSpark Block-8 Speculative Decoding: ON (γ={} • up to 138 tok/s on JSON/code)",
+                            "✓ **DSpark Block-8 Speculative Decoding: ON** (`γ={}` • up to `138 tok/s` on structured JSON/code)",
                             self.inkling_gamma
                         )
                     } else {
-                        "✓ 48-Layer Persistent B=1 Megakernel: ON (~120 tok/s across all tasks, 2 GPU launches)".to_string()
+                        "✓ **48-Layer Persistent B=1 Megakernel: ON** (`~120 tok/s` across all tasks, `2` GPU launches)".to_string()
+                    };
+                    self.messages.push(ChatMsg {
+                        role: "info".into(),
+                        content: msg.clone(),
+                        raw_token_ids: Vec::new(),
+                        stats: None,
                     });
+                    self.scroll_from_bottom = 0;
+                    self.set_toast(msg);
                 } else {
                     self.set_toast(if self.spec_enabled {
                         "✓ BM=4 Lossless Speculative Verify: ON (up to 260+ tok/s on code/JSON)"
@@ -1983,6 +1991,22 @@ impl TuiApp {
                         self.inkling_effort = next_eff.to_string();
                         let _ = client_reset_cache();
                     }
+                    let mode_desc = if self.inkling_effort == "0" {
+                        "Thinking **OFF** (`effort = 0` — instant non-thinking replies at `~120 tok/s`)"
+                    } else {
+                        "Thinking **ON** (`<think>...</think>` 3-pass reasoning active)"
+                    };
+                    let info_msg = format!(
+                        "✓ **Inkling Thinking Effort: `{}`** — {}. Type a prompt below to test!",
+                        self.inkling_effort, mode_desc
+                    );
+                    self.messages.push(ChatMsg {
+                        role: "info".into(),
+                        content: info_msg,
+                        raw_token_ids: Vec::new(),
+                        stats: None,
+                    });
+                    self.scroll_from_bottom = 0;
                     self.set_toast(format!(
                         "✓ Inkling thinking effort set to '{}' (0 = instant ~120 tok/s • 0.2 = reasoning • 0.9 = deep)",
                         self.inkling_effort
@@ -1997,6 +2021,18 @@ impl TuiApp {
                     match client_inkling_set_gamma(gc) {
                         Ok(_) => {
                             self.inkling_gamma = gc;
+                            let info_msg = format!(
+                                "✓ **DSpark Draft Depth: `γ={}`** (speculative verify currently **{}** — use `/spec on` to enable)",
+                                gc,
+                                if self.spec_enabled { "ON" } else { "OFF" }
+                            );
+                            self.messages.push(ChatMsg {
+                                role: "info".into(),
+                                content: info_msg,
+                                raw_token_ids: Vec::new(),
+                                stats: None,
+                            });
+                            self.scroll_from_bottom = 0;
                             self.set_toast(format!("✓ DSpark draft depth set to γ={} (use `/spec on` to enable)", gc));
                         }
                         Err(e) => self.set_toast(format!("Gamma update error: {}", e)),
