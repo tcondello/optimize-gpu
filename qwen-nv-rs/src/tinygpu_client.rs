@@ -129,6 +129,8 @@ impl TinyGpuClient {
         let sock = sock_opt.ok_or_else(|| {
             format!("Failed to connect to TinyGPU server at {}", sock_path.display())
         })?;
+        let _ = sock.set_read_timeout(Some(Duration::from_secs(15)));
+        let _ = sock.set_write_timeout(Some(Duration::from_secs(15)));
 
         // Enlarge socket buffers to 64 MB
         unsafe {

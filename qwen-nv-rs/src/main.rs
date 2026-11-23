@@ -142,11 +142,13 @@ fn print_usage() {
            qwen-nv serve      [OPTIONS]                Serve OpenAI HTTP API (/v1/chat/completions, /v1/embeddings, /v1/audio/*)\n  \
            qwen-nv tokenize   [OPTIONS] <TEXT>         Offline GGUF BPE tokenizer check (zero GPU required)\n\n\
          TEXT & DAEMON OPTIONS:\n  \
-           --model <REF>        Thinker GGUF alias (qwen3-8b-patched, qwen3-thinking:8b, qwen3-embed:8b, qwen3:4b, ...) or path [default: qwen3-8b-patched]\n  \
+           --model <REF>        Thinker GGUF alias (inkling, qwen3-8b-patched, qwen3-thinking:8b, qwen3-embed:8b, qwen3:4b, ...) or path [default: qwen3-8b-patched]\n  \
+           --effort <VAL>       Inkling-2-Mini thinking effort: 0 (instant ~120 tok/s), 0.1, 0.2, 0.7, 0.9 [default: 0.2]\n  \
+           --gamma <1..7>       Inkling-2-Mini DSpark speculative draft length when --spec is active [default: 3]\n  \
            --max-tokens <N>     Maximum tokens to generate [default: 256]\n  \
            --temp <F>           Sampling temperature (0.0 = greedy for text; 0.9 default for speak)\n  \
            --ctx <N>            Maximum KV context length [default: 4096]\n  \
-           --spec / --no-spec   Enable/disable lossless BM=4 speculative verify [default: --spec]\n  \
+           --spec / --no-spec   Enable/disable lossless speculative verify [default: --no-spec (inkling) / --spec (qwen3)]\n  \
            --spec-crossover <N> Auto-switch BM=4 -> persistent T=1 megakernel at pos >= N (0 = never) [default: 3072 (8B) / 1536 (4B)]\n  \
            --direct             Run standalone in-process instead of via persistent daemon\n  \
            --background         Spawn daemon in background and return once ready\n  \
@@ -227,6 +229,7 @@ fn run_cli() -> Result<(), String> {
     let mut temp_explicit = false;
     let mut max_ctx = 4096usize;
     let mut spec = true;
+    let mut spec_explicit = false;
     let mut direct = false;
     let mut background = false;
     let mut reset_cache = false;
@@ -291,7 +294,9 @@ fn run_cli() -> Result<(), String> {
     let mut min_prob = 0.85f32;
     let mut inkling_passes: Option<usize> = None;
     let mut inkling_effort: Option<String> = None;
+    let mut inkling_gamma: Option<usize> = None;
     let mut inkling_suite = false;
+    let mut inkling_pareto = false;
 
     let mut positional = Vec::<String>::new();
 
@@ -581,7 +586,14 @@ fn run_cli() -> Result<(), String> {
                     inkling_effort = Some(args[i].clone());
                 }
             }
+            "--dspark-gamma" => {
+                i += 1;
+                if i < args.len() {
+                    inkling_gamma = args[i].parse().ok();
+                }
+            }
             "--suite" => inkling_suite = true,
+            "--pareto" => inkling_pareto = true,
             "--doc" | "--passage" => embed_is_query = false,
             "--query" => embed_is_query = true,
             "--attn-only" => attn_only = true,
@@ -589,8 +601,14 @@ fn run_cli() -> Result<(), String> {
             "--play" => no_play = false,
             "--greedy" => greedy = true,
             "--no-stream-chunks" => stream_chunks = false,
-            "--spec" => spec = true,
-            "--no-spec" => spec = false,
+            "--spec" => {
+                spec = true;
+                spec_explicit = true;
+            }
+            "--no-spec" => {
+                spec = false;
+                spec_explicit = true;
+            }
             "--direct" => direct = true,
             "--background" => background = true,
             "--reset-cache" => reset_cache = true,
@@ -662,10 +680,15 @@ fn run_cli() -> Result<(), String> {
         "serve" => run_http_server(&model_ref, max_ctx, port, spec),
         "tui" | "chat" => {
             let tui_max = if max_tokens_explicit { max_tokens } else { 1024 };
+            let is_ink = InklingEngine::is_inkling_ref(&model_ref);
+            let tui_spec = if is_ink && !spec_explicit { false } else { spec };
+            if let Some(ref eff) = inkling_effort {
+                std::env::set_var("INKLING_EFFORT", eff);
+            }
             tui::run_tui(
                 &model_ref,
                 max_ctx,
-                spec,
+                tui_spec,
                 temp,
                 tui_max,
                 self_test,
@@ -1520,9 +1543,162 @@ fn run_cli() -> Result<(), String> {
             let _ = stop_daemon();
             install_signal_handlers();
             let mut engine = InklingEngine::new(eff_model, max_ctx)?;
+            if let Some(g) = inkling_gamma {
+                engine.dspark_gamma = g.clamp(1, 7);
+            }
             let eff_seed = seed.unwrap_or(42);
             let eff_temp = if temp_explicit { temp } else { 0.0 };
             let eff_max_toks = if max_tokens_explicit { max_tokens } else { 512 };
+            let spec = if spec_explicit { spec } else { false };
+
+            if inkling_pareto {
+                let pareto_cases: &[(&str, &str, &str, usize)] = &[
+                    (
+                        "concise_factual_effort0",
+                        "What are the three main architectural innovations in a looped Mixture-of-Experts transformer? Reply in 3 concise bullet points.",
+                        "0",
+                        384,
+                    ),
+                    (
+                        "coding_rust_is_prime_effort0",
+                        "Write a concise zero-dependency Rust function `is_prime(n: u64) -> bool`.",
+                        "0",
+                        384,
+                    ),
+                    (
+                        "coding_rust_bsearch_effort0",
+                        "Write a concise zero-dependency generic Rust function `lower_bound<T: Ord>(slice: &[T], target: &T) -> usize` with 3 `assert_eq!` unit test examples.",
+                        "0",
+                        384,
+                    ),
+                    (
+                        "structured_json_effort0",
+                        "Output ONLY a valid minified JSON object with keys `gpu`, `sm_count`, `vram_gb`, `quant`, `loop_passes`, and `logical_layers` describing an NVIDIA RTX 3080 (68 SMs, 10 GB) running Inkling-2-Mini (3 passes, 48 logical layers, IQ2).",
+                        "0",
+                        256,
+                    ),
+                    (
+                        "math_amc12_nut_mix",
+                        "A box contains 10 pounds of a nut mix that is 50% peanuts, 20% cashews, and 30% almonds. A second nut mix containing 20% peanuts, 40% cashews, and 40% almonds is added to the box resulting in a new nut mix that is 40% peanuts. How many pounds of cashews are now in the box? Give the exact final number.",
+                        "0.2",
+                        640,
+                    ),
+                    (
+                        "math_bat_and_ball",
+                        "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?",
+                        "0.2",
+                        256,
+                    ),
+                ];
+
+                // Strategies: `(label, enable_spec, gamma, run_all_6)`
+                let strategies: &[(&str, bool, usize, bool)] = &[
+                    ("persistent_b1", false, 0, true),
+                    ("dspark_gamma2", true, 2, false),
+                    ("dspark_gamma3", true, 3, true),
+                    ("dspark_gamma4", true, 4, false),
+                    ("dspark_gamma7", true, 7, false),
+                ];
+
+                let mut baseline_tokens = std::collections::HashMap::<String, Vec<i32>>::new();
+                let mut rows_json = Vec::new();
+                let model_file = resolve_model_path(eff_model)
+                    .ok()
+                    .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| eff_model.to_string());
+
+                for &(strat_name, en_spec, gam, run_all) in strategies {
+                    if gam > 0 {
+                        engine.dspark_gamma = gam;
+                    }
+                    for (c_idx, &(case_name, prompt_s, eff_str, m_toks)) in pareto_cases.iter().enumerate() {
+                        // Run full 6-task suite on `persistent_b1` and `dspark_gamma3`; run 4 core speed tasks on gamma=2,4,7
+                        if !run_all && c_idx == 4 {
+                            continue;
+                        }
+                        let p_ids = engine.format_chat_prompt(prompt_s, None, Some(eff_str));
+                        let mut reply = String::new();
+                        let st = engine.generate_with_cancel(
+                            &p_ids,
+                            m_toks,
+                            0.0,
+                            eff_seed,
+                            Some(3),
+                            en_spec,
+                            true,
+                            None,
+                            false,
+                            |_, piece| {
+                                reply.push_str(piece);
+                                true
+                            },
+                        )?;
+                        let lossless_match = if !en_spec {
+                            baseline_tokens.insert(case_name.to_string(), st.token_ids.clone());
+                            true
+                        } else if let Some(ref_toks) = baseline_tokens.get(case_name) {
+                            ref_toks == &st.token_ids
+                        } else {
+                            true
+                        };
+                        eprintln!(
+                            "[pareto] {:16} | {:14} | {:28} | prompt={:3} ({:6.1} t/s) | gen={:3} @ {:6.2} tok/s (DSpark +{:3}/{:3}) | match={}",
+                            model_file,
+                            strat_name,
+                            case_name,
+                            st.prompt_tokens,
+                            st.prefill_tok_per_s,
+                            st.completion_tokens,
+                            st.decode_tok_per_s,
+                            st.spec_accepted_extra,
+                            st.spec_verify_calls,
+                            lossless_match
+                        );
+                        let esc_rep = reply
+                            .replace('\\', "\\\\")
+                            .replace('"', "\\\"")
+                            .replace('\n', "\\n")
+                            .replace('\r', "");
+                        rows_json.push(format!(
+                            "{{\"model_file\":\"{}\",\"strategy\":\"{}\",\"case\":\"{}\",\"effort\":\"{}\",\"spec\":{},\"gamma\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\"prefill_ms\":{:.2},\"prefill_tok_per_s\":{:.2},\"decode_ms\":{:.2},\"decode_tok_per_s\":{:.2},\"ttft_ms\":{:.2},\"spec_verify_calls\":{},\"spec_accepted_extra\":{},\"lossless_match\":{},\"vram_weights_mb\":{:.2},\"vram_kv_conv_mb\":{:.2},\"response\":\"{}\"}}",
+                            model_file,
+                            strat_name,
+                            case_name,
+                            eff_str,
+                            en_spec,
+                            gam,
+                            st.prompt_tokens,
+                            st.completion_tokens,
+                            st.prefill_ms,
+                            st.prefill_tok_per_s,
+                            st.decode_ms,
+                            st.decode_tok_per_s,
+                            st.ttft_ms,
+                            st.spec_verify_calls,
+                            st.spec_accepted_extra,
+                            lossless_match,
+                            st.vram_weights_mb,
+                            st.vram_kv_conv_mb,
+                            esc_rep
+                        ));
+                    }
+                }
+
+                let summary_json = format!(
+                    "{{\"model_file\":\"{}\",\"model_name\":\"{}\",\"gpu\":\"NVIDIA GeForce RTX 3080 (GA102, sm_86, 68 SMs, 10GB GDDR6X)\",\"results\":[{}]}}",
+                    model_file,
+                    engine.cfg.model_name,
+                    rows_json.join(",")
+                );
+                if let Some(ref out_p) = output_path {
+                    fs::write(out_p, &summary_json).map_err(|e| e.to_string())?;
+                }
+                if json_stats {
+                    println!("{}", summary_json);
+                }
+                engine.gpu.shutdown_clean();
+                return Ok(());
+            }
 
             if inkling_suite {
                 let bench_cases: &[(&str, &str, &str, usize, usize)] = &[
@@ -1572,16 +1748,19 @@ fn run_cli() -> Result<(), String> {
 
                 let mut rows_json = Vec::new();
                 for &(name, prompt_s, eff_str, n_pass, m_toks) in bench_cases {
-                    eprintln!("\n=== [Inkling Suite: {} (passes={}, effort={})] ===", name, n_pass, eff_str);
+                    eprintln!("\n=== [Inkling Suite: {} (passes={}, effort={}, spec={})] ===", name, n_pass, eff_str, spec);
                     let p_ids = engine.format_chat_prompt(prompt_s, sys_prompt_opt.as_deref(), Some(eff_str));
                     let mut reply = String::new();
                     let mut out_stdout = io::stdout();
-                    let st = engine.generate(
+                    let st = engine.generate_with_cancel(
                         &p_ids,
                         m_toks,
                         0.0,
                         eff_seed,
                         Some(n_pass),
+                        spec,
+                        true,
+                        None,
                         false,
                         |_, piece| {
                             reply.push_str(piece);
@@ -1589,6 +1768,7 @@ fn run_cli() -> Result<(), String> {
                                 let _ = out_stdout.write_all(piece.as_bytes());
                                 let _ = out_stdout.flush();
                             }
+                            true
                         },
                     )?;
                     if !quiet {
@@ -1600,11 +1780,13 @@ fn run_cli() -> Result<(), String> {
                         .replace('\n', "\\n")
                         .replace('\r', "");
                     rows_json.push(format!(
-                        "{{\"case\":\"{}\",\"passes\":{},\"logical_layers\":{},\"effort\":\"{}\",\"prompt_tokens\":{},\"completion_tokens\":{},\"prefill_ms\":{:.2},\"prefill_tok_per_s\":{:.2},\"decode_ms\":{:.2},\"decode_tok_per_s\":{:.2},\"ttft_ms\":{:.2},\"vram_weights_mb\":{:.2},\"vram_kv_conv_mb\":{:.2},\"response\":\"{}\"}}",
+                        "{{\"case\":\"{}\",\"passes\":{},\"logical_layers\":{},\"effort\":\"{}\",\"spec\":{},\"gamma\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\"prefill_ms\":{:.2},\"prefill_tok_per_s\":{:.2},\"decode_ms\":{:.2},\"decode_tok_per_s\":{:.2},\"ttft_ms\":{:.2},\"spec_verify_calls\":{},\"spec_accepted_extra\":{},\"vram_weights_mb\":{:.2},\"vram_kv_conv_mb\":{:.2},\"response\":\"{}\"}}",
                         name,
                         st.loop_passes,
                         st.logical_layers_per_tok,
                         eff_str,
+                        spec && engine.dspark.is_some() && n_pass == 3,
+                        engine.dspark_gamma,
                         st.prompt_tokens,
                         st.completion_tokens,
                         st.prefill_ms,
@@ -1612,6 +1794,8 @@ fn run_cli() -> Result<(), String> {
                         st.decode_ms,
                         st.decode_tok_per_s,
                         st.ttft_ms,
+                        st.spec_verify_calls,
+                        st.spec_accepted_extra,
                         st.vram_weights_mb,
                         st.vram_kv_conv_mb,
                         esc_rep
@@ -1631,7 +1815,7 @@ fn run_cli() -> Result<(), String> {
             let prompt = positional.join(" ");
             if prompt.is_empty() {
                 engine.gpu.shutdown_clean();
-                return Err("Usage: qwen-nv inkling [--passes 1|2|3] [--effort 0|0.2|0.9] [--max-tokens N] <PROMPT>".into());
+                return Err("Usage: qwen-nv inkling [--passes 1|2|3] [--effort 0|0.2|0.9] [--spec|--no-spec] [--dspark-gamma 1..7] [--max-tokens N] <PROMPT>".into());
             }
             let prompt_ids = if raw_mode {
                 engine.tok.encode(&prompt)
@@ -1639,18 +1823,22 @@ fn run_cli() -> Result<(), String> {
                 engine.format_chat_prompt(&prompt, sys_prompt_opt.as_deref(), inkling_effort.as_deref())
             };
             let mut out_stdout = io::stdout();
-            let st = engine.generate(
+            let st = engine.generate_with_cancel(
                 &prompt_ids,
                 eff_max_toks,
                 eff_temp,
                 eff_seed,
                 inkling_passes,
+                spec,
+                true,
+                None,
                 raw_mode,
                 |_, piece| {
                     if !quiet && !piece.is_empty() {
                         let _ = out_stdout.write_all(piece.as_bytes());
                         let _ = out_stdout.flush();
                     }
+                    true
                 },
             )?;
             if !quiet {
@@ -1658,10 +1846,12 @@ fn run_cli() -> Result<(), String> {
             }
             if json_stats {
                 println!(
-                    "{{\"model\":\"{}\",\"loop_passes\":{},\"logical_layers\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\"prefill_ms\":{:.3},\"prefill_tok_per_s\":{:.2},\"decode_ms\":{:.3},\"decode_tok_per_s\":{:.2},\"ttft_ms\":{:.3},\"vram_weights_mb\":{:.2},\"vram_kv_conv_mb\":{:.2}}}",
+                    "{{\"model\":\"{}\",\"loop_passes\":{},\"logical_layers\":{},\"spec\":{},\"gamma\":{},\"prompt_tokens\":{},\"completion_tokens\":{},\"prefill_ms\":{:.3},\"prefill_tok_per_s\":{:.2},\"decode_ms\":{:.3},\"decode_tok_per_s\":{:.2},\"ttft_ms\":{:.3},\"spec_verify_calls\":{},\"spec_accepted_extra\":{},\"vram_weights_mb\":{:.2},\"vram_kv_conv_mb\":{:.2}}}",
                     st.model_name,
                     st.loop_passes,
                     st.logical_layers_per_tok,
+                    spec && engine.dspark.is_some() && st.loop_passes == 3,
+                    engine.dspark_gamma,
                     st.prompt_tokens,
                     st.completion_tokens,
                     st.prefill_ms,
@@ -1669,18 +1859,22 @@ fn run_cli() -> Result<(), String> {
                     st.decode_ms,
                     st.decode_tok_per_s,
                     st.ttft_ms,
+                    st.spec_verify_calls,
+                    st.spec_accepted_extra,
                     st.vram_weights_mb,
                     st.vram_kv_conv_mb
                 );
             } else if !quiet {
                 eprintln!(
-                    "[inkling-nv] {} passes ({} logical layers) | prompt={} ({:.1} tok/s) | gen={} @ {:.2} tok/s | TTFT={:.1} ms | VRAM={:.0}+{:.0} MiB",
+                    "[inkling-nv] {} passes ({} logical layers) | prompt={} ({:.1} tok/s) | gen={} @ {:.2} tok/s (DSpark +{} accepted / {} steps) | TTFT={:.1} ms | VRAM={:.0}+{:.0} MiB",
                     st.loop_passes,
                     st.logical_layers_per_tok,
                     st.prompt_tokens,
                     st.prefill_tok_per_s,
                     st.completion_tokens,
                     st.decode_tok_per_s,
+                    st.spec_accepted_extra,
+                    st.spec_verify_calls,
                     st.ttft_ms,
                     st.vram_weights_mb,
                     st.vram_kv_conv_mb
@@ -1691,34 +1885,39 @@ fn run_cli() -> Result<(), String> {
         }
         "run" => {
             let prompt = positional.join(" ");
+            let is_ink = InklingEngine::is_inkling_ref(&model_ref);
+            let run_spec = if is_ink && !spec_explicit { false } else { spec };
             if prompt.is_empty() {
                 Err("Missing prompt text (pass prompt argument)".into())
-            } else if model_ref.to_ascii_lowercase().contains("inkling")
-                || resolve_model_path(&model_ref)
-                    .map(|p| InklingEngine::is_inkling_gguf(&p))
-                    .unwrap_or(false)
-            {
+            } else if is_ink && (direct || inkling_passes.is_some() || inkling_effort.is_some()) {
                 let _ = stop_daemon();
                 install_signal_handlers();
                 let mut engine = InklingEngine::new(&model_ref, max_ctx)?;
+                if let Some(g) = inkling_gamma {
+                    engine.dspark_gamma = g.clamp(1, 7);
+                }
                 let prompt_ids = if raw_mode {
                     engine.tok.encode(&prompt)
                 } else {
                     engine.format_chat_prompt(&prompt, sys_prompt_opt.as_deref(), inkling_effort.as_deref())
                 };
                 let mut out_stdout = io::stdout();
-                let st = engine.generate(
+                let st = engine.generate_with_cancel(
                     &prompt_ids,
                     max_tokens,
                     temp,
                     seed.unwrap_or(42),
                     inkling_passes,
+                    run_spec,
+                    true,
+                    None,
                     raw_mode,
                     |_, piece| {
                         if !quiet && !piece.is_empty() {
                             let _ = out_stdout.write_all(piece.as_bytes());
                             let _ = out_stdout.flush();
                         }
+                        true
                     },
                 )?;
                 if !quiet {
@@ -1808,7 +2007,7 @@ fn run_cli() -> Result<(), String> {
                         &prompt,
                         max_tokens,
                         temp,
-                        spec,
+                        run_spec,
                         reset_cache,
                         |_, piece| {
                             if !got_first {
@@ -1827,7 +2026,7 @@ fn run_cli() -> Result<(), String> {
                         mode,
                         max_tokens,
                         temp,
-                        spec,
+                        run_spec,
                         reset_cache,
                         |_, piece| {
                             if !got_first {

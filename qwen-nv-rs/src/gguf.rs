@@ -150,8 +150,8 @@ pub fn resolve_model_path(model_ref: &str) -> Result<PathBuf, String> {
         }
     }
     let url_opt = match model_ref {
-        "inkling" | "inkling:mini" | "inkling-2-mini" | "inkling2" | "inkling2:mini" => {
-            Some("https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-AD-IQ2_M.gguf")
+        "inkling" | "inkling-2" | "inkling:mini" | "inkling-2-mini" | "inkling2" | "inkling2:mini" => {
+            Some("https://huggingface.co/AtomicChat/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-AD-IQ2_XXS-Q2.gguf")
         }
         "qwen3-thinking:8b" | "qwen3-think:8b" | "qwen3:8b" | "qwen3:8b-q6" => {
             Some("https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q6_K.gguf")
@@ -1178,6 +1178,59 @@ impl QwenModelConfig {
             .and_then(|v| v.as_str())
             .ok_or("Missing general.architecture in GGUF")?
             .to_string();
+        if arch == "inkling2_loop" {
+            let get_u = |k: &str, def: usize| -> usize {
+                gguf.kv.get(k).and_then(|v| v.as_u64()).map(|x| x as usize).unwrap_or(def)
+            };
+            let n_phys = get_u("inkling2_loop.block_count", 24);
+            let l_start = get_u("inkling2_loop.loop.start", 6);
+            let l_end = get_u("inkling2_loop.loop.end", 18);
+            let l_cnt = get_u("inkling2_loop.loop.count", 3);
+            let logical_layers = n_phys + (l_cnt.saturating_sub(1)) * (l_end.saturating_sub(l_start));
+            let n_heads = match gguf.kv.get("inkling2_loop.attention.head_count") {
+                Some(GgufVal::IntArr(v)) if !v.is_empty() => v[0] as usize,
+                _ => 24,
+            };
+            let n_kv_heads = match gguf.kv.get("inkling2_loop.attention.head_count_kv") {
+                Some(GgufVal::IntArr(v)) if !v.is_empty() => v[0] as usize,
+                _ => 8,
+            };
+            let model_name = gguf
+                .kv
+                .get("general.name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Inkling-2-Mini")
+                .to_string();
+            let mut stop_ids = HashSet::new();
+            stop_ids.insert(200006);
+            stop_ids.insert(199999);
+            let _ = tok;
+            return Ok(Self {
+                arch,
+                model_name,
+                num_layers: logical_layers,
+                dim: get_u("inkling2_loop.embedding_length", 2304),
+                hidden_dim: get_u("inkling2_loop.expert_feed_forward_length", 1152),
+                n_heads,
+                n_kv_heads,
+                head_dim: get_u("inkling2_loop.attention.key_length", 128),
+                rope_dim: 0,
+                rope_theta: 0.0,
+                norm_eps: gguf
+                    .kv
+                    .get("inkling2_loop.attention.layer_norm_rms_epsilon")
+                    .and_then(|v| v.as_f32())
+                    .unwrap_or(1e-6),
+                vocab_size: get_u("inkling2_loop.vocab_size_unpadded", 200058),
+                max_ctx: max_context_req.clamp(512, 8192),
+                has_qk_norm: true,
+                thinking_template: true,
+                bos_id: None,
+                eos_id: 200006,
+                im_end_id: 200001,
+                stop_ids,
+            });
+        }
         if !matches!(arch.as_str(), "qwen2" | "qwen3" | "llama") {
             return Err(format!("Unsupported GGUF architecture '{}'", arch));
         }

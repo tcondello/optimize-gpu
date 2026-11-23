@@ -88,7 +88,9 @@ pub struct VramMemoryManager {
 
 impl VramMemoryManager {
     pub fn new(vram_size: u64, bar1_size: u64) -> Self {
-        let usable_vram = vram_size - (64 << 20);
+        // Reserve top 224 MiB strictly below GSP-RM's hardware-locked WPR2 region (~188 MiB:
+        // 129 MiB gsp_heap + ~55 MiB gsp_image + FRTS + VGA + non_wpr) so user allocations never touch WPR2!
+        let usable_vram = vram_size.saturating_sub(224 << 20);
         let boot_end = 2 << 20;
         let pt_size = align_up(usable_vram / 512, 1 << 20);
         let pt_end = boot_end + pt_size;
@@ -488,18 +490,18 @@ pub struct NvGpu {
 impl NvGpu {
     pub fn init() -> Result<Self, String> {
         let mut last_err = String::new();
-        for attempt in 0..4 {
+        for attempt in 0..5 {
             match Self::init_once() {
                 Ok(gpu) => return Ok(gpu),
                 Err(e) => {
                     last_err = e;
-                    if attempt + 1 < 4 {
+                    if attempt + 1 < 5 {
                         eprintln!(
-                            "[qwen-nv] Retrying GPU init ({}/3) after transient PCIe ASPM wakeup ({})...",
+                            "[qwen-nv] Retrying GPU init ({}/4) after transient PCIe ASPM wakeup ({})...",
                             attempt + 1,
                             last_err
                         );
-                        thread::sleep(Duration::from_millis(400 * (attempt as u64 + 1)));
+                        thread::sleep(Duration::from_millis(500 * (attempt as u64 + 1)));
                     }
                 }
             }
@@ -520,7 +522,7 @@ impl NvGpu {
         if wpr2_hi != 0 {
             eprintln!("[qwen-nv] WPR2 active ({:#x}); issuing clean PCI reset...", wpr2_hi);
             pci.reset_pci()?;
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(Duration::from_millis(650));
             pci.remap_bars()?;
             let pci_cmd2 = pci.read_config(PCI_COMMAND, 2)?;
             pci.write_config(PCI_COMMAND, pci_cmd2 | PCI_COMMAND_MASTER | 0x2, 2)?;

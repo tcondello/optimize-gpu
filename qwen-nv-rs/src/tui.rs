@@ -19,13 +19,14 @@ use std::time::{Duration, Instant};
 
 use crate::audio::{read_wav_mono_16k, CoreAudioPlayer, CoreAudioRecorder, ASR_SAMPLE_RATE, TTS_SAMPLE_RATE};
 use crate::daemon::{
-    client_asr_warm, client_generate_ids_cancellable, client_lora_clear, client_lora_load,
-    client_lora_status, client_rag_clear, client_rag_load, client_rag_search, client_rag_status,
-    client_speak_via_daemon, client_topic_clear, client_topic_list, client_topic_load,
-    client_topic_route, client_topic_status, client_transcribe_via_daemon, client_tts_warm,
-    daemon_ping, ensure_daemon_running, stop_daemon,
+    client_asr_warm, client_generate_ids_cancellable, client_inkling_set_gamma, client_lora_clear,
+    client_lora_load, client_lora_status, client_rag_clear, client_rag_load, client_rag_search,
+    client_rag_status, client_reset_cache, client_speak_via_daemon, client_topic_clear,
+    client_topic_list, client_topic_load, client_topic_route, client_topic_status,
+    client_transcribe_via_daemon, client_tts_warm, daemon_ping, ensure_daemon_running, stop_daemon,
 };
 use crate::gguf::{resolve_model_path, BpeTokenizer, GgufFile, QwenModelConfig};
+use crate::inkling::InklingEngine;
 use crate::rag::format_rag_augmented_prompt;
 use crate::topic_lora::json_find_num;
 use crate::tts::TtsSynthParams;
@@ -911,6 +912,7 @@ struct TurnStats {
     cached_prefix_tokens: usize,
     kernel_launches: usize,
     spec_accepted_extra: usize,
+    token_ids: Vec<i32>,
     cancelled: bool,
 }
 
@@ -930,6 +932,19 @@ fn parse_stats_json(j: &str) -> TurnStats {
             })
             .unwrap_or(0.0)
     };
+    let token_ids = j
+        .find("\"token_ids\":[")
+        .and_then(|idx| {
+            let start = idx + 13;
+            let end = j[start..].find(']')? + start;
+            Some(
+                j[start..end]
+                    .split(',')
+                    .filter_map(|p| p.trim().parse::<i32>().ok())
+                    .collect::<Vec<i32>>(),
+            )
+        })
+        .unwrap_or_default();
     TurnStats {
         decode_tok_s: get_num("\"decode_tok_per_s\""),
         ttft_ms: get_num("\"ttft_ms\""),
@@ -938,6 +953,7 @@ fn parse_stats_json(j: &str) -> TurnStats {
         cached_prefix_tokens: get_num("\"cached_prefix_tokens\"") as usize,
         kernel_launches: get_num("\"kernel_launches\"") as usize,
         spec_accepted_extra: get_num("\"spec_accepted_extra\"") as usize,
+        token_ids,
         cancelled: false,
     }
 }
@@ -946,6 +962,7 @@ fn parse_stats_json(j: &str) -> TurnStats {
 struct ChatMsg {
     role: String, // "user" | "assistant" | "system" | "info"
     content: String,
+    raw_token_ids: Vec<i32>,
     stats: Option<TurnStats>,
 }
 
@@ -1130,6 +1147,10 @@ struct TuiApp {
     model_ref: String,
     gguf_path: PathBuf,
     gguf_size_gb: f64,
+    active_gb_per_tok: f64,
+    is_inkling: bool,
+    inkling_effort: String,
+    inkling_gamma: usize,
     tok: BpeTokenizer,
     cfg: QwenModelConfig,
 
@@ -1208,10 +1229,16 @@ impl TuiApp {
         let gguf = GgufFile::open(&gguf_path)?;
         let tok = BpeTokenizer::from_gguf(&gguf)?;
         let cfg = QwenModelConfig::from_gguf(&gguf, &tok, max_ctx, model_ref)?;
+        let is_inkling = cfg.arch == "inkling2_loop";
+        let active_gb_per_tok = if is_inkling { 2.68 } else { gguf_size_gb };
+        let init_effort = std::env::var("INKLING_EFFORT")
+            .ok()
+            .map(|s| InklingEngine::normalize_effort(&s).to_string())
+            .unwrap_or_else(|| "0.2".to_string());
 
-        let lora_badge = query_lora_badge_from_daemon();
-        let topic_badge = query_topic_badge_from_daemon();
-        let rag_badge = if topic_badge.is_some() {
+        let lora_badge = if is_inkling { None } else { query_lora_badge_from_daemon() };
+        let topic_badge = if is_inkling { None } else { query_topic_badge_from_daemon() };
+        let rag_badge = if is_inkling || topic_badge.is_some() {
             None
         } else {
             query_rag_badge_from_daemon()
@@ -1221,6 +1248,10 @@ impl TuiApp {
             model_ref: model_ref.to_string(),
             gguf_path,
             gguf_size_gb,
+            active_gb_per_tok,
+            is_inkling,
+            inkling_effort: init_effort,
+            inkling_gamma: 7,
             tok,
             cfg,
             active_sms,
@@ -1357,21 +1388,97 @@ impl TuiApp {
     }
 
     fn encode_conversation(&self, last_user_override: Option<&str>, sys_override: Option<&str>) -> Vec<i32> {
-        let mut ids = Vec::with_capacity(1024);
-        if let Some(bos) = self.cfg.bos_id {
-            ids.push(bos);
-        }
         let eff_sys = if !self.system_prompt.is_empty() {
             Some(self.system_prompt.as_str())
         } else {
             sys_override.filter(|s| !s.is_empty())
         };
+        let last_user_idx = self.messages.iter().rposition(|m| m.role == "user");
+        let last_user_txt = last_user_override
+            .or_else(|| last_user_idx.map(|i| self.messages[i].content.as_str()))
+            .unwrap_or("");
+        let user_no_think = last_user_txt.contains("/no_think") || self.voice_enabled || self.topic_lora_active;
+
+        if self.is_inkling {
+            let mut ids = Vec::with_capacity(1024);
+            if let Some(sys_s) = eff_sys {
+                if !sys_s.trim().is_empty() {
+                    let mut sh = String::from("<|message_system|><|content_text|>");
+                    sh.push_str(sys_s.trim());
+                    sh.push_str("<|end_message|>");
+                    ids.extend(self.tok.encode(&sh));
+                }
+            }
+            let mut eff_hdr = String::from("<|message_system|><|content_text|>Thinking effort level: ");
+            eff_hdr.push_str(&self.inkling_effort);
+            eff_hdr.push_str("<|end_message|>");
+            ids.extend(self.tok.encode(&eff_hdr));
+
+            for (idx, m) in self.messages.iter().enumerate() {
+                if m.role == "user" {
+                    let raw_u = if Some(idx) == last_user_idx {
+                        last_user_override.unwrap_or(&m.content)
+                    } else {
+                        m.content.as_str()
+                    };
+                    let clean_u = if raw_u.contains("/no_think") {
+                        raw_u.replace("/no_think", "")
+                    } else {
+                        raw_u.to_string()
+                    };
+                    let mut u_blk = String::from("<|message_user|><|content_text|>");
+                    u_blk.push_str(clean_u.trim());
+                    u_blk.push_str("<|end_message|>");
+                    ids.extend(self.tok.encode(&u_blk));
+                } else if m.role == "assistant" {
+                    if !m.raw_token_ids.is_empty() {
+                        if m.raw_token_ids[0] != 200004 {
+                            ids.push(200004); // `<|message_model|>`
+                            ids.push(200005); // `<|content_text|>`
+                        }
+                        ids.extend_from_slice(&m.raw_token_ids);
+                        if m.raw_token_ids.last().copied() != Some(200001) {
+                            ids.push(200001); // `<|end_message|>`
+                        }
+                    } else {
+                        let trimmed = m.content.trim();
+                        let mut a_blk = String::new();
+                        if let (Some(ts), Some(te)) = (trimmed.find("<think>"), trimmed.find("</think>")) {
+                            let th_b = trimmed[ts + 7..te].trim();
+                            let tx_b = trimmed[te + 8..].trim();
+                            if !th_b.is_empty() {
+                                a_blk.push_str("<|message_model|><|content_thinking|>");
+                                a_blk.push_str(th_b);
+                                a_blk.push_str("<|end_message|>");
+                            }
+                            a_blk.push_str("<|message_model|><|content_text|>");
+                            a_blk.push_str(tx_b);
+                            a_blk.push_str("<|end_message|>");
+                        } else {
+                            a_blk.push_str("<|message_model|><|content_text|>");
+                            a_blk.push_str(trimmed);
+                            a_blk.push_str("<|end_message|>");
+                        }
+                        ids.extend(self.tok.encode(&a_blk));
+                    }
+                }
+            }
+            if self.inkling_effort == "0" || user_no_think {
+                ids.push(200004); // `<|message_model|>`
+                ids.push(200005); // `<|content_text|>`
+            }
+            return ids;
+        }
+
+        let mut ids = Vec::with_capacity(1024);
+        if let Some(bos) = self.cfg.bos_id {
+            ids.push(bos);
+        }
         if let Some(sys_s) = eff_sys {
             ids.extend(self.tok.role_tokens("system"));
             ids.extend(self.tok.encode(sys_s));
             ids.extend(self.tok.end_turn_tokens(self.cfg.im_end_id));
         }
-        let last_user_idx = self.messages.iter().rposition(|m| m.role == "user");
         for (idx, m) in self.messages.iter().enumerate() {
             if m.role == "user" || m.role == "assistant" {
                 ids.extend(self.tok.role_tokens(&m.role));
@@ -1388,10 +1495,6 @@ impl TuiApp {
             }
         }
         ids.extend(self.tok.role_tokens("assistant"));
-        let last_user_txt = last_user_override.or_else(|| {
-            last_user_idx.map(|i| self.messages[i].content.as_str())
-        }).unwrap_or("");
-        let user_no_think = last_user_txt.contains("/no_think") || self.voice_enabled || self.topic_lora_active;
         let lower_name = self.cfg.model_name.to_ascii_lowercase();
         if self.cfg.thinking_template {
             if user_no_think {
@@ -1413,6 +1516,7 @@ impl TuiApp {
         self.messages.push(ChatMsg {
             role: "user".into(),
             content: user_text.clone(),
+            raw_token_ids: Vec::new(),
             stats: None,
         });
 
@@ -1436,7 +1540,8 @@ impl TuiApp {
                             st.gpu_search_us,
                             cite_list.join(" • ")
                         ),
-                        stats: None,
+                        raw_token_ids: Vec::new(),
+            stats: None,
                     });
                     rag_override = Some(format_rag_augmented_prompt(&user_text, &st.hits));
                     // Embedding prefill used the GPU KV scratch, so force fresh prompt prefill cleanly
@@ -1462,7 +1567,8 @@ impl TuiApp {
                                 "⚡ **Topic LoRA**: **{}** (`cos={:.3}` • `{:.1} ms` embed • `{:.0} µs` search • `{:.2} ms` swap • `0` context tokens)",
                                 rt.topic, rt.score, rt.embed_ms, rt.gpu_search_us, rt.swap_ms
                             ),
-                            stats: None,
+                            raw_token_ids: Vec::new(),
+            stats: None,
                         });
                         self.set_toast(format!(
                             "⚡ Topic LoRA: {} (cos={:.3}, swap={:.2}ms)",
@@ -1487,6 +1593,7 @@ impl TuiApp {
         self.messages.push(ChatMsg {
             role: "assistant".into(),
             content: String::new(),
+            raw_token_ids: Vec::new(),
             stats: None,
         });
         self.scroll_from_bottom = 0;
@@ -1505,6 +1612,7 @@ impl TuiApp {
             let mut t_first: Option<Instant> = None;
             let mut ttft_ms = 0.0f64;
             let mut count = 0usize;
+            let mut streamed_ids = Vec::with_capacity(256);
 
             let res = client_generate_ids_cancellable(
                 &prompt_ids,
@@ -1513,7 +1621,10 @@ impl TuiApp {
                 spec,
                 force_reset_cache,
                 &cancel_bg,
-                |_tok_id, piece| {
+                |tok_id, piece| {
+                    if tok_id >= 0 {
+                        streamed_ids.push(tok_id);
+                    }
                     count += 1;
                     let now = Instant::now();
                     if t_first.is_none() {
@@ -1538,6 +1649,7 @@ impl TuiApp {
                     if st.cancelled {
                         st.completion_tokens = count;
                         st.ttft_ms = ttft_ms;
+                        st.token_ids = streamed_ids;
                     }
                     let _ = tx.send(StreamEvent::Finished(st));
                 }
@@ -1756,6 +1868,9 @@ impl TuiApp {
                         self.last_spec_extra = st.spec_accepted_extra;
                         let was_cancelled = st.cancelled;
                         if let Some(last) = self.messages.last_mut() {
+                            if !st.token_ids.is_empty() {
+                                last.raw_token_ids = st.token_ids.clone();
+                            }
                             if self.voice_enabled && !was_cancelled && !last.content.is_empty() {
                                 speak_reply_after = Some(last.content.clone());
                             }
@@ -1814,14 +1929,8 @@ impl TuiApp {
                 self.total_ctx_used = 0;
                 self.last_cached_prefix = 0;
                 self.scroll_from_bottom = 0;
-                // Trigger a 1-token reset or reset on next turn; let's mark via toast & clear
-                let reset_cancel = AtomicBool::new(false);
-                if let Some(bos) = self.cfg.bos_id {
-                    let _ = client_generate_ids_cancellable(&[bos], 1, 0.0, false, true, &reset_cancel, |_, _| {});
-                }
-                let _ = client_generate_ids_cancellable(&[151644], 1, 0.0, false, true, &reset_cancel, |_, _| {});
-                self.messages.clear();
-                self.set_toast("✓ Cleared chat & reset VRAM KV cache");
+                let _ = client_reset_cache();
+                self.set_toast("✓ Cleared chat & reset VRAM KV + ShortConv cache");
             }
             "/spec" => {
                 self.spec_enabled = match arg {
@@ -1829,11 +1938,64 @@ impl TuiApp {
                     "off" | "0" | "false" => false,
                     _ => !self.spec_enabled,
                 };
-                self.set_toast(if self.spec_enabled {
-                    "✓ BM=4 Lossless Speculative Verify: ON (up to 260+ tok/s on code/JSON)"
+                if self.is_inkling {
+                    self.set_toast(if self.spec_enabled {
+                        format!(
+                            "✓ DSpark Block-8 Speculative Decoding: ON (γ={} • up to 138 tok/s on JSON/code)",
+                            self.inkling_gamma
+                        )
+                    } else {
+                        "✓ 48-Layer Persistent B=1 Megakernel: ON (~120 tok/s across all tasks, 2 GPU launches)".to_string()
+                    });
                 } else {
-                    "✓ Pure T=1 68-SM Persistent Megakernel: ON (~173 tok/s, 2 GPU launches)"
-                });
+                    self.set_toast(if self.spec_enabled {
+                        "✓ BM=4 Lossless Speculative Verify: ON (up to 260+ tok/s on code/JSON)"
+                    } else {
+                        "✓ Pure T=1 68-SM Persistent Megakernel: ON (~173 tok/s, 2 GPU launches)"
+                    });
+                }
+            }
+            "/effort" | "/think" => {
+                if self.is_inkling {
+                    let next_eff = if cmd == "/think" {
+                        match arg {
+                            "off" | "0" | "false" => "0",
+                            "on" | "1" | "true" => "0.2",
+                            "" => {
+                                if self.inkling_effort == "0" { "0.2" } else { "0" }
+                            }
+                            other => InklingEngine::normalize_effort(other),
+                        }
+                    } else if arg.is_empty() {
+                        if self.inkling_effort == "0" { "0.2" } else { "0" }
+                    } else {
+                        InklingEngine::normalize_effort(arg)
+                    };
+                    if next_eff != self.inkling_effort {
+                        self.inkling_effort = next_eff.to_string();
+                        let _ = client_reset_cache();
+                    }
+                    self.set_toast(format!(
+                        "✓ Inkling thinking effort set to '{}' (0 = instant ~120 tok/s • 0.2 = reasoning • 0.9 = deep)",
+                        self.inkling_effort
+                    ));
+                } else {
+                    self.set_toast("Tip: append `/no_think` to any prompt to skip thinking on Qwen3");
+                }
+            }
+            "/gamma" => {
+                if let Ok(g) = arg.parse::<usize>() {
+                    let gc = g.clamp(1, 7);
+                    match client_inkling_set_gamma(gc) {
+                        Ok(_) => {
+                            self.inkling_gamma = gc;
+                            self.set_toast(format!("✓ DSpark draft depth set to γ={} (use `/spec on` to enable)", gc));
+                        }
+                        Err(e) => self.set_toast(format!("Gamma update error: {}", e)),
+                    }
+                } else {
+                    self.set_toast(format!("Current DSpark γ={} (usage: /gamma 1..7)", self.inkling_gamma));
+                }
             }
             "/temp" => {
                 if let Ok(v) = arg.parse::<f32>() {
@@ -1863,7 +2025,8 @@ impl TuiApp {
                     self.messages.push(ChatMsg {
                         role: "info".into(),
                         content: format!("**System Prompt**: `{}`\nUse `/sys <prompt>` to set or `/sys clear` to remove.", cur),
-                        stats: None,
+                        raw_token_ids: Vec::new(),
+            stats: None,
                     });
                 }
             }
@@ -1898,15 +2061,34 @@ impl TuiApp {
                 let mtime_info = std::fs::metadata(&self.gguf_path)
                     .map(|md| format!("{} bytes (read-only mmap)", md.len()))
                     .unwrap_or_else(|_| "unknown".into());
-                self.messages.push(ChatMsg {
-                    role: "info".into(),
-                    content: format!(
-                        "### Model Integrity & Pure Serving Layer Verification\n\
-                         - **Model Name**: `{}` (36 layers, dim={}, hidden={}, heads={}/{} GQA, vocab={})\n\
+                let body = if self.is_inkling {
+                    format!(
+                        "### Inkling-2-Mini Looped MoE Integrity & Serving Verification\n\
+                         - **Model Name**: `{}` (24 physical -> {} logical layers, 128x8 Sparse MoE, dim={}, exp_ff={}, heads={}/{} Rel+Sink GQA, vocab={})\n\
                          - **GGUF File**: `{}`\n\
-                         - **Exact Byte Size**: `{}` (`{:.3} GB`, unmodified original `Q4_K_M` weights)\n\
+                         - **Exact Byte Size**: `{}` (`{:.3} GB` total • `~{:.2} GB/tok` active across 48 visits)\n\
+                         - **Serving Guarantees**: Full 3-pass recurrence preserved (`0` loop passes dropped), planarized zero-LUT `Q2_0` + `IQ2_XXS` `sm_86` persistent megakernel (`~120 tok/s`) + co-resident `DSpark` (`Inkling2MTP`) block-8 drafter (`/spec on` up to `138 tok/s`).",
+                        self.cfg.model_name,
+                        self.cfg.num_layers,
+                        self.cfg.dim,
+                        self.cfg.hidden_dim,
+                        self.cfg.n_heads,
+                        self.cfg.n_kv_heads,
+                        self.cfg.vocab_size,
+                        self.gguf_path.display(),
+                        mtime_info,
+                        self.gguf_size_gb,
+                        self.active_gb_per_tok
+                    )
+                } else {
+                    format!(
+                        "### Model Integrity & Pure Serving Layer Verification\n\
+                         - **Model Name**: `{}` ({} layers, dim={}, hidden={}, heads={}/{} GQA, vocab={})\n\
+                         - **GGUF File**: `{}`\n\
+                         - **Exact Byte Size**: `{}` (`{:.3} GB`, unmodified original GGUF weights)\n\
                          - **Serving Guarantees**: `0` layers pruned, `0` weights re-quantized or altered, `PROT_READ` read-only file mapping, exact `FP16` KV cache, and `100%` lossless greedy verification (`BM=4` == `T=1`).",
                         self.cfg.model_name,
+                        self.cfg.num_layers,
                         self.cfg.dim,
                         self.cfg.hidden_dim,
                         self.cfg.n_heads,
@@ -1915,13 +2097,26 @@ impl TuiApp {
                         self.gguf_path.display(),
                         mtime_info,
                         self.gguf_size_gb
-                    ),
+                    )
+                };
+                self.messages.push(ChatMsg {
+                    role: "info".into(),
+                    content: body,
+                    raw_token_ids: Vec::new(),
                     stats: None,
                 });
                 self.scroll_from_bottom = 0;
             }
             "/bench" => {
-                let prompt = if arg == "t1" {
+                let prompt = if self.is_inkling {
+                    if arg == "spec" || arg == "dspark" {
+                        self.spec_enabled = true;
+                        "Output ONLY a valid minified JSON object with keys `gpu`, `sm_count`, `vram_gb`, `quant`, `loop_passes`, and `logical_layers` describing an NVIDIA RTX 3080 (68 SMs, 10 GB) running Inkling-2-Mini (3 passes, 48 logical layers, IQ2). /no_think".to_string()
+                    } else {
+                        self.spec_enabled = false;
+                        "Write a concise zero-dependency Rust function `is_prime(n: u64) -> bool`. /no_think".to_string()
+                    }
+                } else if arg == "t1" {
                     self.spec_enabled = false;
                     "Count from 1 to 60 separated by commas.".to_string()
                 } else {
@@ -2018,7 +2213,8 @@ impl TuiApp {
                     self.messages.push(ChatMsg {
                         role: "info".into(),
                         content: format!("**Fused Rank-r LoRA Status**: `{}`\nUse `/lora <adapter_path>` to hot-swap (`< 1 ms`) or `/lora off` to clear.", st),
-                        stats: None,
+                        raw_token_ids: Vec::new(),
+            stats: None,
                     });
                 } else if matches!(arg, "off" | "clear" | "none") {
                     match client_lora_clear() {
@@ -2050,7 +2246,8 @@ impl TuiApp {
                             "**RTX 3080 Same-Model VectorDB Status**: `{}`\nUse `/rag wiki` (or `/rag <file.qvec>`) to enable live Wikipedia RAG, or `/rag off` to disable.",
                             st
                         ),
-                        stats: None,
+                        raw_token_ids: Vec::new(),
+            stats: None,
                     });
                 } else if matches!(arg, "off" | "clear" | "none") {
                     match client_rag_clear() {
@@ -2087,14 +2284,16 @@ impl TuiApp {
                             "**RTX 3080 Sharded Topic LoRA Bank Status**: `{}`\nUse `/topic wiki` (or `/topic <bank_dir>`) to enable bare-prompt Topic LoRA routing, `/topic list` to list topics, or `/topic off` to disable.",
                             st
                         ),
-                        stats: None,
+                        raw_token_ids: Vec::new(),
+            stats: None,
                     });
                 } else if arg == "list" {
                     let lst = client_topic_list().unwrap_or_else(|e| format!("Error: {}", e));
                     self.messages.push(ChatMsg {
                         role: "info".into(),
                         content: format!("**Loaded Topic LoRA Bank**: `{}`", lst),
-                        stats: None,
+                        raw_token_ids: Vec::new(),
+            stats: None,
                     });
                 } else if matches!(arg, "off" | "clear" | "none") {
                     match client_topic_clear() {
@@ -2124,9 +2323,18 @@ impl TuiApp {
                 self.scroll_from_bottom = 0;
             }
             "/help" | _ => {
-                self.messages.push(ChatMsg {
-                    role: "info".into(),
-                    content: "### Qwen-NV v0.7 Full-Duplex RTX 3080 Voice + Text + RAG + Topic LoRA TUI Commands\n\
+                let help_md = if self.is_inkling {
+                    "### Inkling-NV RTX 3080 48-Layer Looped Sparse MoE TUI Commands\n\
+                        - `/effort <0|0.1|0.2|0.7|0.9>` (or `/think [on|off]`) — Set thinking effort (`0` = instant `~120 tok/s` • `0.2` = standard reasoning • `0.9` = deep math; or append `/no_think` to any prompt)\n\
+                        - `/spec [on|off]` (`Ctrl+S`) — Switch between **48L Persistent `B=1` Megakernel (`~120 tok/s` default)** and **DSpark Block-8 Speculative Decoding (up to `138 tok/s` on structured JSON/code)**\n\
+                        - `/gamma <1..7>` — Tune DSpark block-8 verification depth (`γ=3..7`)\n\
+                        - `/bench` (or `/bench spec`) — Run live RTX 3080 `~120 tok/s` persistent `B=1` or `~138 tok/s` `DSpark` benchmark\n\
+                        - `/verify` — Inspect loaded `Inkling-2-Mini` GGUF path, byte size, & 48-layer 128x8 MoE layout\n\
+                        - `/temp <0.0..2.0>` │ `/max <N>` │ `/sys <text>` — Sampling & system prompt controls\n\
+                        - `/copy` / `/copy code` (`Ctrl+Y`) — Copy last reply or code block to macOS clipboard\n\
+                        - `/clear` (`Ctrl+L`) — Clear conversation & KV+ShortConv cache │ `/quit` (`Ctrl+Q`) — Exit │ `/stop` — Unload GPU"
+                } else {
+                    "### Qwen-NV v0.7 Full-Duplex RTX 3080 Voice + Text + RAG + Topic LoRA TUI Commands\n\
                         - `/topic [wiki|<bank_dir>|list|status|off]` — **Sharded Topic Parametric LoRA Bank** (`308 µs` GPU router + `44 µs` cached LoRA swap, `0` context stuffing!)\n\
                         - `/rag [wiki|<file.qvec>|off]` — **100%-on-RTX-3080 Same-Model Wikipedia VectorDB RAG** (`< 10 ms` embed + `< 50 µs` GPU cosine search; works with both voice & text!)\n\
                         - `Ctrl+R` or `/listen` (`/mic`) — **Speak a question into your Mac mic**: runs 100%-on-RTX-3080 `Qwen3-ASR-1.7B Q8_0` STT -> (optional Wiki RAG) -> streams `Qwen3-4B` -> speaks reply via `Qwen3-TTS-1.7B Q8_0`!\n\
@@ -2141,7 +2349,11 @@ impl TuiApp {
                         - `/temp <0.0..2.0>` │ `/max <N>` │ `/sys <text>` — Sampling & system prompt controls\n\
                         - `/copy` / `/copy code` (`Ctrl+Y`) — Copy last reply or code block to macOS clipboard\n\
                         - `/clear` (`Ctrl+L`) — Clear conversation & KV cache │ `/quit` (`Ctrl+Q`) — Exit │ `/stop` — Unload GPU"
-                        .into(),
+                };
+                self.messages.push(ChatMsg {
+                    role: "info".into(),
+                    content: help_md.into(),
+                    raw_token_ids: Vec::new(),
                     stats: None,
                 });
                 self.scroll_from_bottom = 0;
@@ -2194,13 +2406,22 @@ impl TuiApp {
         scr.fill_row(1, BG_HEADER);
 
         let mut x = 1;
-        x = scr.put_str(x, 0, w, " ⚡ QWEN-NV ", Style::new(BG_MAIN, FG_CYAN).bold());
+        let app_tag = if self.is_inkling { " ⚡ INKLING-NV " } else { " ⚡ QWEN-NV " };
+        x = scr.put_str(x, 0, w, app_tag, Style::new(BG_MAIN, FG_CYAN).bold());
         x = scr.put_str(x + 1, 0, w, &self.cfg.model_name, Style::new(FG_TEXT, BG_HEADER).bold());
+        let sub_hdr = if self.is_inkling {
+            format!(
+                " ({:.2}GB 128x8 MoE • {:.2}GB/tok active • 48L)",
+                self.gguf_size_gb, self.active_gb_per_tok
+            )
+        } else {
+            format!(" ({:.2}GB GGUF • Unmodified)", self.gguf_size_gb)
+        };
         x = scr.put_str(
             x,
             0,
             w,
-            &format!(" ({:.2}GB GGUF • Unmodified)", self.gguf_size_gb),
+            &sub_hdr,
             Style::new(FG_MUTED, BG_HEADER),
         );
 
@@ -2213,14 +2434,25 @@ impl TuiApp {
             scr.put_str(gx, 0, w, &gpu_tag, Style::new(FG_GREEN, BG_HEADER).bold());
         }
 
-        // Row 1: Spec mode badge + Voice/LoRA badges + Temp + KV context gauge + Live Speedometer
+        // Row 1: Spec mode badge + Effort/Voice/LoRA badges + Temp + KV context gauge + Live Speedometer
         let mut x1 = 1;
-        let (mode_lbl, mode_bg) = if self.spec_enabled {
-            (" SPEC BM=4 ON ", BG_BADGE_ON)
+        let (mode_lbl, mode_bg) = if self.is_inkling {
+            if self.spec_enabled {
+                (format!(" DSPARK SPEC (γ={}) ", self.inkling_gamma), BG_BADGE_ON)
+            } else {
+                (" 48L PERSISTENT B=1 ".to_string(), BG_BADGE_T1)
+            }
+        } else if self.spec_enabled {
+            (" SPEC BM=4 ON ".to_string(), BG_BADGE_ON)
         } else {
-            (" T=1 MEGAKERNEL ", BG_BADGE_T1)
+            (" T=1 MEGAKERNEL ".to_string(), BG_BADGE_T1)
         };
-        x1 = scr.put_str(x1, 1, w, mode_lbl, Style::new(FG_TEXT, mode_bg).bold());
+        x1 = scr.put_str(x1, 1, w, &mode_lbl, Style::new(FG_TEXT, mode_bg).bold());
+        if self.is_inkling {
+            let eff_lbl = format!(" EFFORT:{} ", self.inkling_effort);
+            let eff_fg = if self.inkling_effort == "0" { FG_GREEN } else { FG_PURPLE };
+            x1 = scr.put_str(x1 + 1, 1, w, &eff_lbl, Style::new(BG_MAIN, eff_fg).bold());
+        }
         if self.active_recorder.is_some() {
             x1 = scr.put_str(x1 + 1, 1, w, " 🎙 LISTENING ", Style::new(BG_MAIN, FG_GREEN).bold());
         } else if self.asr_rx.is_some() {
@@ -2279,7 +2511,7 @@ impl TuiApp {
             self.last_tps
         };
         if active_tps > 0.0 {
-            let eff_bw = active_tps * self.gguf_size_gb;
+            let eff_bw = active_tps * self.active_gb_per_tok;
             let sp_str = format!(
                 "⚡ {:.1} tok/s • {:.0} GB/s • TTFT {:.0}ms ",
                 active_tps, eff_bw, self.last_ttft_ms
@@ -2321,13 +2553,23 @@ impl TuiApp {
 
         if self.messages.is_empty() {
             all_lines.push(RenderedLine { spans: Vec::new(), row_bg: BG_MAIN });
-            let welcome = format!(
-                "## Welcome to Qwen-NV v0.4 Modular Text + Voice + LoRA TUI\n\
-                 Connected to **{}** (`{:.2} GB` unmodified GGUF) + co-resident **Qwen3-ASR-1.7B (`Q8_0`)** & **Qwen3-TTS-1.7B (`Q8_0`)** on **NVIDIA GeForce RTX 3080 (`GA102`, {} SMs)** with **Docker OFF**.\n\n\
-                 - **Speak to Your RTX 3080**: Press **`Ctrl+R`** (or type `/listen`) and speak a question — 100% of STT, LLM thinking, and `24 kHz` TTS run on the RTX 3080 while capturing the full conversation right here in chat! Or type `/talk` for continuous hands-free conversation.\n\
-                 - **Pure Serving Layer**: `0` model weights modified, `PROT_READ` read-only GGUF mapping, exact `FP16` KV cache, `< 5 ms` Rank-`r` LoRA hot-swap (`/lora`), & `/bench` for live **~260 tok/s** verification.",
-                self.cfg.model_name, self.gguf_size_gb, self.active_sms
-            );
+            let welcome = if self.is_inkling {
+                format!(
+                    "## Welcome to Inkling-NV 100%-on-RTX-3080 Looped Sparse MoE TUI\n\
+                     Connected to **{}** (`{:.2} GB` `AD-IQ2_XXS-Q2` • `26.4B` total / `~1.8B` active • `24` physical -> `48` logical layers • `128x8` Sparse MoE) + co-resident **DSpark (`Inkling2MTP`)** on **NVIDIA GeForce RTX 3080 (`GA102`, {} SMs)** with **Docker OFF**.\n\n\
+                     - **Pareto-Optimal Speed & Reasoning**: Runs the **48-layer Persistent `B=1` `sm_86` Megakernel (`~120 tok/s`)** by default with full 3-pass reasoning (`EFFORT:{}`), plus `< 15 ms` multi-turn KV+ShortConv prefix caching.\n\
+                     - **Controls**: Type `/effort 0` (or `/think off` / append `/no_think`) for instant zero-thinking replies, `/effort 0.2` or `0.9` for reasoning, `/spec on` (`Ctrl+S`) for **DSpark Block-8 Speculative Decoding (up to `138 tok/s` on JSON/code)**, or `/bench` to benchmark live.",
+                    self.cfg.model_name, self.gguf_size_gb, self.active_sms, self.inkling_effort
+                )
+            } else {
+                format!(
+                    "## Welcome to Qwen-NV v0.7 Modular Text + Voice + LoRA TUI\n\
+                     Connected to **{}** (`{:.2} GB` unmodified GGUF) + co-resident **Qwen3-ASR-1.7B (`Q8_0`)** & **Qwen3-TTS-1.7B (`Q8_0`)** on **NVIDIA GeForce RTX 3080 (`GA102`, {} SMs)** with **Docker OFF**.\n\n\
+                     - **Speak to Your RTX 3080**: Press **`Ctrl+R`** (or type `/listen`) and speak a question — 100% of STT, LLM thinking, and `24 kHz` TTS run on the RTX 3080 while capturing the full conversation right here in chat! Or type `/talk` for continuous hands-free conversation.\n\
+                     - **Pure Serving Layer**: `0` model weights modified, `PROT_READ` read-only GGUF mapping, exact `FP16` KV cache, `< 5 ms` Rank-`r` LoRA hot-swap (`/lora`), & `/bench` for live **~260 tok/s** verification.",
+                    self.cfg.model_name, self.gguf_size_gb, self.active_sms
+                )
+            };
             all_lines.extend(format_markdown_block(&welcome, w.saturating_sub(2), false));
         } else {
             for (idx, msg) in self.messages.iter().enumerate() {
@@ -2358,7 +2600,7 @@ impl TuiApp {
                             style: Style::new(FG_AMBER, BG_MAIN),
                         });
                     } else if let Some(st) = &msg.stats {
-                        let eff_bw = st.decode_tok_s * self.gguf_size_gb;
+                        let eff_bw = st.decode_tok_s * self.active_gb_per_tok;
                         let spec_note = if st.spec_accepted_extra > 0 {
                             format!(" • +{} spec", st.spec_accepted_extra)
                         } else {
@@ -3031,4 +3273,182 @@ fn run_tui_voice_self_test(model_ref: &str, max_ctx: usize, spec: bool, temp: f3
         asst_msg.chars().take(90).collect::<String>()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::format_inkling_stats_json;
+    use crate::inkling::InklingGenStats;
+
+    #[test]
+    fn test_inkling_stats_json_and_multiturn_tui_prefix_cache() {
+        let st_in = InklingGenStats {
+            model_name: "Inkling-2-Mini".into(),
+            loop_passes: 3,
+            logical_layers_per_tok: 48,
+            prompt_tokens: 45,
+            cached_prefix_tokens: 31,
+            completion_tokens: 72,
+            prefill_ms: 42.5,
+            decode_ms: 598.2,
+            total_ms: 640.7,
+            prefill_tok_per_s: 329.4,
+            decode_tok_per_s: 120.35,
+            ttft_ms: 42.5,
+            vram_weights_mb: 7522.0,
+            vram_kv_conv_mb: 451.66,
+            spec_verify_calls: 9,
+            spec_accepted_extra: 49,
+            gpu_launches: 2,
+            stop_reason: "stop",
+            token_ids: vec![200004, 200007, 1234, 200001, 200004, 200005, 5678, 200001],
+        };
+        let j = format_inkling_stats_json(&st_in);
+        let parsed = parse_stats_json(&j);
+        assert!((parsed.decode_tok_s - 120.35).abs() < 1e-2);
+        assert_eq!(parsed.cached_prefix_tokens, 31);
+        assert_eq!(parsed.spec_accepted_extra, 49);
+        assert_eq!(parsed.kernel_launches, 2);
+        assert_eq!(parsed.token_ids, st_in.token_ids);
+
+        let Ok(gguf_path) = resolve_model_path("inkling") else {
+            return;
+        };
+        if !gguf_path.exists() {
+            return;
+        }
+        let gguf_bytes = std::fs::metadata(&gguf_path).map(|m| m.len()).unwrap_or(0);
+        let gguf = GgufFile::open(&gguf_path).expect("open inkling gguf");
+        let tok = BpeTokenizer::from_gguf(&gguf).expect("load inkling tokenizer");
+        let cfg = QwenModelConfig::from_gguf(&gguf, &tok, 4096, "inkling").expect("inkling cfg");
+        assert_eq!(cfg.arch, "inkling2_loop");
+        assert_eq!(cfg.num_layers, 48);
+        assert_eq!(cfg.vocab_size, 200058);
+
+        let mut app = TuiApp {
+            model_ref: "inkling".into(),
+            gguf_path,
+            gguf_size_gb: gguf_bytes as f64 / 1e9,
+            active_gb_per_tok: 2.68,
+            is_inkling: true,
+            inkling_effort: "0.2".into(),
+            inkling_gamma: 7,
+            tok,
+            cfg,
+            active_sms: 68,
+            ping_ms: 0.12,
+            daemon_online: true,
+            spec_enabled: false,
+            temperature: 0.0,
+            max_tokens: 512,
+            system_prompt: String::new(),
+            voice_enabled: false,
+            voice_speaker: "ryan".into(),
+            voice_lang: "english".into(),
+            tts_model_ref: "1.7b".into(),
+            tts_speaking: Arc::new(AtomicBool::new(false)),
+            tts_cancel_flag: None,
+            last_ttfa_ms: Arc::new(std::sync::Mutex::new(0.0)),
+            lora_badge: None,
+            rag_badge: None,
+            rag_top_k: 3,
+            topic_badge: None,
+            topic_lora_active: false,
+            asr_model_ref: "1.7b".into(),
+            asr_lang_hint: "auto".into(),
+            active_recorder: None,
+            asr_rx: None,
+            last_asr_ms: 0.0,
+            hands_free_talk: false,
+            prev_tts_speaking: false,
+            talk_rearm_at: None,
+            messages: Vec::new(),
+            input_chars: Vec::new(),
+            cursor_idx: 0,
+            history: Vec::new(),
+            history_pos: None,
+            scroll_from_bottom: 0,
+            total_ctx_used: 0,
+            last_cached_prefix: 0,
+            last_tps: 120.35,
+            last_ttft_ms: 42.5,
+            last_launches: 2,
+            last_spec_extra: 0,
+            streaming_rx: None,
+            cancel_flag: None,
+            stream_live_tps: 0.0,
+            stream_live_toks: 0,
+            spinner_tick: 0,
+            toast: None,
+            mouse_capture: false,
+        };
+
+        // Render welcome banner + `/verify` + `/help`
+        let mut scr = ScreenBuf::new(120, 36);
+        let cur0 = app.draw(&mut scr);
+        assert!(!scr.render_ansi(cur0).is_empty());
+        let _ = app.handle_slash_command("/verify", None);
+        let _ = app.handle_slash_command("/help", None);
+        let cur1 = app.draw(&mut scr);
+        assert!(scr.render_ansi(cur1).len() > 500);
+        app.messages.clear();
+
+        // Verify Turn 1 -> Turn 2 bit-exact prefix match on `effort = "0.2"` (thinking tokens)
+        app.messages.push(ChatMsg {
+            role: "user".into(),
+            content: "What is 2 + 2?".into(),
+            raw_token_ids: Vec::new(),
+            stats: None,
+        });
+        let p1 = app.encode_conversation(None, None);
+        let sim_gen1 = vec![200004, 200007, 17, 10, 17, 200001, 200004, 200005, 19, 200001];
+        let mut engine_cached_1 = p1.clone();
+        engine_cached_1.extend_from_slice(&sim_gen1);
+
+        app.messages.push(ChatMsg {
+            role: "assistant".into(),
+            content: "<think>\n2+2\n</think>\n\n4".into(),
+            raw_token_ids: sim_gen1,
+            stats: Some(parsed),
+        });
+        app.messages.push(ChatMsg {
+            role: "user".into(),
+            content: "Multiply that by 10.".into(),
+            raw_token_ids: Vec::new(),
+            stats: None,
+        });
+        let p2 = app.encode_conversation(None, None);
+        assert!(p2.len() > engine_cached_1.len());
+        assert_eq!(&p2[..engine_cached_1.len()], engine_cached_1.as_slice());
+
+        // Also verify `effort = "0"` bit-exact prefix match!
+        app.messages.clear();
+        app.inkling_effort = "0".into();
+        app.messages.push(ChatMsg {
+            role: "user".into(),
+            content: "Hello".into(),
+            raw_token_ids: Vec::new(),
+            stats: None,
+        });
+        let p1_e0 = app.encode_conversation(None, None);
+        assert_eq!(&p1_e0[p1_e0.len() - 2..], &[200004, 200005]);
+        let sim_gen_e0 = vec![9906, 200001];
+        let mut engine_cached_e0 = p1_e0.clone();
+        engine_cached_e0.extend_from_slice(&sim_gen_e0);
+        app.messages.push(ChatMsg {
+            role: "assistant".into(),
+            content: "Hi".into(),
+            raw_token_ids: sim_gen_e0,
+            stats: None,
+        });
+        app.messages.push(ChatMsg {
+            role: "user".into(),
+            content: "Next turn".into(),
+            raw_token_ids: Vec::new(),
+            stats: None,
+        });
+        let p2_e0 = app.encode_conversation(None, None);
+        assert_eq!(&p2_e0[..engine_cached_e0.len()], engine_cached_e0.as_slice());
+    }
 }

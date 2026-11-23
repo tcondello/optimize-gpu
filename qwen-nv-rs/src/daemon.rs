@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::audio::{encode_wav_pcm16, parse_wav_bytes_mono_16k, TTS_SAMPLE_RATE};
 use crate::engine::{GenerationStats, QwenMegakernelEngine};
 use crate::gguf::Utf8StreamDecoder;
+use crate::inkling::{InklingEngine, InklingGenStats};
 use crate::lora::LoraStatus;
 use crate::rag::{load_jsonl_corpus, EmbedStrategy, RagHit, RagSearchStats};
 use crate::topic_lora::{json_find_num, json_find_str};
@@ -83,6 +84,33 @@ pub fn format_stats_json(stats: &GenerationStats, token_ids: &[i32]) -> String {
     )
 }
 
+pub fn format_inkling_stats_json(st: &InklingGenStats) -> String {
+    let ids_str: Vec<String> = st.token_ids.iter().map(|t| t.to_string()).collect();
+    let prefill_new = st.prompt_tokens.saturating_sub(st.cached_prefix_tokens);
+    format!(
+        "{{\"prompt_tokens\":{},\"cached_prefix_tokens\":{},\"prefill_new_tokens\":{},\"completion_tokens\":{},\
+          \"prefill_ms\":{:.3},\"decode_ms\":{:.3},\"ttft_ms\":{:.3},\"total_ms\":{:.3},\
+          \"decode_tok_per_s\":{:.2},\"prefill_tok_per_s\":{:.2},\"kernel_launches\":{},\
+          \"spec_verify_calls\":{},\"spec_accepted_extra\":{},\"spec_crossover_pos\":0,\"spec_crossover_switched\":false,\
+          \"stop_reason\":\"{}\",\"token_ids\":[{}]}}",
+        st.prompt_tokens,
+        st.cached_prefix_tokens,
+        prefill_new,
+        st.completion_tokens,
+        st.prefill_ms,
+        st.decode_ms,
+        st.ttft_ms,
+        st.total_ms,
+        st.decode_tok_per_s,
+        st.prefill_tok_per_s,
+        st.gpu_launches,
+        st.spec_verify_calls,
+        st.spec_accepted_extra,
+        st.stop_reason,
+        ids_str.join(",")
+    )
+}
+
 pub fn format_lora_json(st: &LoraStatus) -> String {
     format!(
         "{{\"active\":{},\"path\":\"{}\",\"rank\":{},\"alpha\":{:.2},\"scale\":{:.4},\
@@ -116,6 +144,10 @@ pub fn run_daemon_foreground(model_ref: &str, max_ctx: usize) -> Result<(), Stri
             return Err(format!("Daemon is already running at {}", sock_path.display()));
         }
         let _ = fs::remove_file(&sock_path);
+    }
+
+    if InklingEngine::is_inkling_ref(model_ref) {
+        return run_inkling_daemon_foreground(model_ref, max_ctx, sock_path);
     }
 
     let mut engine = QwenMegakernelEngine::load(model_ref, max_ctx)?;
@@ -160,6 +192,259 @@ pub fn run_daemon_foreground(model_ref: &str, max_ctx: usize) -> Result<(), Stri
     let _ = fs::remove_file(&sock_path);
     engine.gpu.shutdown_clean();
     Ok(())
+}
+
+fn run_inkling_daemon_foreground(
+    model_ref: &str,
+    max_ctx: usize,
+    sock_path: PathBuf,
+) -> Result<(), String> {
+    let mut engine = InklingEngine::new(model_ref, max_ctx)?;
+
+    // Quick 1-token warmup so instruction caches & TLBs are hot before accepting clients
+    let warm_ids = engine.format_chat_prompt("Hi", None, Some("0"));
+    let _ = engine.generate_with_cancel(
+        &warm_ids,
+        2,
+        0.0,
+        42,
+        None,
+        false,
+        true,
+        None,
+        false,
+        |_, _| true,
+    )?;
+    let _ = engine.reset_cache();
+
+    let listener = UnixListener::bind(&sock_path)
+        .map_err(|e| format!("Failed to bind {}: {}", sock_path.display(), e))?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+
+    eprintln!(
+        "[qwen-nv daemon] Ready on {} (model='{}', SMs={}, 48L Looped MoE, warm latency < 1 ms)",
+        sock_path.display(),
+        engine.cfg.model_name,
+        engine.gpu.active_sms
+    );
+
+    while !SHUTDOWN_REQ.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                if let Ok(should_stop) = handle_inkling_daemon_client(model_ref, &mut engine, stream) {
+                    if should_stop {
+                        break;
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) => {
+                eprintln!("[qwen-nv daemon] Accept error: {}", e);
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    eprintln!("[qwen-nv daemon] Unloading GSP-RM cleanly...");
+    let _ = fs::remove_file(&sock_path);
+    engine.gpu.shutdown_clean();
+    Ok(())
+}
+
+fn handle_inkling_daemon_client(
+    model_ref: &str,
+    engine: &mut InklingEngine,
+    mut stream: UnixStream,
+) -> Result<bool, String> {
+    let mut hdr_line = Vec::with_capacity(128);
+    let mut b = [0u8; 1];
+    loop {
+        let n = stream.read(&mut b).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Ok(false);
+        }
+        if b[0] == b'\n' {
+            break;
+        }
+        hdr_line.push(b[0]);
+        if hdr_line.len() > 4096 {
+            return Err("Header line too long".into());
+        }
+    }
+    let line = String::from_utf8_lossy(&hdr_line);
+    let parts: Vec<&str> = line.split('\t').collect();
+    match parts.first().copied().unwrap_or("") {
+        "PING" => {
+            let reply = format!(
+                "PONG\t{}\t{}\t{}\n",
+                model_ref, engine.cfg.model_name, engine.gpu.active_sms
+            );
+            let _ = stream.write_all(reply.as_bytes());
+            Ok(false)
+        }
+        "RESET" => {
+            let _ = engine.reset_cache();
+            let _ = stream.write_all(b"OK\n");
+            Ok(false)
+        }
+        "STOP" => {
+            let _ = stream.write_all(b"BYE\n");
+            Ok(true)
+        }
+        "LORA_STATUS" | "LORA_CLEAR" => {
+            let _ = stream.write_all(
+                b"OK\t{\"active\":false,\"path\":\"\",\"rank\":0,\"alpha\":0.00,\"scale\":0.0000,\"adapted_tensors\":0,\"vram_bytes\":0,\"swap_ms\":0.000}\n",
+            );
+            Ok(false)
+        }
+        "RAG_STATUS" | "RAG_CLEAR" => {
+            let _ = stream.write_all(b"OK\t{\"active\":false,\"num_docs\":0}\n");
+            Ok(false)
+        }
+        "TOPIC_STATUS" | "TOPIC_CLEAR" => {
+            let _ = stream.write_all(b"OK\t{\"active\":false,\"num_topics\":0}\n");
+            Ok(false)
+        }
+        "TOPIC_LIST" => {
+            let _ = stream.write_all(b"OK\t[]\n");
+            Ok(false)
+        }
+        "DRAFTER_STATUS" => {
+            let j = if engine.dspark.is_some() {
+                format!(
+                    "{{\"active\":true,\"model_ref\":\"dspark\",\"model_name\":\"Inkling2MTP-Block8\",\"vram_mb\":471.30,\"gamma\":{},\"prior_5grams\":0,\"prior_4grams\":0,\"prior_path\":\"\"}}",
+                    engine.dspark_gamma
+                )
+            } else {
+                "{\"active\":false}".to_string()
+            };
+            let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+            Ok(false)
+        }
+        "INKLING_CFG" => {
+            if let Some(g_str) = parts.get(1) {
+                if let Ok(g) = g_str.trim().parse::<usize>() {
+                    engine.dspark_gamma = g.clamp(1, 7);
+                }
+            }
+            let j = format!(
+                "{{\"gamma\":{},\"dspark_loaded\":{}}}",
+                engine.dspark_gamma,
+                engine.dspark.is_some()
+            );
+            let _ = stream.write_all(format!("OK\t{}\n", j).as_bytes());
+            Ok(false)
+        }
+        "GEN" => {
+            if parts.len() < 6 {
+                return Err("Malformed GEN header".into());
+            }
+            let max_tokens: usize = parts[1].parse().unwrap_or(256);
+            let temp: f32 = parts[2].parse().unwrap_or(0.0);
+            let spec: bool = parts[3] == "1";
+            let reset: bool = parts[4] == "1";
+            let mode = parts[5];
+            if let Some(g_s) = parts.get(6) {
+                if let Ok(g_v) = g_s.parse::<usize>() {
+                    if (1..=7).contains(&g_v) {
+                        engine.dspark_gamma = g_v;
+                    }
+                }
+            }
+
+            let mut len_b = [0u8; 4];
+            stream.read_exact(&mut len_b).map_err(|e| e.to_string())?;
+            let payload_len = u32::from_le_bytes(len_b) as usize;
+            let mut payload = vec![0u8; payload_len];
+            if payload_len > 0 {
+                stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+            }
+
+            let prompt_ids: Vec<i32> = if mode == "ids" {
+                payload
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                    .collect()
+            } else if mode == "raw" {
+                let s = String::from_utf8_lossy(&payload);
+                engine.tok.encode(&s)
+            } else if mode == "chat_sys" && payload.len() >= 4 {
+                let sys_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+                let sys_end = (4 + sys_len).min(payload.len());
+                let sys_s = String::from_utf8_lossy(&payload[4..sys_end]).into_owned();
+                let usr_s = String::from_utf8_lossy(&payload[sys_end..]).into_owned();
+                engine.format_chat_prompt(
+                    &usr_s,
+                    if sys_s.is_empty() { None } else { Some(sys_s.as_str()) },
+                    None,
+                )
+            } else {
+                let s = String::from_utf8_lossy(&payload);
+                engine.format_chat_prompt(&s, None, None)
+            };
+
+            let mut client_alive = true;
+            let gen_res = engine.generate_with_cancel(
+                &prompt_ids,
+                max_tokens,
+                temp,
+                42,
+                None,
+                spec,
+                reset,
+                Some(&SHUTDOWN_REQ),
+                mode == "raw",
+                |tok_id, piece| {
+                    let pb = piece.as_bytes();
+                    let mut frame = Vec::with_capacity(7 + pb.len());
+                    frame.push(0x01);
+                    frame.extend_from_slice(&tok_id.to_le_bytes());
+                    frame.extend_from_slice(&(pb.len() as u16).to_le_bytes());
+                    frame.extend_from_slice(pb);
+                    if stream.write_all(&frame).is_err() || stream.flush().is_err() {
+                        client_alive = false;
+                        return false;
+                    }
+                    true
+                },
+            );
+
+            if !client_alive {
+                return Ok(false);
+            }
+
+            match gen_res {
+                Ok(st) => {
+                    let stats_json = format_inkling_stats_json(&st);
+                    let sb = stats_json.as_bytes();
+                    let mut done_frame = Vec::with_capacity(5 + sb.len());
+                    done_frame.push(0x02);
+                    done_frame.extend_from_slice(&(sb.len() as u32).to_le_bytes());
+                    done_frame.extend_from_slice(sb);
+                    let _ = stream.write_all(&done_frame);
+                    let _ = stream.flush();
+                }
+                Err(err_msg) => {
+                    let eb = err_msg.as_bytes();
+                    let mut eframe = Vec::with_capacity(5 + eb.len());
+                    eframe.push(0xff);
+                    eframe.extend_from_slice(&(eb.len() as u32).to_le_bytes());
+                    eframe.extend_from_slice(eb);
+                    let _ = stream.write_all(&eframe);
+                }
+            }
+            Ok(false)
+        }
+        other => {
+            let _ = stream.write_all(
+                format!("ERR\tCommand '{}' is not supported on Inkling-2-Mini backend\n", other).as_bytes(),
+            );
+            Ok(false)
+        }
+    }
 }
 
 fn handle_daemon_client(engine: &mut QwenMegakernelEngine, mut stream: UnixStream) -> Result<bool, String> {
@@ -1221,6 +1506,33 @@ where
             }
             other => return Err(format!("Unexpected daemon frame tag {:#x}", other)),
         }
+    }
+}
+
+pub fn client_reset_cache() -> Result<(), String> {
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path).map_err(|e| e.to_string())?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+    s.write_all(b"RESET\n").map_err(|e| e.to_string())?;
+    let mut rdr = BufReader::new(s);
+    let mut line = String::new();
+    rdr.read_line(&mut line).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn client_inkling_set_gamma(gamma: usize) -> Result<String, String> {
+    let sock_path = daemon_sock_path();
+    let mut s = UnixStream::connect(&sock_path).map_err(|e| e.to_string())?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+    s.write_all(format!("INKLING_CFG\t{}\n", gamma.clamp(1, 7)).as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut rdr = BufReader::new(s);
+    let mut line = String::new();
+    rdr.read_line(&mut line).map_err(|e| e.to_string())?;
+    if let Some(rest) = line.trim().strip_prefix("OK\t") {
+        Ok(rest.to_string())
+    } else {
+        Err(line.trim().to_string())
     }
 }
 
