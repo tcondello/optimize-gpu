@@ -228,6 +228,7 @@ fn run_cli() -> Result<(), String> {
     let mut temp = 0.0f32;
     let mut temp_explicit = false;
     let mut max_ctx = 4096usize;
+    let mut max_ctx_explicit = false;
     let mut spec = true;
     let mut spec_explicit = false;
     let mut direct = false;
@@ -377,6 +378,7 @@ fn run_cli() -> Result<(), String> {
                 i += 1;
                 if i < args.len() {
                     max_ctx = args[i].parse().unwrap_or(4096);
+                    max_ctx_explicit = true;
                 }
             }
             "--spec-crossover" => {
@@ -671,16 +673,22 @@ fn run_cli() -> Result<(), String> {
             Ok(())
         }
         "daemon" => {
-            if background {
-                ensure_daemon_running(&model_ref, max_ctx)
+            let eff_ctx = if InklingEngine::is_inkling_ref(&model_ref) && !max_ctx_explicit {
+                2048
             } else {
-                run_daemon_foreground(&model_ref, max_ctx)
+                max_ctx
+            };
+            if background {
+                ensure_daemon_running(&model_ref, eff_ctx)
+            } else {
+                run_daemon_foreground(&model_ref, eff_ctx)
             }
         }
         "serve" => run_http_server(&model_ref, max_ctx, port, spec),
         "tui" | "chat" => {
             let tui_max = if max_tokens_explicit { max_tokens } else { 1024 };
             let is_ink = InklingEngine::is_inkling_ref(&model_ref);
+            let tui_ctx = if is_ink && !max_ctx_explicit { 2048 } else { max_ctx };
             let tui_spec = if is_ink && !spec_explicit { false } else { spec };
             if let Some(ref eff) = inkling_effort {
                 std::env::set_var("INKLING_EFFORT", eff);
@@ -690,7 +698,7 @@ fn run_cli() -> Result<(), String> {
             }
             tui::run_tui(
                 &model_ref,
-                max_ctx,
+                tui_ctx,
                 tui_spec,
                 temp,
                 tui_max,

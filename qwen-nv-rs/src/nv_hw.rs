@@ -513,24 +513,31 @@ impl NvGpu {
         let t0 = Instant::now();
         let mut pci = TinyGpuClient::connect()?;
 
-        // Enable PCI Memory Space (0x2) + Bus Master (0x4)
+        // Enable PCI Memory Space (0x2) first (do NOT enable Bus Master until WPR2 check passes,
+        // per PCIe Spec §6.6.2: FLR with active Bus Master / Falcon DMA can Surprise-Down Thunderbolt!)
         let pci_cmd = pci.read_config(PCI_COMMAND, 2)?;
-        pci.write_config(PCI_COMMAND, pci_cmd | PCI_COMMAND_MASTER | 0x2, 2)?;
+        pci.write_config(PCI_COMMAND, (pci_cmd | 0x2) & !PCI_COMMAND_MASTER, 2)?;
 
-        // If WPR2 is still locked from an unclean prior process, issue a PCI reset and wait for GFW boot!
+        // If WPR2 is still locked from an unclean prior process, quiesce Falcons & DMA then issue PCI reset!
         let wpr2_hi = pci.rreg(NV_PFB_PRI_MMU_WPR2_ADDR_HI)?;
         if wpr2_hi != 0 {
-            eprintln!("[qwen-nv] WPR2 active ({:#x}); issuing clean PCI reset...", wpr2_hi);
+            eprintln!("[qwen-nv] WPR2 active ({:#x}); quiescing Falcons & issuing clean PCI reset...", wpr2_hi);
+            Self::emergency_halt_falcons(&mut pci);
+            let cmd_pre = pci.read_config(PCI_COMMAND, 2).unwrap_or(0);
+            let _ = pci.write_config(PCI_COMMAND, cmd_pre & !PCI_COMMAND_MASTER, 2);
+            thread::sleep(Duration::from_millis(25));
             pci.reset_pci()?;
             thread::sleep(Duration::from_millis(650));
             pci.remap_bars()?;
             let pci_cmd2 = pci.read_config(PCI_COMMAND, 2)?;
-            pci.write_config(PCI_COMMAND, pci_cmd2 | PCI_COMMAND_MASTER | 0x2, 2)?;
+            pci.write_config(PCI_COMMAND, (pci_cmd2 | 0x2) & !PCI_COMMAND_MASTER, 2)?;
             Self::wait_for_gfw_boot(&mut pci)?;
             pci.remap_bars()?;
-            let pci_cmd3 = pci.read_config(PCI_COMMAND, 2)?;
-            pci.write_config(PCI_COMMAND, pci_cmd3 | PCI_COMMAND_MASTER | 0x2, 2)?;
         }
+
+        // Now enable PCI Memory Space (0x2) + Bus Master (0x4) cleanly
+        let pci_cmd_final = pci.read_config(PCI_COMMAND, 2)?;
+        pci.write_config(PCI_COMMAND, pci_cmd_final | PCI_COMMAND_MASTER | 0x2, 2)?;
 
         let chip_id = pci.rreg(NV_PMC_BOOT_0)?;
         let boot42 = pci.rreg(NV_PMC_BOOT_42)?;
@@ -2139,7 +2146,12 @@ impl NvGpu {
         // buffers & Thunderbolt PCIe posted-write queues into VRAM BEFORE the BAR0 UC doorbell fires!
         let mut wc_flush = [0u8; 4];
         self.pci.bulk_read(1, gpput_off, &mut wc_flush)?;
-        self.pci.ring_doorbell(token)
+        self.pci.ring_doorbell(token)?;
+        if is_compute {
+            // Non-Posted MRd on BAR0 guarantees the posted BAR0 doorbell MWr crosses Thunderbolt ASPM L0s/L1 immediately!
+            let _ = self.pci.rreg(NV_PMC_BOOT_0)?;
+        }
+        Ok(())
     }
 
     pub fn poll_gsp_faults(&mut self) -> Result<(), String> {
@@ -2654,7 +2666,18 @@ impl NvGpu {
             return;
         }
         self.unloaded = true;
-        let _ = self.wait_timeline(self.timeline_value, Duration::from_millis(500));
+        // Passively drain any in-flight GPU work for up to 1.5s WITHOUT re-ringing compute_gpfifo
+        // (never wake an unstarted QMD milliseconds before unloading GSP-RM!).
+        let sig_ptr = self.timeline_buf.as_ptr() as *const u64;
+        let t_drain = Instant::now();
+        while t_drain.elapsed() < Duration::from_millis(1500) {
+            let cur = unsafe { std::ptr::read_volatile(sig_ptr) };
+            let tgt = self.timeline_value;
+            if cur >= tgt || (tgt < (1u64 << 31) && (cur & 0xffff_ffff) >= tgt) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
         let mut unload_req = [0u8; 8];
         put_u32(&mut unload_req, 4, 1 << 6); // __GPU_STATE_FLAGS_FAST_UNLOAD
         let ok = Self::gsp_send_rpc(

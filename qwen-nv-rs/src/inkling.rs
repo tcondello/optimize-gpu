@@ -1012,10 +1012,69 @@ impl InklingEngine {
         let weights_buf = gpu.alloc_vram(total_w_bytes)?;
         let w_base_va = weights_buf.va_addr;
 
-        // Stream from mmap -> GDDR6X in <= 32 MiB DMA slices, losslessly splitting
-        // quantized projection matrices into `[16B-aligned qs | contiguous fp16 d]` (`0` extra VRAM!)
+        // Stream from mmap -> GDDR6X in coalesced 32 MiB DMA batches (`~240` DMAs instead of `~1,450`),
+        // losslessly splitting quantized matrices into `[16B-aligned qs | contiguous fp16 d]` (`0` extra VRAM!)
         const CHUNK_MAX: usize = 32 * 1024 * 1024;
-        let mut stage = vec![0u8; CHUNK_MAX];
+        struct VramStageCoalescer<'a> {
+            buf: &'a VramBuffer,
+            stage: Vec<u8>,
+            base_off: u64,
+            len: usize,
+        }
+        impl<'a> VramStageCoalescer<'a> {
+            fn new(buf: &'a VramBuffer, cap: usize) -> Self {
+                Self {
+                    buf,
+                    stage: vec![0u8; cap],
+                    base_off: 0,
+                    len: 0,
+                }
+            }
+            fn flush(&mut self, gpu: &mut NvGpu) -> Result<(), String> {
+                if self.len > 0 {
+                    gpu.upload_to_vram(self.buf, self.base_off, &self.stage[..self.len])?;
+                    self.base_off += self.len as u64;
+                    self.len = 0;
+                }
+                Ok(())
+            }
+            fn write_at(&mut self, gpu: &mut NvGpu, off: u64, data: &[u8]) -> Result<(), String> {
+                if data.is_empty() {
+                    return Ok(());
+                }
+                if self.len == 0 {
+                    self.base_off = off;
+                } else {
+                    let cur_end = self.base_off + (self.len as u64);
+                    if off >= cur_end
+                        && (off - cur_end) <= 4096
+                        && self.len + ((off - cur_end) as usize) <= self.stage.len()
+                    {
+                        let pad = (off - cur_end) as usize;
+                        self.stage[self.len..self.len + pad].fill(0);
+                        self.len += pad;
+                    } else if off != cur_end {
+                        self.flush(gpu)?;
+                        self.base_off = off;
+                    }
+                }
+                let mut pos = 0usize;
+                while pos < data.len() {
+                    if self.len == self.stage.len() {
+                        self.flush(gpu)?;
+                    }
+                    let avail = self.stage.len() - self.len;
+                    let take = (data.len() - pos).min(avail);
+                    self.stage[self.len..self.len + take].copy_from_slice(&data[pos..pos + take]);
+                    self.len += take;
+                    pos += take;
+                }
+                Ok(())
+            }
+        }
+
+        let mut coalescer = VramStageCoalescer::new(&weights_buf, CHUNK_MAX);
+        let mut scratch = vec![0u8; 4 * 1024 * 1024];
         let t_dma = Instant::now();
         for name in &names_sorted {
             let info = &gguf.tensors[name];
@@ -1040,7 +1099,7 @@ impl InklingEngine {
                 assert_eq!(tot_blks * gguf_blk, nb);
                 assert_eq!((tot_blks * pay_len) & 15, 0);
 
-                let max_pay_blks = CHUNK_MAX / pay_len;
+                let max_pay_blks = scratch.len() / pay_len;
                 let mut b_cur = 0usize;
                 while b_cur < tot_blks {
                     let take = (tot_blks - b_cur).min(max_pay_blks);
@@ -1066,50 +1125,47 @@ impl InklingEngine {
                                 let p2 = ((b0 >> 4) & 3) | (((b1 >> 4) & 3) << 2) | (b2 & 0x30) | (((b3 >> 4) & 3) << 6);
                                 let p3 = (b0 >> 6) | ((b1 >> 6) << 2) | ((b2 >> 6) << 4) | (b3 & 0xc0);
                                 let pv = p0 | (p1 << 8) | (p2 << 16) | (p3 << 24);
-                                stage[d_pos + w * 4..d_pos + w * 4 + 4].copy_from_slice(&pv.to_le_bytes());
+                                scratch[d_pos + w * 4..d_pos + w * 4 + 4].copy_from_slice(&pv.to_le_bytes());
                             }
                         }
                     } else {
                         for bi in 0..take {
                             let s_off = (b_cur + bi) * gguf_blk + pay_off;
-                            stage[bi * pay_len..(bi + 1) * pay_len]
+                            scratch[bi * pay_len..(bi + 1) * pay_len]
                                 .copy_from_slice(&raw[s_off..s_off + pay_len]);
                         }
                     }
-                    gpu.upload_to_vram(
-                        &weights_buf,
+                    coalescer.write_at(
+                        &mut gpu,
                         dst_off + ((b_cur * pay_len) as u64),
-                        &stage[..take * pay_len],
+                        &scratch[..take * pay_len],
                     )?;
                     b_cur += take;
                 }
 
                 let d_base_off = dst_off + ((tot_blks * pay_len) as u64);
-                let max_d_blks = CHUNK_MAX / 2;
+                let max_d_blks = scratch.len() / 2;
                 b_cur = 0;
                 while b_cur < tot_blks {
                     let take = (tot_blks - b_cur).min(max_d_blks);
                     for bi in 0..take {
                         let s_off = (b_cur + bi) * gguf_blk + d_off;
-                        stage[bi * 2..bi * 2 + 2].copy_from_slice(&raw[s_off..s_off + 2]);
+                        scratch[bi * 2..bi * 2 + 2].copy_from_slice(&raw[s_off..s_off + 2]);
                     }
-                    gpu.upload_to_vram(
-                        &weights_buf,
+                    coalescer.write_at(
+                        &mut gpu,
                         d_base_off + ((b_cur * 2) as u64),
-                        &stage[..take * 2],
+                        &scratch[..take * 2],
                     )?;
                     b_cur += take;
                 }
             } else {
-                let mut pos = 0usize;
-                while pos < nb {
-                    let take = (nb - pos).min(CHUNK_MAX);
-                    gpu.upload_to_vram(&weights_buf, dst_off + (pos as u64), &raw[pos..pos + take])?;
-                    pos += take;
-                }
+                coalescer.write_at(&mut gpu, dst_off, raw)?;
             }
         }
-        drop(stage);
+        coalescer.flush(&mut gpu)?;
+        drop(scratch);
+        drop(coalescer);
         let dma_gbps = (total_w_bytes as f64 / 1e9) / t_dma.elapsed().as_secs_f64().max(1e-6);
 
         let get_wt = |name: &str| -> Result<WeightTensorGpu, String> {
@@ -1319,6 +1375,7 @@ impl InklingEngine {
         let o_logits = alloc_ws(vocab_unpadded * 4);
 
         let ws_buf = gpu.alloc_vram(w_off)?;
+        gpu.zero_vram(&ws_buf)?;
         let wb = ws_buf.va_addr;
 
         // Pack `InkPhysLayerDesc[24]`, `InkLoopCtrlDesc[12]`, `slot_kv_dense[48]`, and `InkModelDesc` into VRAM
@@ -1710,9 +1767,10 @@ impl InklingEngine {
 
         let sig_ptr = self.gpu.timeline_buf.as_ptr() as *const u64;
         let t_wait = Instant::now();
+        let mut iter = 0u32;
         loop {
             let cur_sig = unsafe { std::ptr::read_volatile(sig_ptr) };
-            if cur_sig >= sig_val {
+            if cur_sig >= sig_val || (sig_val < (1u64 << 31) && (cur_sig & 0xffff_ffff) >= sig_val) {
                 break;
             }
             let err = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).error_code) };
@@ -1720,9 +1778,16 @@ impl InklingEngine {
                 let _ = self.gpu.zero_vram(&self.ws_bar_state_buf);
                 return Err(format!("ink_batch_forward_bm8_megakernel barrier watchdog tripped at {}", err));
             }
-            self.gpu.poll_gsp_faults()?;
-            if t_wait.elapsed() > Duration::from_secs(30) {
-                return Err("ink_batch_forward_bm8_megakernel timed out (>30s)".into());
+            iter = iter.wrapping_add(1);
+            if (iter & 0x3fff) == 0 {
+                self.gpu.poll_gsp_faults()?;
+                if t_wait.elapsed() > Duration::from_millis(2) {
+                    let _ = self.gpu.pci.ring_doorbell(self.gpu.compute_gpfifo.token);
+                }
+                if t_wait.elapsed() > Duration::from_secs(30) {
+                    unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
+                    return Err("ink_batch_forward_bm8_megakernel timed out (>30s)".into());
+                }
             }
             std::hint::spin_loop();
         }
@@ -1798,9 +1863,10 @@ impl InklingEngine {
 
         let sig_ptr = self.gpu.timeline_buf.as_ptr() as *const u64;
         let t_wait = Instant::now();
+        let mut iter = 0u32;
         loop {
             let cur_sig = unsafe { std::ptr::read_volatile(sig_ptr) };
-            if cur_sig >= sig_val {
+            if cur_sig >= sig_val || (sig_val < (1u64 << 31) && (cur_sig & 0xffff_ffff) >= sig_val) {
                 break;
             }
             let err = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).error_code) };
@@ -1808,9 +1874,16 @@ impl InklingEngine {
                 let _ = self.gpu.zero_vram(&self.ws_bar_state_buf);
                 return Err(format!("ink_dspark_inject_kv_kernel barrier watchdog tripped at {}", err));
             }
-            self.gpu.poll_gsp_faults()?;
-            if t_wait.elapsed() > Duration::from_secs(10) {
-                return Err("ink_dspark_inject_kv_kernel timed out (>10s)".into());
+            iter = iter.wrapping_add(1);
+            if (iter & 0x3fff) == 0 {
+                self.gpu.poll_gsp_faults()?;
+                if t_wait.elapsed() > Duration::from_millis(2) {
+                    let _ = self.gpu.pci.ring_doorbell(self.gpu.compute_gpfifo.token);
+                }
+                if t_wait.elapsed() > Duration::from_secs(10) {
+                    unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
+                    return Err("ink_dspark_inject_kv_kernel timed out (>10s)".into());
+                }
             }
             std::hint::spin_loop();
         }
@@ -1873,9 +1946,10 @@ impl InklingEngine {
 
         let sig_ptr = self.gpu.timeline_buf.as_ptr() as *const u64;
         let t_wait = Instant::now();
+        let mut iter = 0u32;
         loop {
             let cur_sig = unsafe { std::ptr::read_volatile(sig_ptr) };
-            if cur_sig >= sig_val {
+            if cur_sig >= sig_val || (sig_val < (1u64 << 31) && (cur_sig & 0xffff_ffff) >= sig_val) {
                 break;
             }
             let err = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).error_code) };
@@ -1883,9 +1957,16 @@ impl InklingEngine {
                 let _ = self.gpu.zero_vram(&self.ws_bar_state_buf);
                 return Err(format!("ink_dspark_propose_megakernel barrier watchdog tripped at {}", err));
             }
-            self.gpu.poll_gsp_faults()?;
-            if t_wait.elapsed() > Duration::from_secs(15) {
-                return Err("ink_dspark_propose_megakernel timed out (>15s)".into());
+            iter = iter.wrapping_add(1);
+            if (iter & 0x3fff) == 0 {
+                self.gpu.poll_gsp_faults()?;
+                if t_wait.elapsed() > Duration::from_millis(2) {
+                    let _ = self.gpu.pci.ring_doorbell(self.gpu.compute_gpfifo.token);
+                }
+                if t_wait.elapsed() > Duration::from_secs(15) {
+                    unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
+                    return Err("ink_dspark_propose_megakernel timed out (>15s)".into());
+                }
             }
             std::hint::spin_loop();
         }
@@ -2289,6 +2370,7 @@ impl InklingEngine {
             let mut prev_uncommitted = first_tok;
             let mut user_aborted = false;
             let mut eos_seen = false;
+            let mut iter = 0u32;
 
             loop {
                 let done_steps = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).steps_completed) } as usize;
@@ -2323,7 +2405,7 @@ impl InklingEngine {
                 }
 
                 let cur_sig = unsafe { std::ptr::read_volatile(sig_ptr) };
-                if cur_sig >= sig_val {
+                if cur_sig >= sig_val || (sig_val < (1u64 << 31) && (cur_sig & 0xffff_ffff) >= sig_val) {
                     let final_steps =
                         unsafe { std::ptr::read_volatile(&(*ctrl_ptr).steps_completed) } as usize;
                     while streamed < final_steps {
@@ -2387,11 +2469,17 @@ impl InklingEngine {
                         err
                     ));
                 }
-                self.gpu.poll_gsp_faults()?;
-                if rollout_t0.elapsed() > Duration::from_secs(180) {
-                    unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
-                    self.cached_tokens.clear();
-                    return Err("ink_persistent_decode_megakernel exceeded 180s timeout".into());
+                iter = iter.wrapping_add(1);
+                if (iter & 0x3fff) == 0 {
+                    self.gpu.poll_gsp_faults()?;
+                    if streamed == 0 && rollout_t0.elapsed() > Duration::from_millis(2) {
+                        let _ = self.gpu.pci.ring_doorbell(self.gpu.compute_gpfifo.token);
+                    }
+                    if rollout_t0.elapsed() > Duration::from_secs(180) {
+                        unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
+                        self.cached_tokens.clear();
+                        return Err("ink_persistent_decode_megakernel exceeded 180s timeout".into());
+                    }
                 }
                 std::hint::spin_loop();
             }
