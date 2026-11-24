@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path("/Users/tim/Code/optimize-gpu")
-OUT_IPYNB = ROOT / "wait_hmm_before_after_demo.ipynb"
+OUT_IPYNB = ROOT / "experiments" / "wait_hmm_before_after_demo.ipynb"
 
 
 CELL_1_MD = """# Mechanistic Weight Surgery: Seeing `"Wait / Hmm"` Loops Disappear Before vs. After
@@ -47,7 +47,7 @@ except ImportError:
         print(re.sub(r"<[^>]+>", "", str(obj)))
 
 ROOT = Path("/Users/tim/Code/optimize-gpu")
-BIN = ROOT / "qwen-nv-rs" / "target" / "release" / "qwen-nv"
+BIN = ROOT / "engine" / "target" / "release" / "rtx"
 
 HESITATION_RE = re.compile(
     r"\\b(Wait a second|Wait a minute|Actually,\\s*wait|Let me double[- ]check|Let me recount|Hold on|Wait|Hmm)\\b",

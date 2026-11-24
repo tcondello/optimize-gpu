@@ -5,11 +5,11 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, "/Users/tim/Code/optimize-gpu")
+sys.path.insert(0, "/Users/tim/Code/optimize-gpu/experiments")
 from run_autonomous_weight_edit import analyze_trace, parse_last_json
 
 ROOT = Path("/Users/tim/Code/optimize-gpu")
-BIN = ROOT / "qwen-nv-rs/target/release/qwen-nv"
+BIN = ROOT / "engine/target/release/rtx"
 WORK = ROOT / "data/mech_loop"
 BF16 = Path.home() / ".cache/qwen-nv-rs/models/Qwen3-4B-Thinking-2507-BF16"
 DIRS = WORK / "fork_dirs.bin"

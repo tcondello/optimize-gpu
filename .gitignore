@@ -1,6 +1,6 @@
 # Build artifacts
-qwen-nv-rs/target/
-!qwen-nv-rs/kernels/*.cubin
+engine/target/
+!engine/kernels/*.cubin
 
 # Large model weights & >100MB binary blobs
 *.gguf

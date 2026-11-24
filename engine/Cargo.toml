@@ -1,0 +1,16 @@
+[package]
+name = "rtx"
+version = "0.8.0"
+edition = "2021"
+description = "Zero-Docker, Zero-Crate Native macOS ARM64 Rust Runtime & GA102 (sm_86) Persistent Megakernel Engine for Inkling-2-Mini, Qwen3, Co-Resident STT/TTS, Same-Model RAG, & Mechanistic Weight Surgery"
+
+[[bin]]
+name = "rtx"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = false

@@ -24,7 +24,7 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path("/Users/tim/Code/optimize-gpu")
-BIN = ROOT / "qwen-nv-rs" / "target" / "release" / "qwen-nv"
+BIN = ROOT / "engine" / "target" / "release" / "rtx"
 DATA_DIR = ROOT / "data"
 CALIB_OUT = DATA_DIR / "post_cutoff_calib.jsonl"
 TEST_OUT = DATA_DIR / "post_cutoff_test.jsonl"
