@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Native macOS ARM64 Client for `/Applications/TinyGPU.app` (`tinygpu.sock`).
 //! Connects directly via Unix domain socket + `SCM_RIGHTS` shared-memory `mmap`
 //! with zero Python/tinygrad middleware.
@@ -12,7 +14,7 @@ use std::ptr;
 use std::thread;
 use std::time::Duration;
 
-use crate::nv_defs::*;
+use super::defs::*;
 
 // macOS Darwin POSIX constants & FFI (`libSystem.B.dylib` is linked by `std`)
 const SOL_SOCKET: i32 = 0xffff;

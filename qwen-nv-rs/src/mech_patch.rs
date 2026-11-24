@@ -12,9 +12,10 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use crate::gguf::{f16_to_f32, f32_to_bf16_bits, f32_to_f16_bits, resolve_model_path, GgufFile, MmapFile};
+use crate::gguf::{f16_to_f32, f32_to_bf16_bits, f32_to_f16_bits, resolve_model_path, GgufFile};
+use crate::hw::{get_u32, get_u64};
 use crate::lora::dequant_gguf_2d_f32;
-use crate::nv_defs::{get_u32, get_u64};
+pub use crate::safetensors::{parse_safetensors_index, SafeTensorsFile as MmapSafetensors};
 
 #[link(name = "Accelerate", kind = "framework")]
 extern "C" {
@@ -42,257 +43,6 @@ const CBLAS_TRANS: i32 = 112;
 
 const DIRS_MAGIC: &[u8; 4] = b"QMDR";
 const BACKUP_MAGIC: &[u8; 4] = b"QMBK";
-
-// -----------------------------------------------------------------------------
-// Zero-Copy `mmap` Safetensors Shard Reader & Index Resolver
-// -----------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-pub struct StSliceMeta {
-    pub dtype: String,
-    pub shape: Vec<usize>,
-    pub file_data_start: usize, // absolute byte offset inside `.safetensors` file
-    pub byte_len: usize,
-}
-
-pub struct MmapSafetensors {
-    pub mmap: MmapFile,
-    pub header_end: usize,
-    pub entries: HashMap<String, StSliceMeta>,
-}
-
-impl MmapSafetensors {
-    pub fn open(path: &Path) -> Result<Self, String> {
-        let mmap = MmapFile::open(path)?;
-        let raw = mmap.as_slice();
-        if raw.len() < 8 {
-            return Err(format!("Safetensors {} too small", path.display()));
-        }
-        let hdr_len = get_u64(raw, 0) as usize;
-        if 8 + hdr_len > raw.len() {
-            return Err(format!("Invalid header length in {}", path.display()));
-        }
-        let header_end = 8 + hdr_len;
-        let hdr_str = std::str::from_utf8(&raw[8..header_end])
-            .map_err(|e| format!("Invalid UTF-8 safetensors header: {}", e))?;
-        let entries = parse_st_header(hdr_str, header_end)?;
-        Ok(Self {
-            mmap,
-            header_end,
-            entries,
-        })
-    }
-
-    pub fn decode_f32(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
-        let meta = self
-            .entries
-            .get(name)
-            .ok_or_else(|| format!("Tensor '{}' not found in safetensors shard", name))?;
-        let s = &self.mmap.as_slice()[meta.file_data_start..meta.file_data_start + meta.byte_len];
-        let nel: usize = meta.shape.iter().product();
-        let mut out = Vec::with_capacity(nel);
-        match meta.dtype.as_str() {
-            "BF16" => {
-                for c in s.chunks_exact(2) {
-                    let b = u16::from_le_bytes([c[0], c[1]]) as u32;
-                    out.push(f32::from_bits(b << 16));
-                }
-            }
-            "F16" => {
-                for c in s.chunks_exact(2) {
-                    out.push(f16_to_f32(u16::from_le_bytes([c[0], c[1]])));
-                }
-            }
-            "F32" => {
-                for c in s.chunks_exact(4) {
-                    out.push(f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])));
-                }
-            }
-            other => return Err(format!("Unsupported safetensors dtype '{}'", other)),
-        }
-        Ok((out, meta.shape.clone()))
-    }
-
-    pub fn raw_tensor_bytes(&self, name: &str) -> Result<(&[u8], StSliceMeta), String> {
-        let meta = self
-            .entries
-            .get(name)
-            .ok_or_else(|| format!("Tensor '{}' not found in safetensors shard", name))?
-            .clone();
-        let s = &self.mmap.as_slice()[meta.file_data_start..meta.file_data_start + meta.byte_len];
-        Ok((s, meta))
-    }
-}
-
-fn parse_st_header(hdr: &str, data_base: usize) -> Result<HashMap<String, StSliceMeta>, String> {
-    let bytes = hdr.as_bytes();
-    let mut i = 0usize;
-    let skip_ws = |mut p: usize| -> usize {
-        while p < bytes.len() && bytes[p].is_ascii_whitespace() {
-            p += 1;
-        }
-        p
-    };
-    let read_qstr = |mut p: usize| -> Result<(String, usize), String> {
-        p = skip_ws(p);
-        if p >= bytes.len() || bytes[p] != b'"' {
-            return Err("Expected '\"' in safetensors header".into());
-        }
-        p += 1;
-        let mut s = String::new();
-        while p < bytes.len() {
-            let c = bytes[p];
-            p += 1;
-            if c == b'"' {
-                return Ok((s, p));
-            }
-            if c == b'\\' && p < bytes.len() {
-                s.push(bytes[p] as char);
-                p += 1;
-            } else {
-                s.push(c as char);
-            }
-        }
-        Err("Unterminated string in safetensors header".into())
-    };
-
-    i = skip_ws(i);
-    if i >= bytes.len() || bytes[i] != b'{' {
-        return Err("Safetensors header missing '{'".into());
-    }
-    i += 1;
-
-    let mut map = HashMap::new();
-    loop {
-        i = skip_ws(i);
-        if i >= bytes.len() || bytes[i] == b'}' {
-            break;
-        }
-        if bytes[i] == b',' {
-            i += 1;
-            continue;
-        }
-        let (key, next_i) = read_qstr(i)?;
-        i = skip_ws(next_i);
-        if i >= bytes.len() || bytes[i] != b':' {
-            return Err("Expected ':' in safetensors header".into());
-        }
-        i = skip_ws(i + 1);
-        if bytes[i] != b'{' {
-            return Err("Expected '{' for tensor object".into());
-        }
-        let mut depth = 1usize;
-        let obj_start = i + 1;
-        i += 1;
-        while i < bytes.len() && depth > 0 {
-            match bytes[i] {
-                b'"' => {
-                    i += 1;
-                    while i < bytes.len() {
-                        if bytes[i] == b'\\' {
-                            i += 2;
-                        } else if bytes[i] == b'"' {
-                            i += 1;
-                            break;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                }
-                b'{' => {
-                    depth += 1;
-                    i += 1;
-                }
-                b'}' => {
-                    depth -= 1;
-                    i += 1;
-                }
-                _ => i += 1,
-            }
-        }
-        let obj_str = &hdr[obj_start..i - 1];
-        if key == "__metadata__" {
-            continue;
-        }
-        let dtype = extract_str_val(obj_str, "\"dtype\"").unwrap_or_default();
-        let shape = extract_usize_arr(obj_str, "\"shape\"").unwrap_or_default();
-        let offs = extract_usize_arr(obj_str, "\"data_offsets\"").unwrap_or_default();
-        if offs.len() == 2 && offs[1] >= offs[0] {
-            map.insert(
-                key,
-                StSliceMeta {
-                    dtype,
-                    shape,
-                    file_data_start: data_base + offs[0],
-                    byte_len: offs[1] - offs[0],
-                },
-            );
-        }
-    }
-    Ok(map)
-}
-
-fn extract_str_val(src: &str, key: &str) -> Option<String> {
-    let idx = src.find(key)?;
-    let rest = src[idx + key.len()..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-fn extract_usize_arr(src: &str, key: &str) -> Option<Vec<usize>> {
-    let idx = src.find(key)?;
-    let rest = src[idx + key.len()..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('[')?;
-    let end = rest.find(']')?;
-    let inner = rest[..end].trim();
-    if inner.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut out = Vec::new();
-    for p in inner.split(',') {
-        out.push(p.trim().parse::<usize>().ok()?);
-    }
-    Some(out)
-}
-
-/// Parse `model.safetensors.index.json` -> `HashMap<tensor_name, shard_filename>`.
-pub fn parse_safetensors_index(dir: &Path) -> Result<HashMap<String, String>, String> {
-    let idx_path = dir.join("model.safetensors.index.json");
-    if !idx_path.exists() {
-        let single = dir.join("model.safetensors");
-        if single.exists() {
-            let st = MmapSafetensors::open(&single)?;
-            let mut m = HashMap::new();
-            for k in st.entries.keys() {
-                m.insert(k.clone(), "model.safetensors".to_string());
-            }
-            return Ok(m);
-        }
-        return Err(format!("Missing model.safetensors.index.json in {}", dir.display()));
-    }
-    let txt = fs::read_to_string(&idx_path).map_err(|e| e.to_string())?;
-    let wm_idx = txt
-        .find("\"weight_map\"")
-        .ok_or("Missing weight_map in model.safetensors.index.json")?;
-    let body = &txt[wm_idx + 12..];
-    let open_brace = body.find('{').ok_or("Malformed weight_map")?;
-    let sub = &body[open_brace + 1..];
-
-    let mut map = HashMap::new();
-    for line in sub.lines() {
-        let ln = line.trim().trim_end_matches(',');
-        if ln.starts_with('}') {
-            break;
-        }
-        if let Some(colon) = ln.find(':') {
-            let k = ln[..colon].trim().trim_matches('"');
-            let v = ln[colon + 1..].trim().trim_matches('"');
-            if !k.is_empty() && v.ends_with(".safetensors") {
-                map.insert(k.to_string(), v.to_string());
-            }
-        }
-    }
-    Ok(map)
-}
 
 // -----------------------------------------------------------------------------
 // Phase 2: Causal Localization (`difference-in-means` + Top-2 SVD + Separability)
@@ -964,8 +714,7 @@ pub fn apply_surgical_weight_patch(
         "Qwen3-4B-Thinking-2507-Patched-Q8_0.gguf".to_string()
     } else if dim == 4096 {
         let sample_t = base_gguf
-            .tensors
-            .get("blk.0.ffn_down.weight")
+            .tensor_info("blk.0.ffn_down.weight")
             .map(|t| t.ggml_type)
             .unwrap_or(14);
         if sample_t == 14 {
@@ -1137,10 +886,7 @@ pub fn apply_surgical_weight_patch(
             }
 
             // 2. Quantize patched `FP32` matrix to `Q8_0` or `Q6_K` matching `base_gguf` and patch in-place!
-            let g_info = base_gguf
-                .tensors
-                .get(&gguf_key)
-                .ok_or_else(|| format!("Missing {} in base GGUF", gguf_key))?;
+            let g_info = base_gguf.req_tensor_info(&gguf_key)?;
             let q_bytes = match g_info.ggml_type {
                 8 => quantize_f32_to_q8_0(&w_f32),
                 14 => quantize_f32_to_q6_k(&w_f32),
@@ -1151,7 +897,7 @@ pub fn apply_surgical_weight_patch(
                     ))
                 }
             };
-            let g_file_off = (base_gguf.data_start + g_info.offset) as u64;
+            let g_file_off = (base_gguf.data_start() + g_info.offset) as u64;
             let orig_g_bytes = base_gguf.tensor_bytes(g_info, q_bytes.len());
             backup_records.push((
                 2u8,
@@ -1189,12 +935,7 @@ pub fn apply_surgical_weight_patch(
     }
     fs::write(&backup_path, bk_buf).map_err(|e| e.to_string())?;
 
-    let total_model_params: f64 = base_gguf
-        .tensors
-        .values()
-        .map(|t| t.dims.iter().product::<usize>() as f64)
-        .sum::<f64>()
-        .max(1.0);
+    let total_model_params: f64 = (base_gguf.total_param_count() as f64).max(1.0);
     let dof_pct = 100.0 * (subspace_dof as f64) / total_model_params;
     let mean_frob = if rel_deltas.is_empty() {
         0.0

@@ -14,10 +14,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::gguf::{f16_to_f32, f32_to_f16_bits};
+use crate::hw::{get_u32, put_u32};
 use crate::lora::MAX_LORA_RANK;
-use crate::mech_patch::MmapSafetensors;
-use crate::nv_defs::{get_u32, put_u32};
-use crate::rag::RagHit;
+use crate::safetensors::SafeTensorsFile;
 
 #[link(name = "Accelerate", kind = "framework")]
 extern "C" {
@@ -828,15 +827,15 @@ pub fn write_or_merge_topic_peft_lora(
             prev_dir.to_path_buf()
         };
         if st_path.exists() {
-            let st = MmapSafetensors::open(&st_path)?;
+            let st = SafeTensorsFile::open(&st_path)?;
             let mut prev_pairs: HashMap<usize, (Option<String>, Option<String>)> = HashMap::new();
-            for k in st.entries.keys() {
-                if let Some((l, is_b)) = parse_layer_from_down_proj_key(k) {
+            for k in st.tensor_names() {
+                if let Some((l, is_b)) = parse_layer_from_down_proj_key(&k) {
                     let e = prev_pairs.entry(l).or_insert((None, None));
                     if is_b {
-                        e.1 = Some(k.clone());
+                        e.1 = Some(k);
                     } else {
-                        e.0 = Some(k.clone());
+                        e.0 = Some(k);
                     }
                 }
             }
@@ -1216,18 +1215,22 @@ impl TopicBankManifest {
         }
     }
 
-    pub fn resolve_topic(&self, hits: &[RagHit], min_score_override: Option<f32>) -> Option<(&TopicEntry, f32)> {
+    pub fn resolve_topic<'a>(
+        &self,
+        hits: impl IntoIterator<Item = (&'a str, f32)>,
+        min_score_override: Option<f32>,
+    ) -> Option<(&TopicEntry, f32)> {
         let thresh = min_score_override.unwrap_or(self.min_score);
-        for h in hits {
-            if h.score < thresh {
+        for (title, score) in hits {
+            if score < thresh {
                 continue;
             }
             if let Some(entry) = self
                 .topics
                 .iter()
-                .find(|t| t.title.eq_ignore_ascii_case(h.title.trim()))
+                .find(|t| t.title.eq_ignore_ascii_case(title.trim()))
             {
-                return Some((entry, h.score));
+                return Some((entry, score));
             }
         }
         None

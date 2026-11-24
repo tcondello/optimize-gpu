@@ -11,14 +11,13 @@
 use std::sync::atomic::{fence, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::audio::ASR_SAMPLE_RATE;
-use crate::engine::{QwenDecodeCtrl, QwenLayerDesc, QwenModelDesc};
+use super::audio::ASR_SAMPLE_RATE;
 use crate::gguf::{
     decode_1d_f32, decode_tensor_f32_req, extract_quant_weight_bytes, precompute_freqs_cis_f32,
     resolve_asr_model_path, BpeTokenizer, GgufFile, Utf8StreamDecoder,
 };
-use crate::nv_defs::{put_u32, put_u64, QmdV3};
-use crate::nv_hw::{CubinModule, HostMappedBuffer, NvGpu, VramBuffer};
+use crate::hw::{put_u32, put_u64, CubinModule, HostMappedBuffer, NvGpu, VramBuffer};
+use crate::models::qwen_abi::{QwenDecodeCtrl, QwenLayerDesc, QwenModelDesc};
 
 pub const ASR_MAX_AUDIO_SEC: usize = 60;
 pub const ASR_MAX_SAMPLES: usize = ASR_MAX_AUDIO_SEC * (ASR_SAMPLE_RATE as usize); // 960,000 samples (60s)
@@ -235,8 +234,8 @@ impl ByteSlabBuilder {
 }
 
 pub struct QwenAsrEngine {
-    pub asr_ref: String,
-    pub model_name: String,
+    asr_ref: String,
+    model_name: String,
     pub vram_bytes_total: u64,
     tok: BpeTokenizer,
 
@@ -340,29 +339,26 @@ pub struct QwenAsrEngine {
 }
 
 impl QwenAsrEngine {
+    #[inline]
+    pub fn asr_ref(&self) -> &str {
+        &self.asr_ref
+    }
+
+    #[inline]
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
     pub fn load(gpu: &mut NvGpu, asr_ref: &str) -> Result<Self, String> {
         let t0 = Instant::now();
         let gguf_path = resolve_asr_model_path(asr_ref)?;
         let gf = GgufFile::open(&gguf_path)?;
-        let tok = BpeTokenizer::from_gguf(&gf)?;
+        let tok = gf.build_tokenizer()?;
 
-        let get_u = |k: &str| -> Result<usize, String> {
-            gf.kv
-                .get(k)
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize)
-                .ok_or_else(|| format!("Missing Qwen3-ASR GGUF key '{}'", k))
-        };
-        let get_f = |k: &str, def: f32| -> f32 {
-            gf.kv.get(k).and_then(|v| v.as_f32()).unwrap_or(def)
-        };
+        let get_u = |k: &str| gf.req_usize(k);
+        let get_f = |k: &str, def: f32| gf.get_f32_or(k, def);
 
-        let model_name = gf
-            .kv
-            .get("general.name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Qwen3-ASR-1.7B")
-            .to_string();
+        let model_name = gf.get_str("general.name").unwrap_or("Qwen3-ASR-1.7B").to_string();
 
         let enc_n_layers = get_u("stt.qwen3_asr.encoder.n_layers")?;
         let enc_d_model = get_u("stt.qwen3_asr.encoder.d_model")?;
@@ -400,9 +396,7 @@ impl QwenAsrEngine {
         let audio_start_id = get_u("stt.qwen3_asr.audio_start_token_id")? as i32;
         let audio_end_id = get_u("stt.qwen3_asr.audio_end_token_id")? as i32;
         let eos_id = gf
-            .kv
-            .get("tokenizer.ggml.eos_token_id")
-            .and_then(|v| v.as_u64())
+            .get_u64("tokenizer.ggml.eos_token_id")
             .unwrap_or(151645) as i32;
 
         let req_tok = |s: &str| -> Result<i32, String> {
@@ -912,23 +906,7 @@ impl QwenAsrEngine {
     }
 
     fn execute_qmd_chain(gpu: &mut NvGpu, chain: &[(u64, usize)], timeout_secs: u64) -> Result<(), String> {
-        gpu.timeline_value += 1;
-        let target_sig = gpu.timeline_value;
-        let sig_va = gpu.timeline_buf.va_addr;
-        {
-            let (_, last_off) = *chain.last().unwrap();
-            let buf = gpu.kernargs_buf_mut_slice_at(last_off);
-            let mut tail_qmd = QmdV3 {
-                bytes: buf[..256].try_into().unwrap(),
-            };
-            tail_qmd.set_release0(sig_va, target_sig);
-            buf[..256].copy_from_slice(&tail_qmd.bytes);
-        }
-        for i in 0..(chain.len() - 1) {
-            gpu.link_dependent_qmd(chain[i].1, chain[i + 1].0);
-        }
-        gpu.launch_qmd_chain(chain[0].0, true)?;
-        gpu.wait_timeline(target_sig, Duration::from_secs(timeout_secs))
+        gpu.launch_qmd_chain_sync(chain, true, Duration::from_secs(timeout_secs))
     }
 
     fn run_dec_prefill_chunk(
@@ -938,13 +916,13 @@ impl QwenAsrEngine {
         start_pos: usize,
         t_len: usize,
     ) -> Result<(), String> {
-        let k_copy = &module.kernels["tts_copy_f32"];
-        let k_rms = &module.kernels["qwen_prefill_rmsnorm_q8_1"];
-        let k_gemm = &module.kernels["qwen_prefill_gemm"];
-        let k_qknorm = &module.kernels["qwen_prefill_qknorm_rope_kv"];
-        let k_flash = &module.kernels["qwen_prefill_flash_gqa"];
-        let k_quant = &module.kernels["qwen_prefill_quant_q8_1"];
-        let k_swiglu = &module.kernels["qwen_prefill_swiglu_q8_1"];
+        let k_copy = module.kernel("tts_copy_f32")?;
+        let k_rms = module.kernel("qwen_prefill_rmsnorm_q8_1")?;
+        let k_gemm = module.kernel("qwen_prefill_gemm")?;
+        let k_qknorm = module.kernel("qwen_prefill_qknorm_rope_kv")?;
+        let k_flash = module.kernel("qwen_prefill_flash_gqa")?;
+        let k_quant = module.kernel("qwen_prefill_quant_q8_1")?;
+        let k_swiglu = module.kernel("qwen_prefill_swiglu_q8_1")?;
 
         let dim = self.dec_hidden as u32;
         let hidden_dim = self.dec_inter as u32;
@@ -1160,13 +1138,13 @@ impl QwenAsrEngine {
         };
         gpu.upload_to_vram(&pcm_view, 0, &pcm_bytes)?;
 
-        let k_init_max = &module.kernels["asr_init_max_int_kernel"];
-        let k_mel = &module.kernels["asr_mel_stft_128_kernel"];
-        let k_mel_pack = &module.kernels["asr_mel_norm_pack_kernel"];
-        let k_conv2d = &module.kernels["asr_conv2d_3x3_s2_gelu_kernel"];
-        let k_perm_q8 = &module.kernels["asr_conv2_permute_q8_1_kernel"];
-        let k_gemm = &module.kernels["qwen_prefill_gemm"];
-        let k_add_pe = &module.kernels["asr_add_pe_trim_kernel"];
+        let k_init_max = module.kernel("asr_init_max_int_kernel")?;
+        let k_mel = module.kernel("asr_mel_stft_128_kernel")?;
+        let k_mel_pack = module.kernel("asr_mel_norm_pack_kernel")?;
+        let k_conv2d = module.kernel("asr_conv2d_3x3_s2_gelu_kernel")?;
+        let k_perm_q8 = module.kernel("asr_conv2_permute_q8_1_kernel")?;
+        let k_gemm = module.kernel("qwen_prefill_gemm")?;
+        let k_add_pe = module.kernel("asr_add_pe_trim_kernel")?;
 
         let mut sub_chain = Vec::with_capacity(16);
 
@@ -1343,10 +1321,10 @@ impl QwenAsrEngine {
         // Stage 3: 24-Layer Bidirectional Flash-Attention AuT Encoder + Projector (1 QMD Chain!)
         // ---------------------------------------------------------------------
         let t_enc0 = Instant::now();
-        let k_ln_q8 = &module.kernels["asr_layernorm_q8_1_kernel"];
-        let k_bi_attn = &module.kernels["asr_bidir_flash_attn_f32_kernel"];
-        let k_quant = &module.kernels["qwen_prefill_quant_q8_1"];
-        let k_gelu_q8 = &module.kernels["asr_gelu_erf_q8_1_kernel"];
+        let k_ln_q8 = module.kernel("asr_layernorm_q8_1_kernel")?;
+        let k_bi_attn = module.kernel("asr_bidir_flash_attn_f32_kernel")?;
+        let k_quant = module.kernel("qwen_prefill_quant_q8_1")?;
+        let k_gelu_q8 = module.kernel("asr_gelu_erf_q8_1_kernel")?;
 
         let t_enc_u = t_enc as u32;
         let grid_t = (t_enc_u + 7) / 8;
@@ -1606,7 +1584,7 @@ impl QwenAsrEngine {
         fence(Ordering::SeqCst);
 
         // Assemble `[0 .. T_prompt - 1)` embeddings directly in VRAM
-        let k_asm_dec = &module.kernels["asr_assemble_decoder_embed_kernel"];
+        let k_asm_dec = module.kernel("asr_assemble_decoder_embed_kernel")?;
         let mut a_asm = [0u8; 52];
         put_u64(&mut a_asm, 0, self.ws_dec_prefill_emb.va_addr);
         put_u64(&mut a_asm, 8, self.dec_emb_va);
@@ -1645,7 +1623,7 @@ impl QwenAsrEngine {
         }
         fence(Ordering::SeqCst);
 
-        let k_mk = &module.kernels["qwen_persistent_decode_megakernel"];
+        let k_mk = module.kernel("qwen_persistent_decode_megakernel")?;
         let mut mk_args = [0u8; 16];
         put_u64(&mut mk_args, 0, self.dec_model_desc_gpu.va_addr);
         put_u64(&mut mk_args, 8, self.dec_ctrl_buf.va_addr);

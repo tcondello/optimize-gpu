@@ -14,3 +14,10 @@
 - `[dependencies]` in `qwen-nv-rs/Cargo.toml` must remain completely empty (`0` external crates).
 - Precompiled `sm_86` CUDA binaries (`.cubin`) must be embedded via `include_bytes!`. Docker Desktop must remain completely OFF (`0` containers/VMs) during all runtime execution and benchmarks.
 - Always cleanly unload `GSP-RM` (`qwen-nv stop` / `NV_VGPU_MSG_FUNCTION_UNLOADING_GUEST_DRIVER`) before starting a new GPU process or disconnecting Thunderbolt, and never issue `CMD_BOOST_TO_MAX`.
+
+## 4. Deep Modules & Zero-Slop Architectural Guardrail (`deslop-please`)
+- All Rust code in `qwen-nv-rs` must pass `deslop-please` with **`0` errors and `0` `.deslop-please.allow` suppressions**:
+  1. **`0` module cycles & `0` cross-module tangles**: Enforce a strict DAG (`hw` -> `{safetensors, tokenizer, gguf}` -> `{lora, mech_patch, topic_lora}` -> `{models, voice}` -> `runtime` -> `{tui, cli_ops, main}`).
+  2. **`0` leaked struct fields (`field-leak`)**: Keep stateful struct fields private; expose behavior through methods that do real work rather than trivial field getters/setters or mutable external state pokes.
+  3. **Deep modules with narrow interfaces (`shallow-module`)**: Any folder module with child modules must hide more functions than it exposes and keep each exposed type's external method surface `<= 7` items.
+  4. **Bounded layout (`wide-directory` / `long-file`)**: Keep every directory `<= 15` entries and every `.rs` source file `<= 2,000` lines.

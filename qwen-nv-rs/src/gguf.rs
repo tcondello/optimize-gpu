@@ -1,65 +1,15 @@
-//! Zero-Dependency `mmap` GGUF v2/v3 Reader, Exact Qwen2/Qwen3/GPT-2 BPE Tokenizer,
-//! RoPE Precomputation, and Raw Quantized (`Q4_K` / `Q6_K` / `Q8_0`) Tensor Extraction.
+//! Zero-Dependency `mmap` GGUF v2/v3 Reader, Model Cache Resolver, RoPE Precomputation,
+//! and Raw Quantized (`Q4_K` / `Q6_K` / `Q8_0`) Tensor Extraction.
 
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::ptr;
 
-use crate::nv_defs::{get_u16, get_u32, get_u64};
-use crate::unicode_cats::{is_gpt2_ws, is_ucat_l, is_ucat_n};
-
-const PROT_READ: i32 = 0x01;
-const MAP_PRIVATE: i32 = 0x0002;
-const MAP_FAILED_ISIZE: isize = -1;
-
-extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-    fn munmap(addr: *mut u8, len: usize) -> i32;
-}
-
-pub struct MmapFile {
-    ptr: *mut u8,
-    len: usize,
-}
-
-unsafe impl Send for MmapFile {}
-unsafe impl Sync for MmapFile {}
-
-impl MmapFile {
-    pub fn open(path: &Path) -> Result<Self, String> {
-        let f = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-        let len = f.metadata().map_err(|e| e.to_string())?.len() as usize;
-        if len == 0 {
-            return Err(format!("File {} is empty", path.display()));
-        }
-        let ptr = unsafe { mmap(ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
-        if (ptr as isize) == MAP_FAILED_ISIZE || ptr.is_null() {
-            return Err(format!("mmap failed on {}", path.display()));
-        }
-        Ok(Self { ptr, len })
-    }
-
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-}
-
-impl Drop for MmapFile {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() && self.len > 0 {
-            unsafe {
-                munmap(self.ptr, self.len);
-            }
-            self.ptr = ptr::null_mut();
-        }
-    }
-}
+use crate::hw::{get_u16, get_u32, get_u64};
+pub use crate::safetensors::{f16_to_f32, f32_to_bf16_bits, f32_to_f16_bits, MmapFile};
+pub use crate::tokenizer::{BpeTokenizer, Utf8StreamDecoder};
 
 // -----------------------------------------------------------------------------
 // Pure-Rust RFC 1321 MD5 (for zero-download reuse of `~/Library/Caches/tinygrad/downloads/<md5>`)
@@ -134,9 +84,7 @@ pub fn resolve_model_path(model_ref: &str) -> Result<PathBuf, String> {
         if p.exists() {
             return Ok(p);
         }
-        eprintln!(
-            "[qwen-nv] Note: patched checkpoint not found locally; falling back to qwen3-thinking:8b"
-        );
+        eprintln!("[qwen-nv] Note: patched checkpoint not found locally; falling back to qwen3-thinking:8b");
         return resolve_model_path("qwen3-thinking:8b");
     }
     if matches!(model_ref, "qwen3-patched" | "qwen-patched" | "qwen3-4b-patched") {
@@ -179,7 +127,6 @@ pub fn resolve_model_path(model_ref: &str) -> Result<PathBuf, String> {
     if let Some(url) = url_opt {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         let hash = md5_hex(url.as_bytes());
-        // Check macOS & Linux tinygrad download cache locations first!
         let tg_mac = PathBuf::from(&home).join("Library/Caches/tinygrad/downloads").join(&hash);
         if tg_mac.exists() {
             return Ok(tg_mac);
@@ -227,12 +174,61 @@ pub fn resolve_model_path(model_ref: &str) -> Result<PathBuf, String> {
     }
 }
 
+pub fn resolve_tts_model_paths(talker_ref: &str, codec_ref: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
+    let talker_url_or_path = match talker_ref {
+        "" | "1.7b" | "1.7b-q8" | "q8_0" | "default" => {
+            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-1.7b-customvoice-Q8_0.gguf"
+        }
+        "1.7b-q4" | "q4_k_m" => {
+            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-1.7b-customvoice-Q4_K_M.gguf"
+        }
+        "1.7b-voicedesign" | "voicedesign" => {
+            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-1.7b-voicedesign-Q8_0.gguf"
+        }
+        "0.6b" | "0.6b-q8" => {
+            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-0.6b-customvoice-Q8_0.gguf"
+        }
+        other => other,
+    };
+    let codec_url_or_path = match codec_ref.unwrap_or("default") {
+        "" | "default" | "12hz" | "bf16" => {
+            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-tokenizer-12hz-BF16.gguf"
+        }
+        other => other,
+    };
+    let talker_path = resolve_model_path(talker_url_or_path)?;
+    let codec_path = resolve_model_path(codec_url_or_path)?;
+    Ok((talker_path, codec_path))
+}
+
+pub fn resolve_asr_model_path(asr_ref: &str) -> Result<PathBuf, String> {
+    let url_or_path = match asr_ref {
+        "" | "1.7b" | "1.7b-q8" | "q8_0" | "default" | "qwen3-asr:1.7b" => {
+            "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/main/Qwen3-ASR-1.7B-Q8_0.gguf"
+        }
+        "1.7b-q4" | "q4_k_m" => {
+            "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/main/Qwen3-ASR-1.7B-Q4_K_M.gguf"
+        }
+        "1.7b-q6" | "q6_k" => {
+            "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/main/Qwen3-ASR-1.7B-Q6_K.gguf"
+        }
+        "0.6b" | "0.6b-q8" | "qwen3-asr:0.6b" => {
+            "https://huggingface.co/handy-computer/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf"
+        }
+        "0.6b-q4" => {
+            "https://huggingface.co/handy-computer/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q4_K_M.gguf"
+        }
+        other => other,
+    };
+    resolve_model_path(url_or_path)
+}
+
 // -----------------------------------------------------------------------------
 // GGUF v2/v3 Metadata & Tensor Info Parser
 // -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-pub enum GgufVal {
+enum GgufVal {
     UInt(u64),
     Int(i64),
     Float(f64),
@@ -244,14 +240,14 @@ pub enum GgufVal {
 }
 
 impl GgufVal {
-    pub fn as_u64(&self) -> Option<u64> {
+    fn as_u64(&self) -> Option<u64> {
         match self {
             GgufVal::UInt(v) => Some(*v),
             GgufVal::Int(v) => Some(*v as u64),
             _ => None,
         }
     }
-    pub fn as_f32(&self) -> Option<f32> {
+    fn as_f32(&self) -> Option<f32> {
         match self {
             GgufVal::Float(v) => Some(*v as f32),
             GgufVal::UInt(v) => Some(*v as f32),
@@ -259,14 +255,14 @@ impl GgufVal {
             _ => None,
         }
     }
-    pub fn as_bool(&self) -> Option<bool> {
+    fn as_bool(&self) -> Option<bool> {
         match self {
             GgufVal::Bool(b) => Some(*b),
             GgufVal::UInt(v) => Some(*v != 0),
             _ => None,
         }
     }
-    pub fn as_str(&self) -> Option<&str> {
+    fn as_str(&self) -> Option<&str> {
         match self {
             GgufVal::Str(s) => Some(s.as_str()),
             _ => None,
@@ -282,10 +278,10 @@ pub struct TensorInfo {
 }
 
 pub struct GgufFile {
-    pub mmap: MmapFile,
-    pub kv: HashMap<String, GgufVal>,
-    pub tensors: HashMap<String, TensorInfo>,
-    pub data_start: usize,
+    mmap: MmapFile,
+    kv: HashMap<String, GgufVal>,
+    tensors: HashMap<String, TensorInfo>,
+    data_start: usize,
 }
 
 impl GgufFile {
@@ -361,8 +357,6 @@ impl GgufFile {
                     let et = get_u32(buf, *c);
                     let n = get_u64(buf, *c + 4) as usize;
                     *c += 12;
-                    // Only materialize large arrays we actually use (`tokenizer.ggml.tokens` & `token_type`),
-                    // skipping `merges`/`scores` in ~0.5 ms!
                     if et == 8 && (key == "tokenizer.ggml.tokens" || n <= 64) {
                         let mut v = Vec::with_capacity(n);
                         for _ in 0..n {
@@ -440,94 +434,164 @@ impl GgufFile {
     }
 
     #[inline]
+    pub fn file_len(&self) -> usize {
+        self.mmap.len()
+    }
+
+    #[inline]
+    pub fn data_start(&self) -> usize {
+        self.data_start
+    }
+
+    #[inline]
+    pub fn get_str(&self, key: &str) -> Option<&str> {
+        self.kv.get(key).and_then(|v| v.as_str())
+    }
+
+    #[inline]
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        self.kv.get(key).and_then(|v| v.as_u64())
+    }
+
+    #[inline]
+    pub fn get_usize_or(&self, key: &str, def: usize) -> usize {
+        self.get_u64(key).map(|v| v as usize).unwrap_or(def)
+    }
+
+    pub fn req_usize(&self, key: &str) -> Result<usize, String> {
+        self.get_u64(key)
+            .map(|v| v as usize)
+            .ok_or_else(|| format!("Missing GGUF key {}", key))
+    }
+
+    #[inline]
+    pub fn get_f32(&self, key: &str) -> Option<f32> {
+        self.kv.get(key).and_then(|v| v.as_f32())
+    }
+
+    #[inline]
+    pub fn get_f32_or(&self, key: &str, def: f32) -> f32 {
+        self.get_f32(key).unwrap_or(def)
+    }
+
+    pub fn req_f32(&self, key: &str) -> Result<f32, String> {
+        self.get_f32(key)
+            .ok_or_else(|| format!("Missing GGUF key {}", key))
+    }
+
+    #[inline]
+    pub fn get_bool_or(&self, key: &str, def: bool) -> bool {
+        self.kv.get(key).and_then(|v| v.as_bool()).unwrap_or(def)
+    }
+
+    pub fn get_str_arr(&self, key: &str) -> Option<&[String]> {
+        match self.kv.get(key) {
+            Some(GgufVal::StrArr(v)) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn get_i32_arr(&self, key: &str) -> Option<&[i32]> {
+        match self.kv.get(key) {
+            Some(GgufVal::IntArr(v)) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
+
+    #[inline]
+    pub fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
+        self.tensors.get(name)
+    }
+
+    pub fn req_tensor_info(&self, name: &str) -> Result<&TensorInfo, String> {
+        self.tensors
+            .get(name)
+            .ok_or_else(|| format!("Missing required tensor '{}' in GGUF", name))
+    }
+
+    pub fn sorted_tensor_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tensors.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    pub fn tensor_names_by_offset(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tensors.keys().cloned().collect();
+        names.sort_by_key(|n| self.tensors[n].offset);
+        names
+    }
+
+    pub fn total_param_count(&self) -> u64 {
+        self.tensors
+            .values()
+            .map(|t| t.dims.iter().product::<usize>() as u64)
+            .sum()
+    }
+
+    #[inline]
     pub fn tensor_bytes(&self, info: &TensorInfo, nbytes: usize) -> &[u8] {
         let start = self.data_start + info.offset;
         &self.mmap.as_slice()[start..start + nbytes]
     }
+
+    pub fn build_tokenizer(&self) -> Result<BpeTokenizer, String> {
+        let tokens = self
+            .get_str_arr("tokenizer.ggml.tokens")
+            .ok_or_else(|| "Missing tokenizer.ggml.tokens in GGUF".to_string())?;
+        let types_opt = self.get_i32_arr("tokenizer.ggml.token_type");
+        let raw_pre = self.get_str("tokenizer.ggml.pre").unwrap_or("qwen2");
+        BpeTokenizer::from_vocab(tokens, types_opt, raw_pre)
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Half-Precision & Fallback Q8_0 Conversion Helpers
+// Tensor Extraction & Fallback Q8_0 Conversion Helpers
 // -----------------------------------------------------------------------------
 
-#[inline]
-pub fn f16_to_f32(h: u16) -> f32 {
-    let sign = ((h & 0x8000) as u32) << 16;
-    let mut exp = ((h >> 10) & 0x1f) as i32;
-    let mut mant = (h & 0x03ff) as u32;
-    let bits = if exp == 0 {
-        if mant == 0 {
-            sign
-        } else {
-            exp = 1;
-            while (mant & 0x0400) == 0 {
-                mant <<= 1;
-                exp -= 1;
-            }
-            mant &= 0x03ff;
-            sign | (((exp + 127 - 15) as u32) << 23) | (mant << 13)
-        }
-    } else if exp == 31 {
-        sign | 0x7f80_0000 | (mant << 13)
-    } else {
-        sign | (((exp + 127 - 15) as u32) << 23) | (mant << 13)
+pub fn decode_1d_f32(gguf: &GgufFile, name: &str) -> Result<Option<Vec<f32>>, String> {
+    let Some(info) = gguf.tensor_info(name) else {
+        return Ok(None);
     };
-    f32::from_bits(bits)
-}
-
-#[inline]
-pub fn f32_to_f16_bits(v: f32) -> u16 {
-    let f = v.to_bits();
-    let sign = ((f >> 16) & 0x8000) as u16;
-    let exp = ((f >> 23) & 0xff) as i32 - 127 + 15;
-    if exp <= 0 {
-        if exp < -10 {
-            return sign;
+    let nel: usize = info.dims.iter().product();
+    let mut out = Vec::with_capacity(nel);
+    match info.ggml_type {
+        0 => {
+            let raw = gguf.tensor_bytes(info, nel * 4);
+            for i in 0..nel {
+                out.push(f32::from_bits(get_u32(raw, i * 4)));
+            }
         }
-        let mant = (f & 0x007f_ffff) | 0x0080_0000;
-        let shift = 14 - exp;
-        let rounded = (mant + (1 << (shift - 1)) - 1 + ((mant >> shift) & 1)) >> shift;
-        return sign | (rounded as u16);
-    } else if exp >= 31 {
-        return sign | 0x7c00;
-    }
-    let mant = f & 0x007f_ffff;
-    let rounded = (mant + 0x0fff + ((mant >> 13) & 1)) >> 13;
-    if rounded >= 0x0400 {
-        if exp + 1 >= 31 {
-            return sign | 0x7c00;
+        1 => {
+            let raw = gguf.tensor_bytes(info, nel * 2);
+            for i in 0..nel {
+                out.push(f16_to_f32(get_u16(raw, i * 2)));
+            }
         }
-        return sign | (((exp + 1) as u16) << 10);
+        30 => {
+            let raw = gguf.tensor_bytes(info, nel * 2);
+            for i in 0..nel {
+                out.push(f32::from_bits((get_u16(raw, i * 2) as u32) << 16));
+            }
+        }
+        other => return Err(format!("Unsupported 1D norm/bias ggml_type={} on {}", other, name)),
     }
-    sign | ((exp as u16) << 10) | (rounded as u16)
-}
-
-#[inline]
-pub fn f32_to_bf16_bits(v: f32) -> u16 {
-    let bits = v.to_bits();
-    if (bits & 0x7f80_0000) == 0x7f80_0000 && (bits & 0x007f_ffff) != 0 {
-        return ((bits >> 16) as u16) | 0x0040; // preserve quiet NaN
-    }
-    let lsb = (bits >> 16) & 1;
-    let rounding_bias = 0x7fff + lsb;
-    (bits.wrapping_add(rounding_bias) >> 16) as u16
+    Ok(Some(out))
 }
 
 pub fn decode_tensor_f32_req(gguf: &GgufFile, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
-    let info = gguf
-        .tensors
-        .get(name)
-        .ok_or_else(|| format!("Missing required tensor '{}' in GGUF", name))?;
+    let info = gguf.req_tensor_info(name)?;
     let dims = info.dims.clone();
     let v = decode_1d_f32(gguf, name)?.ok_or_else(|| format!("Missing '{}'", name))?;
     Ok((v, dims))
 }
 
 pub fn decode_tensor_bf16_req(gguf: &GgufFile, name: &str) -> Result<(Vec<u16>, Vec<usize>), String> {
-    let info = gguf
-        .tensors
-        .get(name)
-        .ok_or_else(|| format!("Missing required tensor '{}' in GGUF", name))?;
+    let info = gguf.req_tensor_info(name)?;
     let nel: usize = info.dims.iter().product();
     let mut out = Vec::with_capacity(nel);
     match info.ggml_type {
@@ -554,88 +618,6 @@ pub fn decode_tensor_bf16_req(gguf: &GgufFile, name: &str) -> Result<(Vec<u16>, 
     Ok((out, info.dims.clone()))
 }
 
-pub fn resolve_tts_model_paths(talker_ref: &str, codec_ref: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
-    let talker_url_or_path = match talker_ref {
-        "" | "1.7b" | "1.7b-q8" | "q8_0" | "default" => {
-            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-1.7b-customvoice-Q8_0.gguf"
-        }
-        "1.7b-q4" | "q4_k_m" => {
-            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-1.7b-customvoice-Q4_K_M.gguf"
-        }
-        "1.7b-voicedesign" | "voicedesign" => {
-            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-1.7b-voicedesign-Q8_0.gguf"
-        }
-        "0.6b" | "0.6b-q8" => {
-            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-talker-0.6b-customvoice-Q8_0.gguf"
-        }
-        other => other,
-    };
-    let codec_url_or_path = match codec_ref.unwrap_or("default") {
-        "" | "default" | "12hz" | "bf16" => {
-            "https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/main/qwen-tokenizer-12hz-BF16.gguf"
-        }
-        other => other,
-    };
-    let talker_path = resolve_model_path(talker_url_or_path)?;
-    let codec_path = resolve_model_path(codec_url_or_path)?;
-    Ok((talker_path, codec_path))
-}
-
-pub fn resolve_asr_model_path(asr_ref: &str) -> Result<PathBuf, String> {
-    let url_or_path = match asr_ref {
-        "" | "1.7b" | "1.7b-q8" | "q8_0" | "default" | "qwen3-asr:1.7b" => {
-            "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/main/Qwen3-ASR-1.7B-Q8_0.gguf"
-        }
-        "1.7b-q4" | "q4_k_m" => {
-            "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/main/Qwen3-ASR-1.7B-Q4_K_M.gguf"
-        }
-        "1.7b-q6" | "q6_k" => {
-            "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/main/Qwen3-ASR-1.7B-Q6_K.gguf"
-        }
-        "0.6b" | "0.6b-q8" | "qwen3-asr:0.6b" => {
-            "https://huggingface.co/handy-computer/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf"
-        }
-        "0.6b-q4" => {
-            "https://huggingface.co/handy-computer/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q4_K_M.gguf"
-        }
-        other => other,
-    };
-    resolve_model_path(url_or_path)
-}
-
-pub fn decode_1d_f32(gguf: &GgufFile, name: &str) -> Result<Option<Vec<f32>>, String> {
-    let Some(info) = gguf.tensors.get(name) else {
-        return Ok(None);
-    };
-    let nel: usize = info.dims.iter().product();
-    let mut out = Vec::with_capacity(nel);
-    match info.ggml_type {
-        0 => {
-            // F32
-            let raw = gguf.tensor_bytes(info, nel * 4);
-            for i in 0..nel {
-                out.push(f32::from_bits(get_u32(raw, i * 4)));
-            }
-        }
-        1 => {
-            // F16
-            let raw = gguf.tensor_bytes(info, nel * 2);
-            for i in 0..nel {
-                out.push(f16_to_f32(get_u16(raw, i * 2)));
-            }
-        }
-        30 => {
-            // BF16
-            let raw = gguf.tensor_bytes(info, nel * 2);
-            for i in 0..nel {
-                out.push(f32::from_bits((get_u16(raw, i * 2) as u32) << 16));
-            }
-        }
-        other => return Err(format!("Unsupported 1D norm/bias ggml_type={} on {}", other, name)),
-    }
-    Ok(Some(out))
-}
-
 pub fn raw_quant_byte_len(nel: usize, ggml_type: i32) -> Option<usize> {
     match ggml_type {
         8 => Some((nel / 32) * 34),    // Q8_0
@@ -646,11 +628,11 @@ pub fn raw_quant_byte_len(nel: usize, ggml_type: i32) -> Option<usize> {
 }
 
 /// Extract raw `Q4_K`/`Q6_K`/`Q8_0` bytes (or convert F16/F32/BF16 linear weights to `Q8_0` once).
-pub fn extract_quant_weight_bytes<'a>(gguf: &'a GgufFile, name: &str) -> Result<(std::borrow::Cow<'a, [u8]>, i32, usize, usize), String> {
-    let info = gguf
-        .tensors
-        .get(name)
-        .ok_or_else(|| format!("Missing required tensor '{}' in GGUF", name))?;
+pub fn extract_quant_weight_bytes<'a>(
+    gguf: &'a GgufFile,
+    name: &str,
+) -> Result<(std::borrow::Cow<'a, [u8]>, i32, usize, usize), String> {
+    let info = gguf.req_tensor_info(name)?;
     let in_f = info.dims[0];
     let out_f = if info.dims.len() > 1 { info.dims[1] } else { 1 };
     let nel = in_f * out_f;
@@ -659,7 +641,6 @@ pub fn extract_quant_weight_bytes<'a>(gguf: &'a GgufFile, name: &str) -> Result<
         return Ok((std::borrow::Cow::Borrowed(gguf.tensor_bytes(info, nbytes)), info.ggml_type, out_f, in_f));
     }
 
-    // Fallback: quantize F32/F16/BF16 weight matrix to Q8_0
     if in_f % 32 != 0 {
         return Err(format!("Fallback tensor {} in_features={} not divisible by 32", name, in_f));
     }
@@ -714,439 +695,6 @@ pub fn precompute_freqs_cis_f32(rope_dim: usize, max_ctx: usize, theta: f32) -> 
     out
 }
 
-// -----------------------------------------------------------------------------
-// Exact Qwen2 / Qwen3 / Llama3 GPT-2 Byte-Level BPE Tokenizer (`SimpleTokenizer` Parity)
-// -----------------------------------------------------------------------------
-
-pub struct BpeTokenizer {
-    pub preset: String,
-    normal_tokens: HashMap<Vec<u8>, i32>,
-    pub special_tokens: HashMap<String, i32>,
-    special_list: Vec<(String, i32)>,
-    tok2bytes: Vec<Vec<u8>>,
-}
-
-impl BpeTokenizer {
-    pub fn from_gguf(gguf: &GgufFile) -> Result<Self, String> {
-        let tokens = match gguf.kv.get("tokenizer.ggml.tokens") {
-            Some(GgufVal::StrArr(v)) => v,
-            _ => return Err("Missing tokenizer.ggml.tokens in GGUF".into()),
-        };
-        let types_opt = match gguf.kv.get("tokenizer.ggml.token_type") {
-            Some(GgufVal::IntArr(v)) => Some(v.as_slice()),
-            _ => None,
-        };
-        let raw_pre = gguf
-            .kv
-            .get("tokenizer.ggml.pre")
-            .and_then(|v| v.as_str())
-            .unwrap_or("qwen2");
-        let preset = match raw_pre {
-            "qwen35" | "qwen35moe" => "qwen2",
-            other => other,
-        }
-        .to_string();
-
-        // GPT-2 byte decoder map (`char -> u8`)
-        let mut byte_dec = HashMap::<char, u8>::with_capacity(256);
-        let mut direct = [false; 256];
-        for b in (33u16..127).chain(161..173).chain(174..256) {
-            direct[b as usize] = true;
-            byte_dec.insert(char::from_u32(b as u32).unwrap(), b as u8);
-        }
-        let mut extra_idx = 0u32;
-        for b in 0..256usize {
-            if !direct[b] {
-                byte_dec.insert(char::from_u32(256 + extra_idx).unwrap(), b as u8);
-                extra_idx += 1;
-            }
-        }
-
-        let mut normal_tokens = HashMap::with_capacity(tokens.len());
-        let mut special_tokens = HashMap::new();
-        let mut special_list = Vec::new();
-        let mut tok2bytes = vec![Vec::new(); tokens.len()];
-
-        for (idx, tok_str) in tokens.iter().enumerate() {
-            let tid = idx as i32;
-            let ttype = types_opt.map(|ts| ts[idx]).unwrap_or(1);
-            if ttype == 1 {
-                let mut raw_bytes = Vec::with_capacity(tok_str.len());
-                let mut ok = true;
-                for c in tok_str.chars() {
-                    if let Some(&b) = byte_dec.get(&c) {
-                        raw_bytes.push(b);
-                    } else {
-                        ok = false;
-                        break;
-                    }
-                }
-                if ok {
-                    tok2bytes[idx] = raw_bytes.clone();
-                    normal_tokens.insert(raw_bytes, tid);
-                } else {
-                    let fb = tok_str.as_bytes().to_vec();
-                    tok2bytes[idx] = fb.clone();
-                    normal_tokens.insert(fb, tid);
-                }
-            } else {
-                let sb = tok_str.as_bytes().to_vec();
-                tok2bytes[idx] = sb;
-                if !tok_str.is_empty() {
-                    special_tokens.insert(tok_str.clone(), tid);
-                    special_list.push((tok_str.clone(), tid));
-                }
-            }
-        }
-
-        Ok(Self {
-            preset,
-            normal_tokens,
-            special_tokens,
-            special_list,
-            tok2bytes,
-        })
-    }
-
-    /// Exact implementation of llama.cpp / Qwen2 / Llama3 GPT-2 regex pre-tokenizer:
-    /// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{N}\p{L}]?[\p{L}]+|[\p{N}]{1,3}| ?[^\s\p{N}\p{L}]+[\r\n]*|[\s]*[\r\n]+|[\s]+(?![^\s])|[\s]+`
-    pub fn split_to_words(chunk: &str) -> Vec<&str> {
-        if chunk.is_empty() {
-            return Vec::new();
-        }
-        let chars: Vec<(usize, char)> = chunk.char_indices().collect();
-        let n = chars.len();
-        let mut out = Vec::new();
-        let mut i = 0usize;
-
-        let slice_range = |start_ci: usize, end_ci: usize| -> &str {
-            let b0 = chars[start_ci].0;
-            let b1 = if end_ci < n { chars[end_ci].0 } else { chunk.len() };
-            &chunk[b0..b1]
-        };
-
-        while i < n {
-            let c0 = chars[i].1;
-
-            // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
-            if c0 == '\'' && i + 1 < n {
-                let c1 = chars[i + 1].1.to_ascii_lowercase();
-                if i + 2 < n {
-                    let c2 = chars[i + 2].1.to_ascii_lowercase();
-                    if (c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l') {
-                        out.push(slice_range(i, i + 3));
-                        i += 3;
-                        continue;
-                    }
-                }
-                if matches!(c1, 's' | 't' | 'm' | 'd') {
-                    out.push(slice_range(i, i + 2));
-                    i += 2;
-                    continue;
-                }
-            }
-
-            // 2. [^\r\n\p{N}\p{L}]?[\p{L}]+
-            if is_ucat_l(c0) {
-                let mut j = i + 1;
-                while j < n && is_ucat_l(chars[j].1) {
-                    j += 1;
-                }
-                out.push(slice_range(i, j));
-                i = j;
-                continue;
-            }
-            if c0 != '\r' && c0 != '\n' && !is_ucat_n(c0) && i + 1 < n && is_ucat_l(chars[i + 1].1) {
-                let mut j = i + 2;
-                while j < n && is_ucat_l(chars[j].1) {
-                    j += 1;
-                }
-                out.push(slice_range(i, j));
-                i = j;
-                continue;
-            }
-
-            // 3. [\p{N}]{1,3}
-            if is_ucat_n(c0) {
-                let mut j = i + 1;
-                while j < n && j - i < 3 && is_ucat_n(chars[j].1) {
-                    j += 1;
-                }
-                out.push(slice_range(i, j));
-                i = j;
-                continue;
-            }
-
-            // 4. ` ?[^\s\p{N}\p{L}]+[\r\n]*`
-            {
-                let p0 = if c0 == ' ' { i + 1 } else { i };
-                if p0 < n {
-                    let cp = chars[p0].1;
-                    if !is_gpt2_ws(cp) && !is_ucat_n(cp) && !is_ucat_l(cp) {
-                        let mut j = p0 + 1;
-                        while j < n {
-                            let cj = chars[j].1;
-                            if !is_gpt2_ws(cj) && !is_ucat_n(cj) && !is_ucat_l(cj) {
-                                j += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        while j < n && (chars[j].1 == '\r' || chars[j].1 == '\n') {
-                            j += 1;
-                        }
-                        out.push(slice_range(i, j));
-                        i = j;
-                        continue;
-                    }
-                }
-            }
-
-            // Branches 5, 6, 7 all start with `is_gpt2_ws(c0)` (`\r` and `\n` are in `is_gpt2_ws`)
-            if is_gpt2_ws(c0) {
-                let mut ws_end = i + 1;
-                let mut last_crlf = if c0 == '\r' || c0 == '\n' { Some(i + 1) } else { None };
-                while ws_end < n && is_gpt2_ws(chars[ws_end].1) {
-                    if chars[ws_end].1 == '\r' || chars[ws_end].1 == '\n' {
-                        last_crlf = Some(ws_end + 1);
-                    }
-                    ws_end += 1;
-                }
-
-                // 5. [\s]*[\r\n]+
-                if let Some(crlf_end) = last_crlf {
-                    out.push(slice_range(i, crlf_end));
-                    i = crlf_end;
-                    continue;
-                }
-
-                // 6. [\s]+(?![^\s])
-                if ws_end == n {
-                    out.push(slice_range(i, ws_end));
-                    i = ws_end;
-                    continue;
-                }
-                if ws_end - i >= 2 {
-                    // Backtrack 1 whitespace char so next char IS whitespace -> (?![^\s]) holds!
-                    out.push(slice_range(i, ws_end - 1));
-                    i = ws_end - 1;
-                    continue;
-                }
-
-                // 7. [\s]+
-                out.push(slice_range(i, ws_end));
-                i = ws_end;
-                continue;
-            }
-
-            // Safety fallback (unreachable under exhaustive Unicode categories)
-            out.push(slice_range(i, i + 1));
-            i += 1;
-        }
-        out
-    }
-
-    fn encode_word(&self, word: &[u8]) -> Vec<i32> {
-        if let Some(&tid) = self.normal_tokens.get(word) {
-            return vec![tid];
-        }
-        let mut parts: Vec<Vec<u8>> = word.iter().map(|&b| vec![b]).collect();
-        while parts.len() >= 2 {
-            let mut best_rank = i32::MAX;
-            let mut best_idx = None;
-            let mut merged_probe = Vec::with_capacity(32);
-            for j in 0..(parts.len() - 1) {
-                merged_probe.clear();
-                merged_probe.extend_from_slice(&parts[j]);
-                merged_probe.extend_from_slice(&parts[j + 1]);
-                if let Some(&rank) = self.normal_tokens.get(&merged_probe) {
-                    if rank < best_rank {
-                        best_rank = rank;
-                        best_idx = Some(j);
-                    }
-                }
-            }
-            let Some(idx) = best_idx else { break };
-            let right = parts.remove(idx + 1);
-            parts[idx].extend_from_slice(&right);
-        }
-        parts
-            .into_iter()
-            .filter_map(|p| self.normal_tokens.get(&p).copied())
-            .collect()
-    }
-
-    fn match_contraction_len(chars: &[(usize, char)], pos: usize) -> usize {
-        let n = chars.len();
-        if pos + 1 < n && chars[pos].1 == '\'' {
-            let c1 = chars[pos + 1].1.to_ascii_lowercase();
-            if pos + 2 < n {
-                let c2 = chars[pos + 2].1.to_ascii_lowercase();
-                if (c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l') {
-                    return 3;
-                }
-            }
-            if matches!(c1, 's' | 't' | 'm' | 'd') {
-                return 2;
-            }
-        }
-        0
-    }
-
-    fn encode_sentence(&self, chunk: &str, out: &mut Vec<i32>) {
-        if matches!(self.preset.as_str(), "inkling2" | "gpt-4o") {
-            let words = Self::split_to_words(chunk);
-            let mut k = 0usize;
-            while k < words.len() {
-                if k + 1 < words.len()
-                    && words[k + 1].starts_with('\'')
-                    && words[k].chars().last().map(is_ucat_l).unwrap_or(false)
-                {
-                    let mut combined = Vec::with_capacity(words[k].len() + words[k + 1].len());
-                    combined.extend_from_slice(words[k].as_bytes());
-                    combined.extend_from_slice(words[k + 1].as_bytes());
-                    out.extend(self.encode_word(&combined));
-                    k += 2;
-                    continue;
-                }
-                out.extend(self.encode_word(words[k].as_bytes()));
-                k += 1;
-            }
-            return;
-        }
-        for w in Self::split_to_words(chunk) {
-            out.extend(self.encode_word(w.as_bytes()));
-        }
-    }
-
-    pub fn encode(&self, text: &str) -> Vec<i32> {
-        let mut out = Vec::new();
-        let mut pos = 0usize;
-        while pos < text.len() {
-            let rem = &text[pos..];
-            // Only scan special tokens if `<|` or `<` appears in remaining text (fast path!)
-            let mut best_match: Option<(usize, usize, i32)> = None;
-            if rem.contains('<') {
-                for (stok, tid) in &self.special_list {
-                    if let Some(rel) = rem.find(stok.as_str()) {
-                        if best_match.map_or(true, |(cur_rel, _, _)| rel < cur_rel) {
-                            best_match = Some((rel, stok.len(), *tid));
-                        }
-                    }
-                }
-            }
-            if let Some((rel, slen, tid)) = best_match {
-                if rel > 0 {
-                    self.encode_sentence(&rem[..rel], &mut out);
-                }
-                out.push(tid);
-                pos += rel + slen;
-            } else {
-                self.encode_sentence(rem, &mut out);
-                break;
-            }
-        }
-        out
-    }
-
-    pub fn role_tokens(&self, role: &str) -> Vec<i32> {
-        match self.preset.as_str() {
-            "olmo" => self.encode(&format!("<|{}|>\n", role)),
-            "kimi-k2" => self.encode(&format!("<|im_{}|>{}<|im_middle|>", role, role)),
-            "qwen2" => self.encode(&format!("<|im_start|>{}\n", role)),
-            _ => self.encode(&format!("<|start_header_id|>{}<|end_header_id|>\n\n", role)),
-        }
-    }
-
-    pub fn end_turn_tokens(&self, im_end_id: i32) -> Vec<i32> {
-        match self.preset.as_str() {
-            "olmo" => self.encode("\n"),
-            "qwen2" => {
-                let mut v = vec![im_end_id];
-                v.extend(self.encode("\n"));
-                v
-            }
-            _ => vec![im_end_id],
-        }
-    }
-
-    #[inline]
-    pub fn token_bytes(&self, tid: i32) -> &[u8] {
-        if tid >= 0 && (tid as usize) < self.tok2bytes.len() {
-            &self.tok2bytes[tid as usize]
-        } else {
-            &[]
-        }
-    }
-
-    pub fn decode(&self, ids: &[i32]) -> String {
-        let mut bytes = Vec::with_capacity(ids.len() * 4);
-        for &id in ids {
-            bytes.extend_from_slice(self.token_bytes(id));
-        }
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-
-    pub fn find_token_id(&self, s: &str) -> Option<i32> {
-        if let Some(&id) = self.special_tokens.get(s) {
-            return Some(id);
-        }
-        self.normal_tokens.get(s.as_bytes()).copied()
-    }
-}
-
-/// Incremental UTF-8 stream decoder so multi-byte UTF-8 characters (emojis, CJK) never emit `U+FFFD` mid-char!
-pub struct Utf8StreamDecoder {
-    pending: Vec<u8>,
-}
-
-impl Utf8StreamDecoder {
-    pub fn new() -> Self {
-        Self {
-            pending: Vec::with_capacity(8),
-        }
-    }
-
-    pub fn push(&mut self, bytes: &[u8]) -> String {
-        self.pending.extend_from_slice(bytes);
-        let mut out = String::new();
-        loop {
-            match std::str::from_utf8(&self.pending) {
-                Ok(valid) => {
-                    out.push_str(valid);
-                    self.pending.clear();
-                    break;
-                }
-                Err(e) => {
-                    let valid_up_to = e.valid_up_to();
-                    if valid_up_to > 0 {
-                        out.push_str(unsafe { std::str::from_utf8_unchecked(&self.pending[..valid_up_to]) });
-                        self.pending.drain(..valid_up_to);
-                    }
-                    if let Some(err_len) = e.error_len() {
-                        out.push('\u{FFFD}');
-                        self.pending.drain(..err_len);
-                    } else {
-                        // Incomplete multi-byte UTF-8 sequence at end — wait for next token!
-                        break;
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    pub fn flush(&mut self) -> String {
-        if self.pending.is_empty() {
-            String::new()
-        } else {
-            let s = String::from_utf8_lossy(&self.pending).into_owned();
-            self.pending.clear();
-            s
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct QwenModelConfig {
     pub arch: String,
@@ -1171,36 +719,33 @@ pub struct QwenModelConfig {
 }
 
 impl QwenModelConfig {
-    pub fn from_gguf(gguf: &GgufFile, tok: &BpeTokenizer, max_context_req: usize, fallback_stem: &str) -> Result<Self, String> {
+    pub fn from_gguf(
+        gguf: &GgufFile,
+        tok: &BpeTokenizer,
+        max_context_req: usize,
+        fallback_stem: &str,
+    ) -> Result<Self, String> {
         let arch = gguf
-            .kv
-            .get("general.architecture")
-            .and_then(|v| v.as_str())
+            .get_str("general.architecture")
             .ok_or("Missing general.architecture in GGUF")?
             .to_string();
         if arch == "inkling2_loop" {
-            let get_u = |k: &str, def: usize| -> usize {
-                gguf.kv.get(k).and_then(|v| v.as_u64()).map(|x| x as usize).unwrap_or(def)
-            };
-            let n_phys = get_u("inkling2_loop.block_count", 24);
-            let l_start = get_u("inkling2_loop.loop.start", 6);
-            let l_end = get_u("inkling2_loop.loop.end", 18);
-            let l_cnt = get_u("inkling2_loop.loop.count", 3);
+            let n_phys = gguf.get_usize_or("inkling2_loop.block_count", 24);
+            let l_start = gguf.get_usize_or("inkling2_loop.loop.start", 6);
+            let l_end = gguf.get_usize_or("inkling2_loop.loop.end", 18);
+            let l_cnt = gguf.get_usize_or("inkling2_loop.loop.count", 3);
             let logical_layers = n_phys + (l_cnt.saturating_sub(1)) * (l_end.saturating_sub(l_start));
-            let n_heads = match gguf.kv.get("inkling2_loop.attention.head_count") {
-                Some(GgufVal::IntArr(v)) if !v.is_empty() => v[0] as usize,
-                _ => 24,
-            };
-            let n_kv_heads = match gguf.kv.get("inkling2_loop.attention.head_count_kv") {
-                Some(GgufVal::IntArr(v)) if !v.is_empty() => v[0] as usize,
-                _ => 8,
-            };
-            let model_name = gguf
-                .kv
-                .get("general.name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Inkling-2-Mini")
-                .to_string();
+            let n_heads = gguf
+                .get_i32_arr("inkling2_loop.attention.head_count")
+                .and_then(|v| v.first().copied())
+                .map(|v| v as usize)
+                .unwrap_or(24);
+            let n_kv_heads = gguf
+                .get_i32_arr("inkling2_loop.attention.head_count_kv")
+                .and_then(|v| v.first().copied())
+                .map(|v| v as usize)
+                .unwrap_or(8);
+            let model_name = gguf.get_str("general.name").unwrap_or("Inkling-2-Mini").to_string();
             let mut stop_ids = HashSet::new();
             stop_ids.insert(200006);
             stop_ids.insert(199999);
@@ -1209,19 +754,15 @@ impl QwenModelConfig {
                 arch,
                 model_name,
                 num_layers: logical_layers,
-                dim: get_u("inkling2_loop.embedding_length", 2304),
-                hidden_dim: get_u("inkling2_loop.expert_feed_forward_length", 1152),
+                dim: gguf.get_usize_or("inkling2_loop.embedding_length", 2304),
+                hidden_dim: gguf.get_usize_or("inkling2_loop.expert_feed_forward_length", 1152),
                 n_heads,
                 n_kv_heads,
-                head_dim: get_u("inkling2_loop.attention.key_length", 128),
+                head_dim: gguf.get_usize_or("inkling2_loop.attention.key_length", 128),
                 rope_dim: 0,
                 rope_theta: 0.0,
-                norm_eps: gguf
-                    .kv
-                    .get("inkling2_loop.attention.layer_norm_rms_epsilon")
-                    .and_then(|v| v.as_f32())
-                    .unwrap_or(1e-6),
-                vocab_size: get_u("inkling2_loop.vocab_size_unpadded", 200058),
+                norm_eps: gguf.get_f32_or("inkling2_loop.attention.layer_norm_rms_epsilon", 1e-6),
+                vocab_size: gguf.get_usize_or("inkling2_loop.vocab_size_unpadded", 200058),
                 max_ctx: max_context_req.clamp(512, 8192),
                 has_qk_norm: true,
                 thinking_template: true,
@@ -1235,21 +776,8 @@ impl QwenModelConfig {
             return Err(format!("Unsupported GGUF architecture '{}'", arch));
         }
 
-        let u_key = |suffix: &str| -> Result<usize, String> {
-            let k = format!("{}.{}", arch, suffix);
-            gguf.kv
-                .get(&k)
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize)
-                .ok_or_else(|| format!("Missing GGUF key {}", k))
-        };
-        let f_key = |suffix: &str| -> Result<f32, String> {
-            let k = format!("{}.{}", arch, suffix);
-            gguf.kv
-                .get(&k)
-                .and_then(|v| v.as_f32())
-                .ok_or_else(|| format!("Missing GGUF key {}", k))
-        };
+        let u_key = |suffix: &str| gguf.req_usize(&format!("{}.{}", arch, suffix));
+        let f_key = |suffix: &str| gguf.req_f32(&format!("{}.{}", arch, suffix));
 
         let file_ctx = u_key("context_length")?;
         let max_ctx = max_context_req.min(file_ctx);
@@ -1258,39 +786,23 @@ impl QwenModelConfig {
         let hidden_dim = u_key("feed_forward_length")?;
         let n_heads = u_key("attention.head_count")?;
         let n_kv_heads = u_key("attention.head_count_kv")?;
-        let head_dim = gguf
-            .kv
-            .get(&format!("{}.attention.key_length", arch))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .unwrap_or(dim / n_heads);
-        let rope_dim = gguf
-            .kv
-            .get(&format!("{}.rope.dimension_count", arch))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .unwrap_or(head_dim);
+        let head_dim = gguf.get_usize_or(&format!("{}.attention.key_length", arch), dim / n_heads);
+        let rope_dim = gguf.get_usize_or(&format!("{}.rope.dimension_count", arch), head_dim);
         let rope_theta = f_key("rope.freq_base")?;
         let norm_eps = f_key("attention.layer_norm_rms_epsilon")?;
-        let vocab_size = match gguf.kv.get("tokenizer.ggml.tokens") {
-            Some(GgufVal::StrArr(v)) => v.len(),
-            _ => return Err("Missing tokenizer.ggml.tokens".into()),
-        };
-        let has_qk_norm = gguf.tensors.contains_key("blk.0.attn_q_norm.weight");
+        let vocab_size = gguf
+            .get_str_arr("tokenizer.ggml.tokens")
+            .ok_or("Missing tokenizer.ggml.tokens")?
+            .len();
+        let has_qk_norm = gguf.has_tensor("blk.0.attn_q_norm.weight");
 
         let model_name = gguf
-            .kv
-            .get("general.name")
-            .and_then(|v| v.as_str())
-            .or_else(|| gguf.kv.get("general.basename").and_then(|v| v.as_str()))
+            .get_str("general.name")
+            .or_else(|| gguf.get_str("general.basename"))
             .unwrap_or(fallback_stem)
             .to_string();
 
-        let chat_tmpl = gguf
-            .kv
-            .get("tokenizer.chat_template")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let chat_tmpl = gguf.get_str("tokenizer.chat_template").unwrap_or("");
         let lower_name = model_name.to_ascii_lowercase();
         let lower_stem = fallback_stem.to_ascii_lowercase();
         let is_embed = lower_name.contains("embed") || lower_stem.contains("embed");
@@ -1306,31 +818,20 @@ impl QwenModelConfig {
                 || lower_name.contains("thinking")
                 || lower_stem.contains("thinking"));
 
-        let add_bos = gguf
-            .kv
-            .get("tokenizer.ggml.add_bos_token")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let add_bos = gguf.get_bool_or("tokenizer.ggml.add_bos_token", true);
         let bos_id = if add_bos {
-            gguf.kv
-                .get("tokenizer.ggml.bos_token_id")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as i32)
+            gguf.get_u64("tokenizer.ggml.bos_token_id").map(|v| v as i32)
         } else {
             None
         };
-        let eos_id = gguf
-            .kv
-            .get("tokenizer.ggml.eos_token_id")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(151645) as i32;
-        let im_end_id = tok.special_tokens.get("<|im_end|>").copied().unwrap_or(eos_id);
+        let eos_id = gguf.get_usize_or("tokenizer.ggml.eos_token_id", 151645) as i32;
+        let im_end_id = tok.special_id("<|im_end|>").unwrap_or(eos_id);
 
         let mut stop_ids = HashSet::new();
         stop_ids.insert(eos_id);
         stop_ids.insert(im_end_id);
         for s in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
-            if let Some(&tid) = tok.special_tokens.get(s) {
+            if let Some(tid) = tok.special_id(s) {
                 stop_ids.insert(tid);
             }
         }

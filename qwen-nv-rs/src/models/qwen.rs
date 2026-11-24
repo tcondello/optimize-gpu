@@ -1,33 +1,20 @@
 //! Native GA102 Persistent Megakernel & Speculative `BM=4` Qwen Inference Engine.
-//! Embeds pre-compiled `qwen_sm86_megakernel.cubin` directly into the Rust binary (zero runtime Docker/nvcc).
+
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{fence, Ordering};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use crate::asr::{AsrStats, QwenAsrEngine};
-use crate::drafter::{CalibratedNgramPrior, QwenNeuralDrafter};
-use crate::gguf::{
-    decode_1d_f32, extract_quant_weight_bytes, precompute_freqs_cis_f32, resolve_model_path, BpeTokenizer, GgufFile,
-    QwenModelConfig,
-};
-use crate::lora::{
-    prepare_lora_from_path, LoraStatus, QwenLayerLoraDesc, LORA_ARENA_DEFAULT_BYTES,
-};
-use crate::nv_defs::{put_u32, put_u64, QmdV3};
-use crate::nv_hw::{CubinModule, HostMappedBuffer, NvGpu, VramBuffer};
-use crate::rag::{f32_to_bf16_bits, EmbedStrategy, GpuVectorDb, RagDoc, RagHit, RagSearchStats};
+use super::drafter::QwenNeuralDrafter;
+use super::qwen_abi::{GenerationStats, QwenDecodeCtrl, QwenLayerDesc};
+use super::qwen_loader::{load_qwen_vram, QwenLoraArena, EMBED_MAX_POOL_ROWS, PREFILL_MAX_CHUNK};
+use super::rag::{f32_to_bf16_bits, EmbedStrategy, GpuVectorDb, RagDoc, RagHit, RagSearchStats};
+use crate::gguf::{BpeTokenizer, QwenModelConfig};
+use crate::hw::{put_u32, put_u64, CubinModule, HostMappedBuffer, NvGpu, VramBuffer};
+use crate::lora::LoraStatus;
 use crate::topic_lora::{TopicBankManifest, TopicEntry};
-use crate::tts::{QwenTtsEngine, TtsStats, TtsSynthParams};
-
-pub static EMBEDDED_CUBIN: &[u8] = include_bytes!("../kernels/qwen_sm86_megakernel.cubin");
-
-const PREFILL_MAX_CHUNK: usize = 64;
-const EMBED_MAX_POOL_ROWS: usize = 512;
-const TOPIC_LORA_SLOT_BYTES: u64 = 8 << 20; // 8 MB per cached topic LoRA slot
-pub const TOPIC_LORA_NUM_SLOTS: usize = 8; // 64 MB single one-time allocation (0 VRAM leaks)
-const MLP_KV_HOST_BUF_BYTES: usize = 16 << 20; // 16 MB snooped host buffer (0 extra GDDR6X VRAM)
 
 #[derive(Clone, Debug)]
 pub struct TopicRouteResult {
@@ -42,17 +29,6 @@ pub struct TopicRouteResult {
     pub hits: Vec<RagHit>,
 }
 
-#[derive(Clone)]
-struct CachedTopicSlot {
-    path: String,
-    user_scale: f32,
-    fingerprint: (u64, u128),
-    last_used: u64,
-    descs: Vec<QwenLayerLoraDesc>,
-    ptrs: Vec<u64>,
-    status: LoraStatus,
-}
-
 struct MlpKvHookSpec<'a> {
     key_layers: &'a [usize],
     row_start: usize,
@@ -61,152 +37,21 @@ struct MlpKvHookSpec<'a> {
     final_res_va: u64,
 }
 
-fn adapter_file_fingerprint(path_str: &str) -> (u64, u128) {
-    let p = Path::new(path_str);
-    let st_path = if p.is_dir() {
-        p.join("adapter_model.safetensors")
-    } else {
-        p.to_path_buf()
-    };
-    let Ok(md) = std::fs::metadata(&st_path) else {
-        return (0, 0);
-    };
-    let mtime_ns = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    (md.len(), mtime_ns)
+fn json_esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
-// -----------------------------------------------------------------------------
-// Exact Host/Device ABI Structs Matching `kernels/qwen_sm86_megakernel.cu`
-// -----------------------------------------------------------------------------
-
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Default)]
-pub struct QwenLayerDesc {
-    pub attn_norm_w: u64,
-    pub ffn_norm_w: u64,
-    pub q_norm_w: u64,
-    pub k_norm_w: u64,
-
-    pub w_qkv_or_qk: u64,
-    pub b_qkv_or_qk: u64,
-    pub w_v: u64,
-    pub b_v: u64,
-
-    pub w_o: u64,
-    pub b_o: u64,
-
-    pub w_gate_up: u64,
-    pub w_up_sep: u64,
-    pub w_down: u64,
-    pub b_down: u64,
-
-    pub kv_cache: u64,
-
-    pub qkv_type: i32,
-    pub v_type: i32,
-    pub o_type: i32,
-    pub gate_up_type: i32,
-    pub up_sep_type: i32,
-    pub down_type: i32,
-    pub split_v: i32,
-    pub split_gate_up: i32,
-
-    pub lora_ptr: u64,
-    pub _pad_lora: u64,
-}
-
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-pub struct QwenModelDesc {
-    pub layers_ptr: u64,
-    pub emb_w: u64,
-    pub output_norm_w: u64,
-    pub lm_head_w: u64,
-    pub freqs_cis: u64,
-
-    pub ws_x_res: u64,
-    pub ws_x_res2: u64,
-    pub ws_xq: u64,
-    pub ws_xds: u64,
-    pub ws_qkv: u64,
-    pub ws_q_roped: u64,
-    pub ws_gate_up: u64,
-    pub ws_cta_val: u64,
-    pub ws_cta_idx: u64,
-    pub ws_bar_state: u64,
-
-    pub num_layers: i32,
-    pub dim: i32,
-    pub hidden_dim: i32,
-    pub n_heads: i32,
-    pub n_kv_heads: i32,
-    pub head_dim: i32,
-    pub rope_dim: i32,
-    pub vocab_size: i32,
-    pub max_ctx: i32,
-    pub has_qk_norm: i32,
-    pub emb_type: i32,
-    pub lm_head_type: i32,
-    pub norm_eps: f32,
-    pub inv_sqrt_head_dim: f32,
-    pub stop_id0: i32,
-    pub stop_id1: i32,
-    pub stop_id2: i32,
-    pub stop_id3: i32,
-
-    pub ws_ext_embed: u64,
-    pub ws_hidden_last: u64,
-    pub ws_logits_out: u64,
-    pub _pad_model: u64,
-}
-
-#[repr(C, align(64))]
-pub struct QwenDecodeCtrl {
-    pub start_token: i32,
-    pub start_pos: i32,
-    pub max_steps: i32,
-    pub temperature: f32,
-    pub rng_seed: u64,
-    pub cancel_flag: i32,
-    pub error_code: i32,
-    pub steps_completed: i32,
-    pub stop_reason: i32,
-    pub spec_tokens_in: [i32; 4],
-    pub spec_tokens_out: [i32; 4],
-    pub export_logits: i32,
-    pub _pad_ctrl: [i32; 3],
-    pub tokens_out: [i32; 4096],
-}
-
-pub const DEFAULT_SPEC_CROSSOVER_4B: usize = 1536;
-pub const DEFAULT_SPEC_CROSSOVER_8B: usize = 3072;
-
-#[derive(Clone, Debug, Default)]
-pub struct GenerationStats {
-    pub prompt_tokens: usize,
-    pub cached_prefix_tokens: usize,
-    pub prefill_new_tokens: usize,
-    pub completion_tokens: usize,
-    pub prefill_ms: f64,
-    pub decode_ms: f64,
-    pub ttft_ms: f64,
-    pub total_ms: f64,
-    pub decode_tok_per_s: f64,
-    pub prefill_tok_per_s: f64,
-    pub kernel_launches: usize,
-    pub spec_verify_calls: usize,
-    pub spec_accepted_extra: usize,
-    pub spec_crossover_pos: usize,
-    pub spec_crossover_switched: bool,
-    pub stop_reason: &'static str,
-}
-
-// -----------------------------------------------------------------------------
 // Fast Lossless N-Gram Draft Table (Prompt + Generated History Lookup)
 // -----------------------------------------------------------------------------
 
@@ -274,34 +119,23 @@ impl NgramDraftTable {
 // QwenMegakernelEngine
 // -----------------------------------------------------------------------------
 
-pub struct QwenMegakernelEngine {
-    pub gpu: NvGpu,
-    pub module: CubinModule,
-    pub cfg: QwenModelConfig,
-    pub tok: BpeTokenizer,
-    pub model_ref: String,
 
-    // Keep VRAM allocations alive for the lifetime of the engine
+pub struct QwenMegakernelEngine {
+    module: CubinModule,
+    cfg: QwenModelConfig,
+    tok: BpeTokenizer,
+    model_ref: String,
+
     _owned_vram: Vec<VramBuffer>,
     layers_host: Vec<QwenLayerDesc>,
     layers_gpu: VramBuffer,
     model_desc_gpu: VramBuffer,
 
-    // Dynamic Rank-r (`r <= 32`) LoRA arena & co-resident 100%-GPU TTS + ASR + RAG VectorDB engines
-    lora_arena: Option<VramBuffer>,
-    lora_descs_host: Vec<QwenLayerLoraDesc>,
-    cached_lora_state: Option<(String, f32, Vec<QwenLayerLoraDesc>, Vec<u64>, LoraStatus)>,
-    topic_lora_pool: Option<VramBuffer>,
-    topic_lora_slots: Vec<Option<CachedTopicSlot>>,
-    topic_lora_clock: u64,
-    pub lora_status: LoraStatus,
-    pub tts: Option<QwenTtsEngine>,
-    pub asr: Option<QwenAsrEngine>,
-    pub rag_db: Option<GpuVectorDb>,
-    pub topic_bank: Option<(String, TopicBankManifest)>,
-    pub drafter: Option<QwenNeuralDrafter>,
+    lora_mgr: QwenLoraArena,
+    rag_db: Option<GpuVectorDb>,
+    topic_bank: Option<(String, TopicBankManifest)>,
+    drafter: Option<QwenNeuralDrafter>,
 
-    // Scratch workspace buffers (sized for both `PREFILL_MAX_CHUNK=64` and `BM=4` / `T=1`)
     ws_x_res: VramBuffer,
     ws_x_res2: VramBuffer,
     ws_xq: VramBuffer,
@@ -330,440 +164,151 @@ pub struct QwenMegakernelEngine {
     hooks_out_buf: HostMappedBuffer,
     mlp_kv_buf: HostMappedBuffer,
     cached_kv_tokens: Vec<i32>,
-    pub spec_crossover_pos: usize,
+    spec_crossover_pos: usize,
     rng_counter: u64,
 }
 
 impl QwenMegakernelEngine {
-    pub fn load(model_ref: &str, max_context: usize) -> Result<Self, String> {
-        assert_eq!(std::mem::size_of::<QwenLayerDesc>(), 176);
-        assert_eq!(std::mem::size_of::<QwenModelDesc>(), 224);
-
-        let t0 = Instant::now();
-        let local_path = resolve_model_path(model_ref)?;
-        let stem = local_path.file_stem().and_then(|s| s.to_str()).unwrap_or("qwen");
-        let gguf = GgufFile::open(&local_path)?;
-        let tok = BpeTokenizer::from_gguf(&gguf)?;
-        let cfg = QwenModelConfig::from_gguf(&gguf, &tok, max_context, stem)?;
-
-        let mut gpu = NvGpu::init()?;
-        let module = gpu.load_cubin(EMBEDDED_CUBIN)?;
-
-        let mut owned_vram = Vec::<VramBuffer>::new();
-        let kv_alloc_ctx = cfg.max_ctx + PREFILL_MAX_CHUNK;
-
-        // Helper to upload f32 slice to a packed VRAM arena or dedicated buffer
-        let mut small_arena_bytes = Vec::<u8>::with_capacity(4 << 20);
-        let push_f32_arena = |arena: &mut Vec<u8>, vals: &[f32]| -> u64 {
-            let pad = (256 - (arena.len() % 256)) % 256;
-            arena.resize(arena.len() + pad, 0);
-            let off = arena.len() as u64;
-            for &v in vals {
-                arena.extend_from_slice(&v.to_le_bytes());
-            }
-            off
-        };
-
-        // Precompute RoPE `freqs_cis` `[kv_alloc_ctx, rope_dim]`
-        let freqs_vec = precompute_freqs_cis_f32(cfg.rope_dim, kv_alloc_ctx, cfg.rope_theta);
-        let mut freqs_bytes = Vec::with_capacity(freqs_vec.len() * 4);
-        for &v in &freqs_vec {
-            freqs_bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        let freqs_cis_gpu = gpu.alloc_vram(freqs_bytes.len() as u64)?;
-        gpu.upload_to_vram(&freqs_cis_gpu, 0, &freqs_bytes)?;
-
-        // Upload Embedding & LM Head
-        let (emb_cow, emb_type, _, _) = extract_quant_weight_bytes(&gguf, "token_embd.weight")?;
-        let emb_buf = gpu.alloc_vram(emb_cow.len() as u64)?;
-        gpu.upload_to_vram(&emb_buf, 0, &emb_cow)?;
-        let emb_gpu_va = emb_buf.va_addr;
-        owned_vram.push(emb_buf);
-
-        let (lm_head_va, lm_head_type) = if gguf.tensors.contains_key("output.weight") {
-            let (lh_cow, lh_type, _, _) = extract_quant_weight_bytes(&gguf, "output.weight")?;
-            let lh_buf = gpu.alloc_vram(lh_cow.len() as u64)?;
-            gpu.upload_to_vram(&lh_buf, 0, &lh_cow)?;
-            let va = lh_buf.va_addr;
-            owned_vram.push(lh_buf);
-            (va, lh_type)
-        } else {
-            (emb_gpu_va, emb_type)
-        };
-
-        let out_norm_vec = decode_1d_f32(&gguf, "output_norm.weight")?
-            .ok_or("Missing output_norm.weight in GGUF")?;
-        let out_norm_rel = push_f32_arena(&mut small_arena_bytes, &out_norm_vec);
-        let unit_l2_vec = vec![1.0f32 / (cfg.dim as f32).sqrt(); cfg.dim];
-        let unit_l2_rel = push_f32_arena(&mut small_arena_bytes, &unit_l2_vec);
-
-        // Allocate ONE contiguous KV-cache slab for all layers (`num_layers * 2 * n_kv_heads * kv_alloc_ctx * head_dim * 2` bytes)
-        let kv_layer_bytes = ((2 * cfg.n_kv_heads * kv_alloc_ctx * cfg.head_dim * 2) as u64 + 255) & !255;
-        let kv_slab = gpu.alloc_vram(kv_layer_bytes * (cfg.num_layers as u64))?;
-        let kv_slab_va = kv_slab.va_addr;
-        owned_vram.push(kv_slab);
-
-        // Pack all layer weights into large 64 MB VRAM slabs for 2MB-hugepage TLB residency & max DMA speed!
-        let t_upload = Instant::now();
-        let mut total_weight_bytes = emb_cow.len() as u64;
-
-        struct LayerRel {
-            desc: QwenLayerDesc,
-            attn_norm_rel: u64,
-            ffn_norm_rel: u64,
-            q_norm_rel: Option<u64>,
-            k_norm_rel: Option<u64>,
-            b_qkv_rel: Option<u64>,
-            b_v_rel: Option<u64>,
-            b_o_rel: Option<u64>,
-        }
-        let mut layer_rels = Vec::with_capacity(cfg.num_layers);
-
-        for i in 0..cfg.num_layers {
-            let p = format!("blk.{}", i);
-            let an = decode_1d_f32(&gguf, &format!("{}.attn_norm.weight", p))?
-                .ok_or_else(|| format!("Missing {}.attn_norm.weight", p))?;
-            let fnw = decode_1d_f32(&gguf, &format!("{}.ffn_norm.weight", p))?
-                .ok_or_else(|| format!("Missing {}.ffn_norm.weight", p))?;
-            let attn_norm_rel = push_f32_arena(&mut small_arena_bytes, &an);
-            let ffn_norm_rel = push_f32_arena(&mut small_arena_bytes, &fnw);
-
-            let q_norm_rel = if cfg.has_qk_norm {
-                decode_1d_f32(&gguf, &format!("{}.attn_q_norm.weight", p))?
-                    .map(|v| push_f32_arena(&mut small_arena_bytes, &v))
-            } else {
-                None
-            };
-            let k_norm_rel = if cfg.has_qk_norm {
-                decode_1d_f32(&gguf, &format!("{}.attn_k_norm.weight", p))?
-                    .map(|v| push_f32_arena(&mut small_arena_bytes, &v))
-            } else {
-                None
-            };
-
-            let (wq, tq, oq, _) = extract_quant_weight_bytes(&gguf, &format!("{}.attn_q.weight", p))?;
-            let (wk, tk, ok, _) = extract_quant_weight_bytes(&gguf, &format!("{}.attn_k.weight", p))?;
-            let (wv, tv, ov, _) = extract_quant_weight_bytes(&gguf, &format!("{}.attn_v.weight", p))?;
-            let bq = decode_1d_f32(&gguf, &format!("{}.attn_q.bias", p))?;
-            let bk = decode_1d_f32(&gguf, &format!("{}.attn_k.bias", p))?;
-            let bv = decode_1d_f32(&gguf, &format!("{}.attn_v.bias", p))?;
-
-            let fuse_biases = |parts: &[(&Option<Vec<f32>>, usize)]| -> Option<Vec<f32>> {
-                if parts.iter().all(|(b, _)| b.is_none()) {
-                    return None;
-                }
-                let mut f = Vec::new();
-                for &(b_opt, len) in parts {
-                    if let Some(bv) = b_opt {
-                        f.extend_from_slice(bv);
-                    } else {
-                        f.resize(f.len() + len, 0.0);
-                    }
-                }
-                Some(f)
-            };
-
-            let (w_qkv_va, qkv_type, b_qkv_rel, w_v_va, v_type, b_v_rel, split_v) = if tq == tk && tk == tv {
-                let mut fused = Vec::with_capacity(wq.len() + wk.len() + wv.len());
-                fused.extend_from_slice(&wq);
-                fused.extend_from_slice(&wk);
-                fused.extend_from_slice(&wv);
-                let buf = gpu.alloc_vram(fused.len() as u64)?;
-                gpu.upload_to_vram(&buf, 0, &fused)?;
-                total_weight_bytes += fused.len() as u64;
-                let va = buf.va_addr;
-                owned_vram.push(buf);
-                let brel = fuse_biases(&[(&bq, oq), (&bk, ok), (&bv, ov)])
-                    .map(|v| push_f32_arena(&mut small_arena_bytes, &v));
-                (va, tq, brel, 0u64, 0i32, None, 0i32)
-            } else if tq == tk {
-                let mut fused_qk = Vec::with_capacity(wq.len() + wk.len());
-                fused_qk.extend_from_slice(&wq);
-                fused_qk.extend_from_slice(&wk);
-                let buf_qk = gpu.alloc_vram(fused_qk.len() as u64)?;
-                gpu.upload_to_vram(&buf_qk, 0, &fused_qk)?;
-                let buf_v = gpu.alloc_vram(wv.len() as u64)?;
-                gpu.upload_to_vram(&buf_v, 0, &wv)?;
-                total_weight_bytes += (fused_qk.len() + wv.len()) as u64;
-                let va_qk = buf_qk.va_addr;
-                let va_v = buf_v.va_addr;
-                owned_vram.push(buf_qk);
-                owned_vram.push(buf_v);
-                let bqk_rel = fuse_biases(&[(&bq, oq), (&bk, ok)])
-                    .map(|v| push_f32_arena(&mut small_arena_bytes, &v));
-                let bv_rel = bv.map(|v| push_f32_arena(&mut small_arena_bytes, &v));
-                (va_qk, tq, bqk_rel, va_v, tv, bv_rel, 1i32)
-            } else {
-                return Err(format!("Layer {} has mismatched Q ({}) and K ({}) types", i, tq, tk));
-            };
-
-            let (wo, to_t, _, _) = extract_quant_weight_bytes(&gguf, &format!("{}.attn_output.weight", p))?;
-            let bo = decode_1d_f32(&gguf, &format!("{}.attn_output.bias", p))?;
-            let buf_o = gpu.alloc_vram(wo.len() as u64)?;
-            gpu.upload_to_vram(&buf_o, 0, &wo)?;
-            total_weight_bytes += wo.len() as u64;
-            let w_o_va = buf_o.va_addr;
-            owned_vram.push(buf_o);
-            let b_o_rel = bo.map(|v| push_f32_arena(&mut small_arena_bytes, &v));
-
-            let (wg, tg, _, _) = extract_quant_weight_bytes(&gguf, &format!("{}.ffn_gate.weight", p))?;
-            let (wu, tu, _, _) = extract_quant_weight_bytes(&gguf, &format!("{}.ffn_up.weight", p))?;
-            let (w_gu_va, gu_type, w_up_va, up_type, split_gu) = if tg == tu {
-                let mut fused_gu = Vec::with_capacity(wg.len() + wu.len());
-                fused_gu.extend_from_slice(&wg);
-                fused_gu.extend_from_slice(&wu);
-                let buf_gu = gpu.alloc_vram(fused_gu.len() as u64)?;
-                gpu.upload_to_vram(&buf_gu, 0, &fused_gu)?;
-                total_weight_bytes += fused_gu.len() as u64;
-                let va = buf_gu.va_addr;
-                owned_vram.push(buf_gu);
-                (va, tg, 0u64, 0i32, 0i32)
-            } else {
-                let buf_g = gpu.alloc_vram(wg.len() as u64)?;
-                gpu.upload_to_vram(&buf_g, 0, &wg)?;
-                let buf_u = gpu.alloc_vram(wu.len() as u64)?;
-                gpu.upload_to_vram(&buf_u, 0, &wu)?;
-                total_weight_bytes += (wg.len() + wu.len()) as u64;
-                let va_g = buf_g.va_addr;
-                let va_u = buf_u.va_addr;
-                owned_vram.push(buf_g);
-                owned_vram.push(buf_u);
-                (va_g, tg, va_u, tu, 1i32)
-            };
-
-            let (wd, td, _, _) = extract_quant_weight_bytes(&gguf, &format!("{}.ffn_down.weight", p))?;
-            let buf_d = gpu.alloc_vram(wd.len() as u64)?;
-            gpu.upload_to_vram(&buf_d, 0, &wd)?;
-            total_weight_bytes += wd.len() as u64;
-            let w_down_va = buf_d.va_addr;
-            owned_vram.push(buf_d);
-
-            let desc = QwenLayerDesc {
-                w_qkv_or_qk: w_qkv_va,
-                w_v: w_v_va,
-                w_o: w_o_va,
-                w_gate_up: w_gu_va,
-                w_up_sep: w_up_va,
-                w_down: w_down_va,
-                kv_cache: kv_slab_va + (i as u64) * kv_layer_bytes,
-                qkv_type,
-                v_type,
-                o_type: to_t,
-                gate_up_type: gu_type,
-                up_sep_type: up_type,
-                down_type: td,
-                split_v,
-                split_gate_up: split_gu,
-                ..Default::default()
-            };
-
-            layer_rels.push(LayerRel {
-                desc,
-                attn_norm_rel,
-                ffn_norm_rel,
-                q_norm_rel,
-                k_norm_rel,
-                b_qkv_rel,
-                b_v_rel,
-                b_o_rel,
-            });
-        }
-
-        // Upload consolidated norm + bias F32 arena in one single DMA!
-        let small_arena_gpu = gpu.alloc_vram(small_arena_bytes.len().max(4096) as u64)?;
-        gpu.upload_to_vram(&small_arena_gpu, 0, &small_arena_bytes)?;
-        let arena_va = small_arena_gpu.va_addr;
-        owned_vram.push(small_arena_gpu);
-
-        let mut layers_host = Vec::with_capacity(cfg.num_layers);
-        for lr in layer_rels {
-            let mut d = lr.desc;
-            d.attn_norm_w = arena_va + lr.attn_norm_rel;
-            d.ffn_norm_w = arena_va + lr.ffn_norm_rel;
-            d.q_norm_w = lr.q_norm_rel.map_or(0, |r| arena_va + r);
-            d.k_norm_w = lr.k_norm_rel.map_or(0, |r| arena_va + r);
-            d.b_qkv_or_qk = lr.b_qkv_rel.map_or(0, |r| arena_va + r);
-            d.b_v = lr.b_v_rel.map_or(0, |r| arena_va + r);
-            d.b_o = lr.b_o_rel.map_or(0, |r| arena_va + r);
-            layers_host.push(d);
-        }
-
-        let layers_bytes = unsafe {
-            std::slice::from_raw_parts(
-                layers_host.as_ptr() as *const u8,
-                layers_host.len() * std::mem::size_of::<QwenLayerDesc>(),
-            )
-        };
-        let layers_gpu = gpu.alloc_vram(layers_bytes.len() as u64)?;
-        gpu.upload_to_vram(&layers_gpu, 0, layers_bytes)?;
-        let layers_ptr_va = layers_gpu.va_addr;
-
-        // Allocate L2/VRAM scratch buffers
-        let q_dim = cfg.n_heads * cfg.head_dim;
-        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
-        let max_k = cfg.dim.max(q_dim).max(cfg.hidden_dim);
-
-        let ws_x_res = gpu.alloc_vram((PREFILL_MAX_CHUNK * cfg.dim * 4) as u64)?;
-        let ws_x_res2 = gpu.alloc_vram((PREFILL_MAX_CHUNK * cfg.dim * 4) as u64)?;
-        let ws_xq = gpu.alloc_vram((PREFILL_MAX_CHUNK * max_k) as u64)?;
-        let ws_xds = gpu.alloc_vram((PREFILL_MAX_CHUNK * (max_k / 32) * 8) as u64)?;
-        let ws_qkv = gpu.alloc_vram((PREFILL_MAX_CHUNK * (q_dim + 2 * kv_dim) * 4) as u64)?;
-        let ws_v_sep = gpu.alloc_vram((PREFILL_MAX_CHUNK * kv_dim * 4) as u64)?;
-        let ws_q_roped = gpu.alloc_vram((PREFILL_MAX_CHUNK * q_dim * 4) as u64)?;
-        let ws_attn_out = gpu.alloc_vram((PREFILL_MAX_CHUNK * q_dim * 4) as u64)?;
-        let ws_gate_up = gpu.alloc_vram((PREFILL_MAX_CHUNK * 2 * cfg.hidden_dim * 4) as u64)?;
-        let ws_cta_val = gpu.alloc_vram(4 * 128 * 4)?;
-        let ws_cta_idx = gpu.alloc_vram(4 * 128 * 4)?;
-        let ws_bar_state = gpu.alloc_vram(4096)?;
-        gpu.zero_vram(&ws_bar_state)?;
-        let ws_embed_pool = gpu.alloc_vram((EMBED_MAX_POOL_ROWS * cfg.dim * 4) as u64)?;
-        let ws_pool_acc = gpu.alloc_vram(((cfg.dim * 4) as u64).max(4096))?;
-        let ws_pool_norm = gpu.alloc_vram(((cfg.dim * 4) as u64).max(4096))?;
-        let zero_bf16_gpu = gpu.alloc_vram(((cfg.dim * 4 * 2) as u64).max(4096))?;
-        gpu.zero_vram(&zero_bf16_gpu)?;
-
-        let cta_val_va = ws_cta_val.va_addr;
-        let cta_idx_va = ws_cta_idx.va_addr;
-        owned_vram.push(ws_cta_val);
-        owned_vram.push(ws_cta_idx);
-
-        // Stop token IDs (up to 4)
-        let mut sids: Vec<i32> = cfg.stop_ids.iter().copied().collect();
-        sids.sort_unstable();
-        while sids.len() < 4 {
-            sids.push(cfg.eos_id);
-        }
-
-        let ctrl_buf = gpu.alloc_host_mapped(std::mem::size_of::<QwenDecodeCtrl>())?;
-        let prefill_toks_buf = gpu.alloc_host_mapped(PREFILL_MAX_CHUNK * 4)?;
-        let embed_out_buf = gpu.alloc_host_mapped((cfg.dim * 4).max(4096))?;
-        let embed_in_buf = gpu.alloc_host_mapped((cfg.dim * 4).max(4096))?;
-        let logits_out_buf = gpu.alloc_host_mapped((cfg.vocab_size * 4).max(4096))?;
-        let hooks_out_buf = gpu.alloc_host_mapped(((1 + 2 * cfg.num_layers) * cfg.dim * 4).max(4096))?;
-        let mlp_kv_buf = gpu.alloc_host_mapped(MLP_KV_HOST_BUF_BYTES)?;
-
-        let mdesc = QwenModelDesc {
-            layers_ptr: layers_ptr_va,
-            emb_w: emb_gpu_va,
-            output_norm_w: arena_va + out_norm_rel,
-            lm_head_w: lm_head_va,
-            freqs_cis: freqs_cis_gpu.va_addr,
-            ws_x_res: ws_x_res.va_addr,
-            ws_x_res2: ws_x_res2.va_addr,
-            ws_xq: ws_xq.va_addr,
-            ws_xds: ws_xds.va_addr,
-            ws_qkv: ws_qkv.va_addr,
-            ws_q_roped: ws_q_roped.va_addr,
-            ws_gate_up: ws_gate_up.va_addr,
-            ws_cta_val: cta_val_va,
-            ws_cta_idx: cta_idx_va,
-            ws_bar_state: ws_bar_state.va_addr,
-            num_layers: cfg.num_layers as i32,
-            dim: cfg.dim as i32,
-            hidden_dim: cfg.hidden_dim as i32,
-            n_heads: cfg.n_heads as i32,
-            n_kv_heads: cfg.n_kv_heads as i32,
-            head_dim: cfg.head_dim as i32,
-            rope_dim: cfg.rope_dim as i32,
-            vocab_size: cfg.vocab_size as i32,
-            max_ctx: kv_alloc_ctx as i32,
-            has_qk_norm: i32::from(cfg.has_qk_norm),
-            emb_type,
-            lm_head_type,
-            norm_eps: cfg.norm_eps,
-            inv_sqrt_head_dim: 1.0 / (cfg.head_dim as f32).sqrt(),
-            stop_id0: sids[0],
-            stop_id1: sids[1],
-            stop_id2: sids[2],
-            stop_id3: sids[3],
-            ws_ext_embed: 0,
-            ws_hidden_last: embed_out_buf.va_addr,
-            ws_logits_out: logits_out_buf.va_addr,
-            _pad_model: 0,
-        };
-        let mdesc_bytes = unsafe {
-            std::slice::from_raw_parts(&mdesc as *const QwenModelDesc as *const u8, std::mem::size_of::<QwenModelDesc>())
-        };
-        let model_desc_gpu = gpu.alloc_vram(4096)?;
-        gpu.upload_to_vram(&model_desc_gpu, 0, mdesc_bytes)?;
-
-        let output_norm_va = arena_va + out_norm_rel;
-        let unit_l2_va = arena_va + unit_l2_rel;
-
-        let dma_gbps = (total_weight_bytes as f64 / 1e9) / t_upload.elapsed().as_secs_f64();
-        eprintln!(
-            "[qwen-nv] Loaded '{}' ({:.2} GB weights @ {:.2} GB/s DMA, {} layers, ctx={}, thinking_tmpl={}) in {:.2}s",
-            cfg.model_name,
-            total_weight_bytes as f64 / 1e9,
-            dma_gbps,
-            cfg.num_layers,
-            cfg.max_ctx,
-            cfg.thinking_template,
-            t0.elapsed().as_secs_f64()
-        );
-
-        let num_layers_cfg = cfg.num_layers;
-        let default_crossover = if cfg.dim > 2560 {
-            DEFAULT_SPEC_CROSSOVER_8B
-        } else {
-            DEFAULT_SPEC_CROSSOVER_4B
-        };
-
+    pub fn load(gpu: &mut NvGpu, model_ref: &str, max_context: usize) -> Result<Self, String> {
+        let v = load_qwen_vram(gpu, model_ref, max_context)?;
         Ok(Self {
-            gpu,
-            module,
-            cfg,
-            tok,
+            module: v.module,
+            cfg: v.cfg,
+            tok: v.tok,
             model_ref: model_ref.to_string(),
-            _owned_vram: owned_vram,
-            layers_host,
-            layers_gpu,
-            model_desc_gpu,
-            lora_arena: None,
-            lora_descs_host: vec![QwenLayerLoraDesc::default(); num_layers_cfg],
-            cached_lora_state: None,
-            topic_lora_pool: None,
-            topic_lora_slots: vec![None; TOPIC_LORA_NUM_SLOTS],
-            topic_lora_clock: 0,
-            lora_status: LoraStatus::default(),
-            tts: None,
-            asr: None,
+            _owned_vram: v.owned_vram,
+            layers_host: v.layers_host,
+            layers_gpu: v.layers_gpu,
+            model_desc_gpu: v.model_desc_gpu,
+            lora_mgr: QwenLoraArena::new(v.num_layers_cfg),
             rag_db: None,
             topic_bank: None,
             drafter: None,
-            ws_x_res,
-            ws_x_res2,
-            ws_xq,
-            ws_xds,
-            ws_qkv,
-            ws_v_sep,
-            ws_q_roped,
-            ws_attn_out,
-            ws_gate_up,
-            ws_bar_state,
-            ws_embed_pool,
-            ws_pool_acc,
-            ws_pool_norm,
-            zero_bf16_gpu,
-            freqs_cis_gpu,
-            output_norm_va,
-            unit_l2_va,
-            emb_gpu_va,
-            emb_type,
-            ctrl_buf,
-            prefill_toks_buf,
-            embed_out_buf,
-            embed_in_buf,
-            logits_out_buf,
-            hooks_out_buf,
-            mlp_kv_buf,
+            ws_x_res: v.ws_x_res,
+            ws_x_res2: v.ws_x_res2,
+            ws_xq: v.ws_xq,
+            ws_xds: v.ws_xds,
+            ws_qkv: v.ws_qkv,
+            ws_v_sep: v.ws_v_sep,
+            ws_q_roped: v.ws_q_roped,
+            ws_attn_out: v.ws_attn_out,
+            ws_gate_up: v.ws_gate_up,
+            ws_bar_state: v.ws_bar_state,
+            ws_embed_pool: v.ws_embed_pool,
+            ws_pool_acc: v.ws_pool_acc,
+            ws_pool_norm: v.ws_pool_norm,
+            zero_bf16_gpu: v.zero_bf16_gpu,
+            freqs_cis_gpu: v.freqs_cis_gpu,
+            output_norm_va: v.output_norm_va,
+            unit_l2_va: v.unit_l2_va,
+            emb_gpu_va: v.emb_gpu_va,
+            emb_type: v.emb_type,
+            ctrl_buf: v.ctrl_buf,
+            prefill_toks_buf: v.prefill_toks_buf,
+            embed_out_buf: v.embed_out_buf,
+            embed_in_buf: v.embed_in_buf,
+            logits_out_buf: v.logits_out_buf,
+            hooks_out_buf: v.hooks_out_buf,
+            mlp_kv_buf: v.mlp_kv_buf,
             cached_kv_tokens: Vec::new(),
             spec_crossover_pos: std::env::var("QWEN_NV_SPEC_CROSSOVER")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(default_crossover),
+                .unwrap_or(v.default_crossover),
             rng_counter: 0x2026_1118_cafe_babe,
         })
+    }
+
+    #[inline]
+    pub fn model_ref(&self) -> &str {
+        &self.model_ref
+    }
+
+    #[inline]
+    pub fn model_name(&self) -> &str {
+        &self.cfg.model_name
+    }
+
+    #[inline]
+    pub fn lora_status_json(&self) -> String {
+        self.lora_mgr.status_json()
+    }
+
+    pub fn encode_raw_prompt(&self, raw: &str) -> Vec<i32> {
+        let mut v = Vec::new();
+        if let Some(bos) = self.cfg.bos_id {
+            v.push(bos);
+        }
+        v.extend(self.tok.encode(raw));
+        v
+    }
+
+    #[inline]
+    pub fn decode_tokens(&self, ids: &[i32]) -> String {
+        self.tok.decode(ids)
+    }
+
+    pub fn rag_status_json(&self, load_ms_opt: Option<f64>) -> String {
+        match self.rag_db {
+            Some(ref db) => db.status_json(load_ms_opt),
+            None => "{\"active\":false,\"num_docs\":0}".to_string(),
+        }
+    }
+
+    pub fn drafter_status_json(&self, load_ms_opt: Option<f64>) -> String {
+        match self.drafter {
+            Some(ref dr) => dr.status_json(load_ms_opt),
+            None => "{\"active\":false}".to_string(),
+        }
+    }
+
+    pub fn topic_status_json(&self, active_lora_json: &str) -> String {
+        let (used_slots, max_slots, embed_pinned) = self.lora_cache_summary();
+        if let Some((ref dir, ref man)) = self.topic_bank {
+            format!(
+                "{{\"active\":true,\"bank_dir\":\"{}\",\"num_topics\":{},\"router_qvec\":\"{}\",\"min_score\":{:.4},\"system_prompt\":\"{}\",\"cached_topic_slots\":{},\"max_topic_slots\":{},\"embed_lora_pinned\":{},\"active_lora\":{}}}",
+                json_esc(dir),
+                man.topics.len(),
+                json_esc(&man.router_qvec),
+                man.min_score,
+                json_esc(&man.system_prompt),
+                used_slots,
+                max_slots,
+                embed_pinned,
+                active_lora_json
+            )
+        } else {
+            format!(
+                "{{\"active\":false,\"num_topics\":0,\"cached_topic_slots\":{},\"max_topic_slots\":{},\"embed_lora_pinned\":{},\"active_lora\":{}}}",
+                used_slots,
+                max_slots,
+                embed_pinned,
+                active_lora_json
+            )
+        }
+    }
+
+    pub fn topic_list_json(&self) -> String {
+        if let Some((_, ref man)) = self.topic_bank {
+            let items: Vec<String> = man
+                .topics
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{{\"title\":\"{}\",\"slug\":\"{}\",\"num_facts\":{},\"rank\":{},\"mean_fit_err\":{:.6},\"kl_nats\":{:.6}}}",
+                        json_esc(&t.title),
+                        json_esc(&t.slug),
+                        t.num_facts,
+                        t.rank,
+                        t.mean_fit_err,
+                        t.kl_nats
+                    )
+                })
+                .collect();
+            format!("[{}]", items.join(","))
+        } else {
+            "[]".to_string()
+        }
     }
 
     pub fn reset_cache(&mut self) {
@@ -774,308 +319,35 @@ impl QwenMegakernelEngine {
     // Dynamic Fused Rank-r (`r <= 32`) LoRA Hot-Swap (`< 1 ms` VRAM update!)
     // -------------------------------------------------------------------------
 
-    fn upload_layers_host_to_gpu(&mut self) -> Result<(), String> {
-        let layers_bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.layers_host.as_ptr() as *const u8,
-                self.layers_host.len() * std::mem::size_of::<QwenLayerDesc>(),
-            )
-        };
-        let layers_buf = VramBuffer {
-            va_addr: self.layers_gpu.va_addr,
-            size: self.layers_gpu.size,
-            paddrs: self.layers_gpu.paddrs.clone(),
-        };
-        self.gpu.upload_to_vram(&layers_buf, 0, layers_bytes)
-    }
-
     pub fn lora_cache_summary(&self) -> (usize, usize, bool) {
-        let used_slots = self.topic_lora_slots.iter().filter(|s| s.is_some()).count();
-        (used_slots, TOPIC_LORA_NUM_SLOTS, self.cached_lora_state.is_some())
+        self.lora_mgr.cache_summary()
     }
 
-    pub fn load_lora(&mut self, path: &str, user_scale: f32) -> Result<LoraStatus, String> {
-        let st_fp = adapter_file_fingerprint(path);
-
-        // 1. Check `topic_lora_slots` LRU cache (`<= 8 MB` adapters, ~44 us pointer flip!)
-        if self.topic_lora_pool.is_some() {
-            if let Some(hit_idx) = self.topic_lora_slots.iter().position(|slot_opt| {
-                slot_opt.as_ref().map_or(false, |s| {
-                    s.path == path
-                        && (s.user_scale - user_scale).abs() < 1e-6
-                        && s.fingerprint == st_fp
-                })
-            }) {
-                let t_swap = Instant::now();
-                self.topic_lora_clock = self.topic_lora_clock.wrapping_add(1);
-                let clk = self.topic_lora_clock;
-                let (ptrs, descs, mut st) = {
-                    let slot = self.topic_lora_slots[hit_idx].as_mut().unwrap();
-                    slot.last_used = clk;
-                    (slot.ptrs.clone(), slot.descs.clone(), slot.status.clone())
-                };
-                for l in 0..self.cfg.num_layers {
-                    self.layers_host[l].lora_ptr = ptrs[l];
-                }
-                self.lora_descs_host = descs;
-                self.upload_layers_host_to_gpu()?;
-                self.reset_cache();
-                st.active = true;
-                st.swap_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
-                self.lora_status = st.clone();
-                return Ok(st);
-            }
-        }
-
-        // 2. Check pinned large-adapter cache (`> 8 MB`, e.g. `126 MB` Retrieval SVD LoRA)
-        if self.lora_arena.is_some() {
-            let cached_hit = self.cached_lora_state.as_ref().and_then(
-                |(c_path, c_scale, c_descs, c_ptrs, c_meta)| {
-                    if c_path == path && (*c_scale - user_scale).abs() < 1e-6 {
-                        Some((c_descs.clone(), c_ptrs.clone(), c_meta.clone()))
-                    } else {
-                        None
-                    }
-                },
-            );
-            if let Some((c_descs, c_ptrs, mut st)) = cached_hit {
-                let t_swap = Instant::now();
-                for l in 0..self.cfg.num_layers {
-                    self.layers_host[l].lora_ptr = c_ptrs[l];
-                }
-                self.lora_descs_host = c_descs;
-                self.upload_layers_host_to_gpu()?;
-                self.reset_cache();
-                st.active = true;
-                st.swap_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
-                self.lora_status = st.clone();
-                return Ok(st);
-            }
-        }
-
-        let q_dim = self.cfg.n_heads * self.cfg.head_dim;
-        let kv_dim = self.cfg.n_kv_heads * self.cfg.head_dim;
-        let mut prep = prepare_lora_from_path(
+    pub fn load_lora(&mut self, gpu: &mut NvGpu, path: &str, user_scale: f32) -> Result<LoraStatus, String> {
+        let st = self.lora_mgr.load_adapter(
+            gpu,
+            &self.cfg,
+            &self.layers_gpu,
+            &mut self.layers_host,
             path,
             user_scale,
-            self.cfg.num_layers,
-            self.cfg.dim,
-            self.cfg.hidden_dim,
-            q_dim,
-            kv_dim,
         )?;
+        self.reset_cache();
+        Ok(st)
+    }
 
-        let desc_sz = std::mem::size_of::<QwenLayerLoraDesc>();
-        let patch_and_set_ptrs = |layer_descs: &mut [QwenLayerLoraDesc],
-                                  arena_bytes: &mut [u8],
-                                  layers_host: &mut [QwenLayerDesc],
-                                  arena_va: u64| {
-            for (l, ld_lora) in layer_descs.iter_mut().enumerate() {
-                for p in &mut ld_lora.projs {
-                    if p.rank > 0 {
-                        p.a_f16 += arena_va;
-                        p.b_f16 += arena_va;
-                    }
-                }
-                let src = unsafe {
-                    std::slice::from_raw_parts(ld_lora as *const QwenLayerLoraDesc as *const u8, desc_sz)
-                };
-                arena_bytes[l * desc_sz..(l + 1) * desc_sz].copy_from_slice(src);
-                layers_host[l].lora_ptr = if ld_lora.active_mask != 0 {
-                    arena_va + (l * desc_sz) as u64
-                } else {
-                    0
-                };
-            }
-        };
-
-        // 3A. Small Topic LoRA (`<= 8 MB`): upload into pre-allocated `topic_lora_pool` slot without evicting `lora_arena`!
-        if (prep.arena_bytes.len() as u64) <= TOPIC_LORA_SLOT_BYTES {
-            if self.topic_lora_pool.is_none() {
-                self.topic_lora_pool = Some(
-                    self.gpu
-                        .alloc_vram(TOPIC_LORA_SLOT_BYTES * (TOPIC_LORA_NUM_SLOTS as u64))?,
-                );
-            }
-            let slot_idx = if let Some(empty_i) = self.topic_lora_slots.iter().position(|s| s.is_none()) {
-                empty_i
-            } else {
-                self.topic_lora_slots
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, s)| s.as_ref().map_or(0, |c| c.last_used))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            };
-
-            let t_swap = Instant::now();
-            let pool_ref = self.topic_lora_pool.as_ref().unwrap();
-            let slot_offset = (slot_idx as u64) * TOPIC_LORA_SLOT_BYTES;
-            let arena_va = pool_ref.va_addr + slot_offset;
-            let pool_buf = VramBuffer {
-                va_addr: pool_ref.va_addr,
-                size: pool_ref.size,
-                paddrs: pool_ref.paddrs.clone(),
-            };
-
-            patch_and_set_ptrs(
-                &mut prep.layer_descs,
-                &mut prep.arena_bytes,
-                &mut self.layers_host,
-                arena_va,
-            );
-            self.gpu.upload_to_vram(&pool_buf, slot_offset, &prep.arena_bytes)?;
-            self.upload_layers_host_to_gpu()?;
-            self.reset_cache();
-
-            let swap_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
-            let saved_ptrs: Vec<u64> = self.layers_host.iter().map(|ld| ld.lora_ptr).collect();
-            self.lora_descs_host = prep.layer_descs;
-            self.lora_status = LoraStatus {
-                active: true,
-                path: path.to_string(),
-                rank: prep.rank,
-                alpha: prep.alpha,
-                scale: prep.scale,
-                num_adapted_tensors: prep.num_adapted_tensors,
-                vram_bytes: prep.arena_bytes.len(),
-                swap_ms,
-            };
-            self.topic_lora_clock = self.topic_lora_clock.wrapping_add(1);
-            self.topic_lora_slots[slot_idx] = Some(CachedTopicSlot {
-                path: path.to_string(),
-                user_scale,
-                fingerprint: st_fp,
-                last_used: self.topic_lora_clock,
-                descs: self.lora_descs_host.clone(),
-                ptrs: saved_ptrs,
-                status: self.lora_status.clone(),
-            });
-            return Ok(self.lora_status.clone());
-        }
-
-        // 3B. Large adapter (`> 8 MB`, e.g. `126 MB` Retrieval SVD LoRA): upload to `self.lora_arena`
-        let need_bytes = (prep.arena_bytes.len() as u64).max(LORA_ARENA_DEFAULT_BYTES);
-        let need_realloc = self.lora_arena.as_ref().map_or(true, |b| b.size < need_bytes);
-        if need_realloc {
-            self.lora_arena = Some(self.gpu.alloc_vram(need_bytes)?);
-        }
-        let t_swap = Instant::now();
-        let arena_va = self.lora_arena.as_ref().unwrap().va_addr;
-        patch_and_set_ptrs(
-            &mut prep.layer_descs,
-            &mut prep.arena_bytes,
+    pub fn clear_lora(&mut self, gpu: &mut NvGpu) -> Result<LoraStatus, String> {
+        let st = self.lora_mgr.clear(
+            gpu,
+            self.cfg.num_layers,
+            &self.layers_gpu,
             &mut self.layers_host,
-            arena_va,
-        );
-
-        let arena_ref = self.lora_arena.as_ref().unwrap();
-        let arena_buf = VramBuffer {
-            va_addr: arena_ref.va_addr,
-            size: arena_ref.size,
-            paddrs: arena_ref.paddrs.clone(),
-        };
-        self.gpu.upload_to_vram(&arena_buf, 0, &prep.arena_bytes)?;
-        self.upload_layers_host_to_gpu()?;
+        )?;
         self.reset_cache();
-
-        let swap_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
-        let saved_ptrs: Vec<u64> = self.layers_host.iter().map(|ld| ld.lora_ptr).collect();
-        self.lora_descs_host = prep.layer_descs;
-        self.lora_status = LoraStatus {
-            active: true,
-            path: path.to_string(),
-            rank: prep.rank,
-            alpha: prep.alpha,
-            scale: prep.scale,
-            num_adapted_tensors: prep.num_adapted_tensors,
-            vram_bytes: prep.arena_bytes.len(),
-            swap_ms,
-        };
-        self.cached_lora_state = Some((
-            path.to_string(),
-            user_scale,
-            self.lora_descs_host.clone(),
-            saved_ptrs,
-            self.lora_status.clone(),
-        ));
-        Ok(self.lora_status.clone())
-    }
-
-    pub fn clear_lora(&mut self) -> Result<LoraStatus, String> {
-        let t_swap = Instant::now();
-        for l in 0..self.cfg.num_layers {
-            self.layers_host[l].lora_ptr = 0;
-            self.lora_descs_host[l] = QwenLayerLoraDesc::default();
-        }
-        self.upload_layers_host_to_gpu()?;
-        self.reset_cache();
-        let swap_ms = t_swap.elapsed().as_secs_f64() * 1000.0;
-        self.lora_status = LoraStatus {
-            active: false,
-            swap_ms,
-            ..Default::default()
-        };
-        Ok(self.lora_status.clone())
+        Ok(st)
     }
 
     // -------------------------------------------------------------------------
-    // Co-Resident 100%-on-RTX-3080 `Qwen3-TTS-12Hz-1.7B` Engine
-    // -------------------------------------------------------------------------
-
-    pub fn ensure_tts_loaded(&mut self, talker_ref: &str) -> Result<(), String> {
-        let eff_ref = if talker_ref.trim().is_empty() { "1.7b" } else { talker_ref.trim() };
-        if let Some(ref existing) = self.tts {
-            if existing.talker_ref == eff_ref {
-                return Ok(());
-            }
-        }
-        let tts_engine = QwenTtsEngine::load(&mut self.gpu, eff_ref, None)?;
-        self.tts = Some(tts_engine);
-        Ok(())
-    }
-
-    pub fn synthesize_speech<F>(
-        &mut self,
-        talker_ref: &str,
-        params: &TtsSynthParams,
-        cancel: Option<&std::sync::atomic::AtomicBool>,
-        on_chunk: F,
-    ) -> Result<(Vec<f32>, TtsStats), String>
-    where
-        F: FnMut(&[f32]) -> bool,
-    {
-        self.ensure_tts_loaded(talker_ref)?;
-        let tts = self.tts.as_mut().unwrap();
-        tts.synthesize(&mut self.gpu, &self.module, params, cancel, on_chunk)
-    }
-
-    // -------------------------------------------------------------------------
-    // Co-Resident 100%-on-RTX-3080 `Qwen3-ASR-1.7B` Speech-to-Text Engine
-    // -------------------------------------------------------------------------
-
-    pub fn ensure_asr_loaded(&mut self, asr_ref: &str) -> Result<(), String> {
-        let eff_ref = if asr_ref.trim().is_empty() { "1.7b" } else { asr_ref.trim() };
-        if let Some(ref existing) = self.asr {
-            if existing.asr_ref == eff_ref {
-                return Ok(());
-            }
-        }
-        let asr_engine = QwenAsrEngine::load(&mut self.gpu, eff_ref)?;
-        self.asr = Some(asr_engine);
-        Ok(())
-    }
-
-    pub fn transcribe_audio(
-        &mut self,
-        asr_ref: &str,
-        pcm_16k: &[f32],
-        language_hint: Option<&str>,
-    ) -> Result<AsrStats, String> {
-        self.ensure_asr_loaded(asr_ref)?;
-        let asr = self.asr.as_mut().unwrap();
-        asr.transcribe(&mut self.gpu, &self.module, pcm_16k, language_hint)
-    }
 
     pub fn encode_chat(&self, messages: &[(String, String)], enable_thinking: bool) -> Vec<i32> {
         let mut ids = Vec::new();
@@ -1108,18 +380,18 @@ impl QwenMegakernelEngine {
         ids
     }
 
-    pub fn ensure_drafter_loaded(&mut self, draft_ref: &str) -> Result<(), String> {
+    pub fn ensure_drafter_loaded(&mut self, gpu: &mut NvGpu, draft_ref: &str) -> Result<(), String> {
         let eff_ref = if draft_ref.trim().is_empty() {
             "qwen3:0.6b"
         } else {
             draft_ref.trim()
         };
         if let Some(ref existing) = self.drafter {
-            if existing.model_ref == eff_ref {
+            if existing.model_ref() == eff_ref {
                 return Ok(());
             }
         }
-        let d = QwenNeuralDrafter::load(&mut self.gpu, eff_ref, self.cfg.max_ctx)?;
+        let d = QwenNeuralDrafter::load(gpu, eff_ref, self.cfg.max_ctx)?;
         self.drafter = Some(d);
         Ok(())
     }
@@ -1128,15 +400,11 @@ impl QwenMegakernelEngine {
         self.drafter = None;
     }
 
-    pub fn load_drafter_prior(&mut self, prior_path: &std::path::Path) -> Result<(usize, usize), String> {
+    pub fn load_drafter_prior(&mut self, gpu: &mut NvGpu, prior_path: &std::path::Path) -> Result<(usize, usize), String> {
         if self.drafter.is_none() {
-            self.ensure_drafter_loaded("qwen3:0.6b")?;
+            self.ensure_drafter_loaded(gpu, "qwen3:0.6b")?;
         }
-        let prior = CalibratedNgramPrior::load_bin(prior_path)?;
-        let n5 = prior.map5.len();
-        let n4 = prior.map4.len();
-        self.drafter.as_mut().unwrap().calibrated_prior = Some(prior);
-        Ok((n5, n4))
+        self.drafter.as_mut().unwrap().load_prior(prior_path)
     }
 
     fn common_prefix_len(&self, prompt_without_last: &[i32]) -> usize {
@@ -1153,6 +421,7 @@ impl QwenMegakernelEngine {
     ///   (`t_len - 1`) layer-by-layer to `h_va` in snooped host memory (`0` extra VRAM!).
     fn run_prefill_chunk(
         &mut self,
+        gpu: &mut NvGpu,
         chunk: &[i32],
         start_pos: usize,
         capture_norm_out_va: Option<u64>,
@@ -1169,14 +438,14 @@ impl QwenMegakernelEngine {
             }
         }
 
-        let k_embed = &self.module.kernels["qwen_prefill_embed"];
-        let k_rms = &self.module.kernels["qwen_prefill_rmsnorm_q8_1"];
-        let k_gemm = &self.module.kernels["qwen_prefill_gemm"];
-        let k_lora = &self.module.kernels["qwen_prefill_lora_add"];
-        let k_qknorm = &self.module.kernels["qwen_prefill_qknorm_rope_kv"];
-        let k_flash = &self.module.kernels["qwen_prefill_flash_gqa"];
-        let k_quant = &self.module.kernels["qwen_prefill_quant_q8_1"];
-        let k_swiglu = &self.module.kernels["qwen_prefill_swiglu_q8_1"];
+        let k_embed = self.module.kernel("qwen_prefill_embed")?;
+        let k_rms = self.module.kernel("qwen_prefill_rmsnorm_q8_1")?;
+        let k_gemm = self.module.kernel("qwen_prefill_gemm")?;
+        let k_lora = self.module.kernel("qwen_prefill_lora_add")?;
+        let k_qknorm = self.module.kernel("qwen_prefill_qknorm_rope_kv")?;
+        let k_flash = self.module.kernel("qwen_prefill_flash_gqa")?;
+        let k_quant = self.module.kernel("qwen_prefill_quant_q8_1")?;
+        let k_swiglu = self.module.kernel("qwen_prefill_swiglu_q8_1")?;
 
         let push_lora_qmd = |gpu: &mut NvGpu,
                              chain: &mut Vec<(u64, usize)>,
@@ -1233,17 +502,17 @@ impl QwenMegakernelEngine {
         put_u64(&mut a_emb, 16, self.prefill_toks_buf.va_addr);
         put_u32(&mut a_emb, 24, dim as u32);
         put_u32(&mut a_emb, 28, self.emb_type as u32);
-        chain.push(self.gpu.prepare_qmd(k_embed, (t_len as u32, 1, 1), (256, 1, 1), &a_emb, None));
+        chain.push(gpu.prepare_qmd(k_embed, (t_len as u32, 1, 1), (256, 1, 1), &a_emb, None));
 
         let last_row_byte_off = ((t_len - 1) * (dim as usize) * 4) as u64;
         let slot_bytes = ((dim as usize) * 4) as u64;
-        let k_copy_f32 = &self.module.kernels["tts_copy_f32"];
+        let k_copy_f32 = self.module.kernel("tts_copy_f32")?;
         if let Some(h_va) = hook_last_token_va {
             let mut a_cp = [0u8; 20];
             put_u64(&mut a_cp, 0, h_va);
             put_u64(&mut a_cp, 8, self.ws_x_res.va_addr + last_row_byte_off);
             put_u32(&mut a_cp, 16, dim as u32);
-            chain.push(self.gpu.prepare_qmd(
+            chain.push(gpu.prepare_qmd(
                 k_copy_f32,
                 (((dim as u32) + 255) / 256, 1, 1),
                 (256, 1, 1),
@@ -1264,7 +533,7 @@ impl QwenMegakernelEngine {
             put_u64(&mut a_rms1, 24, ld.attn_norm_w);
             put_u32(&mut a_rms1, 32, dim as u32);
             put_u32(&mut a_rms1, 36, eps_bits);
-            chain.push(self.gpu.prepare_qmd(k_rms, (t_len as u32, 1, 1), (256, 1, 1), &a_rms1, None));
+            chain.push(gpu.prepare_qmd(k_rms, (t_len as u32, 1, 1), (256, 1, 1), &a_rms1, None));
 
             // QKV or QK + V GEMM
             let qk_n = if ld.split_v == 0 { q_dim + 2 * kv_dim } else { q_dim + kv_dim };
@@ -1279,7 +548,7 @@ impl QwenMegakernelEngine {
             put_u32(&mut a_qk, 52, qk_n as u32);
             put_u32(&mut a_qk, 56, dim as u32);
             put_u32(&mut a_qk, 60, ld.qkv_type as u32);
-            chain.push(self.gpu.prepare_qmd(
+            chain.push(gpu.prepare_qmd(
                 k_gemm,
                 (((qk_n as u32) + 3) / 4, grid_m, 1),
                 (128, 1, 1),
@@ -1299,7 +568,7 @@ impl QwenMegakernelEngine {
                 put_u32(&mut a_v, 52, kv_dim as u32);
                 put_u32(&mut a_v, 56, dim as u32);
                 put_u32(&mut a_v, 60, ld.v_type as u32);
-                chain.push(self.gpu.prepare_qmd(
+                chain.push(gpu.prepare_qmd(
                     k_gemm,
                     (((kv_dim as u32) + 3) / 4, grid_m, 1),
                     (128, 1, 1),
@@ -1308,15 +577,15 @@ impl QwenMegakernelEngine {
                 ));
             }
 
-            if self.lora_status.active && (self.lora_descs_host[l].active_mask & 0x07) != 0 {
-                let ldesc = self.lora_descs_host[l];
+            if self.lora_mgr.is_active() && (self.lora_mgr.layer_desc(l).active_mask & 0x07) != 0 {
+                let ldesc = self.lora_mgr.layer_desc(l);
                 let qk_stride = if ld.split_v == 0 { q_dim + 2 * kv_dim } else { q_dim + kv_dim };
-                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_qkv.va_addr, &ldesc.projs[0], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, qk_stride, 0);
-                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_qkv.va_addr, &ldesc.projs[1], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, qk_stride, q_dim);
+                push_lora_qmd(gpu, &mut chain, self.ws_qkv.va_addr, &ldesc.projs[0], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, qk_stride, 0);
+                push_lora_qmd(gpu, &mut chain, self.ws_qkv.va_addr, &ldesc.projs[1], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, qk_stride, q_dim);
                 if ld.split_v == 0 {
-                    push_lora_qmd(&mut self.gpu, &mut chain, self.ws_qkv.va_addr, &ldesc.projs[2], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, qk_stride, q_dim + kv_dim);
+                    push_lora_qmd(gpu, &mut chain, self.ws_qkv.va_addr, &ldesc.projs[2], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, qk_stride, q_dim + kv_dim);
                 } else {
-                    push_lora_qmd(&mut self.gpu, &mut chain, self.ws_v_sep.va_addr, &ldesc.projs[2], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, kv_dim, 0);
+                    push_lora_qmd(gpu, &mut chain, self.ws_v_sep.va_addr, &ldesc.projs[2], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, kv_dim, 0);
                 }
             }
 
@@ -1339,7 +608,7 @@ impl QwenMegakernelEngine {
             put_u32(&mut a_rope, 84, eps_bits);
             put_u32(&mut a_rope, 88, u32::from(self.cfg.has_qk_norm));
             put_u32(&mut a_rope, 92, ld.split_v as u32);
-            chain.push(self.gpu.prepare_qmd(
+            chain.push(gpu.prepare_qmd(
                 k_qknorm,
                 ((n_heads + 2 * n_kv_heads) as u32, t_len as u32, 1),
                 (256, 1, 1),
@@ -1371,7 +640,7 @@ impl QwenMegakernelEngine {
             put_u32(&mut a_fl, 40, head_dim as u32);
             put_u32(&mut a_fl, 44, max_ctx_i32 as u32);
             put_u32(&mut a_fl, 48, scale_bits);
-            chain.push(self.gpu.prepare_qmd(
+            chain.push(gpu.prepare_qmd(
                 k_flash,
                 (n_heads as u32, t_len as u32, 1),
                 (128, 1, 1),
@@ -1386,7 +655,7 @@ impl QwenMegakernelEngine {
             put_u64(&mut a_q8, 8, self.ws_xds.va_addr);
             put_u64(&mut a_q8, 16, self.ws_attn_out.va_addr);
             put_u32(&mut a_q8, 24, attn_blks as u32);
-            chain.push(self.gpu.prepare_qmd(
+            chain.push(gpu.prepare_qmd(
                 k_quant,
                 (((attn_blks as u32) + 3) / 4, 1, 1),
                 (128, 1, 1),
@@ -1406,23 +675,23 @@ impl QwenMegakernelEngine {
             put_u32(&mut a_wo, 52, dim as u32);
             put_u32(&mut a_wo, 56, q_dim as u32);
             put_u32(&mut a_wo, 60, ld.o_type as u32);
-            chain.push(self.gpu.prepare_qmd(
+            chain.push(gpu.prepare_qmd(
                 k_gemm,
                 (((dim as u32) + 3) / 4, grid_m, 1),
                 (128, 1, 1),
                 &a_wo,
                 None,
             ));
-            if self.lora_status.active && (self.lora_descs_host[l].active_mask & 0x08) != 0 {
-                let p = self.lora_descs_host[l].projs[3];
-                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_x_res2.va_addr, &p, self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, dim, 0);
+            if self.lora_mgr.is_active() && (self.lora_mgr.layer_desc(l).active_mask & 0x08) != 0 {
+                let p = self.lora_mgr.layer_desc(l).projs[3];
+                push_lora_qmd(gpu, &mut chain, self.ws_x_res2.va_addr, &p, self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, dim, 0);
             }
             if let Some(h_va) = hook_last_token_va {
                 let mut a_cp = [0u8; 20];
                 put_u64(&mut a_cp, 0, h_va + ((2 * l + 1) as u64) * slot_bytes);
                 put_u64(&mut a_cp, 8, self.ws_x_res2.va_addr + last_row_byte_off);
                 put_u32(&mut a_cp, 16, dim as u32);
-                chain.push(self.gpu.prepare_qmd(
+                chain.push(gpu.prepare_qmd(
                     k_copy_f32,
                     (((dim as u32) + 255) / 256, 1, 1),
                     (256, 1, 1),
@@ -1439,7 +708,7 @@ impl QwenMegakernelEngine {
             put_u64(&mut a_rms2, 24, ld.ffn_norm_w);
             put_u32(&mut a_rms2, 32, dim as u32);
             put_u32(&mut a_rms2, 36, eps_bits);
-            chain.push(self.gpu.prepare_qmd(k_rms, (t_len as u32, 1, 1), (256, 1, 1), &a_rms2, None));
+            chain.push(gpu.prepare_qmd(k_rms, (t_len as u32, 1, 1), (256, 1, 1), &a_rms2, None));
 
             // Gate+Up GEMM
             let gu_n = 2 * hidden_dim;
@@ -1454,22 +723,22 @@ impl QwenMegakernelEngine {
             put_u32(&mut a_gu, 52, gu_n as u32);
             put_u32(&mut a_gu, 56, dim as u32);
             put_u32(&mut a_gu, 60, ld.gate_up_type as u32);
-            chain.push(self.gpu.prepare_qmd(
+            chain.push(gpu.prepare_qmd(
                 k_gemm,
                 (((gu_n as u32) + 3) / 4, grid_m, 1),
                 (128, 1, 1),
                 &a_gu,
                 None,
             ));
-            if self.lora_status.active && (self.lora_descs_host[l].active_mask & 0x30) != 0 {
-                let ldesc = self.lora_descs_host[l];
-                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_gate_up.va_addr, &ldesc.projs[4], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, gu_n, 0);
-                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_gate_up.va_addr, &ldesc.projs[5], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, gu_n, hidden_dim);
+            if self.lora_mgr.is_active() && (self.lora_mgr.layer_desc(l).active_mask & 0x30) != 0 {
+                let ldesc = self.lora_mgr.layer_desc(l);
+                push_lora_qmd(gpu, &mut chain, self.ws_gate_up.va_addr, &ldesc.projs[4], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, gu_n, 0);
+                push_lora_qmd(gpu, &mut chain, self.ws_gate_up.va_addr, &ldesc.projs[5], self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, gu_n, hidden_dim);
             }
 
             if let Some(spec) = mlp_kv_hook {
                 if let Some(kl_idx) = spec.key_layers.iter().position(|&kl| kl == l) {
-                    let k_c2w_swiglu = &self.module.kernels["c2w_swiglu_f32_kernel"];
+                    let k_c2w_swiglu = self.module.kernel("c2w_swiglu_f32_kernel")?;
                     let out_va = spec.keys_va + ((kl_idx * spec.n_rows * (hidden_dim as usize) * 4) as u64);
                     let gate_up_va = self.ws_gate_up.va_addr + ((spec.row_start * 2 * (hidden_dim as usize) * 4) as u64);
                     let tot_sw = (spec.n_rows * (hidden_dim as usize)) as u32;
@@ -1478,7 +747,7 @@ impl QwenMegakernelEngine {
                     put_u64(&mut a_sw_f32, 8, gate_up_va);
                     put_u32(&mut a_sw_f32, 16, spec.n_rows as u32);
                     put_u32(&mut a_sw_f32, 20, hidden_dim as u32);
-                    chain.push(self.gpu.prepare_qmd(
+                    chain.push(gpu.prepare_qmd(
                         k_c2w_swiglu,
                         ((tot_sw + 255) / 256, 1, 1),
                         (256, 1, 1),
@@ -1496,7 +765,7 @@ impl QwenMegakernelEngine {
             put_u64(&mut a_sw, 16, self.ws_gate_up.va_addr);
             put_u32(&mut a_sw, 24, m_i32 as u32);
             put_u32(&mut a_sw, 28, hidden_dim as u32);
-            chain.push(self.gpu.prepare_qmd(
+            chain.push(gpu.prepare_qmd(
                 k_swiglu,
                 (((ffn_blks as u32) + 3) / 4, 1, 1),
                 (128, 1, 1),
@@ -1516,16 +785,16 @@ impl QwenMegakernelEngine {
             put_u32(&mut a_dn, 52, dim as u32);
             put_u32(&mut a_dn, 56, hidden_dim as u32);
             put_u32(&mut a_dn, 60, ld.down_type as u32);
-            chain.push(self.gpu.prepare_qmd(
+            chain.push(gpu.prepare_qmd(
                 k_gemm,
                 (((dim as u32) + 3) / 4, grid_m, 1),
                 (128, 1, 1),
                 &a_dn,
                 None,
             ));
-            if self.lora_status.active && (self.lora_descs_host[l].active_mask & 0x40) != 0 {
-                let p = self.lora_descs_host[l].projs[6];
-                push_lora_qmd(&mut self.gpu, &mut chain, self.ws_x_res.va_addr, &p, self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, dim, 0);
+            if self.lora_mgr.is_active() && (self.lora_mgr.layer_desc(l).active_mask & 0x40) != 0 {
+                let p = self.lora_mgr.layer_desc(l).projs[6];
+                push_lora_qmd(gpu, &mut chain, self.ws_x_res.va_addr, &p, self.ws_xq.va_addr, self.ws_xds.va_addr, m_i32, dim, 0);
             }
             if is_last_layer {
                 if let Some(spec) = mlp_kv_hook {
@@ -1535,7 +804,7 @@ impl QwenMegakernelEngine {
                     put_u64(&mut a_cp, 0, spec.final_res_va);
                     put_u64(&mut a_cp, 8, src_va);
                     put_u32(&mut a_cp, 16, n_el);
-                    chain.push(self.gpu.prepare_qmd(
+                    chain.push(gpu.prepare_qmd(
                         k_copy_f32,
                         ((n_el + 255) / 256, 1, 1),
                         (256, 1, 1),
@@ -1549,7 +818,7 @@ impl QwenMegakernelEngine {
                 put_u64(&mut a_cp, 0, h_va + ((2 * l + 2) as u64) * slot_bytes);
                 put_u64(&mut a_cp, 8, self.ws_x_res.va_addr + last_row_byte_off);
                 put_u32(&mut a_cp, 16, dim as u32);
-                chain.push(self.gpu.prepare_qmd(
+                chain.push(gpu.prepare_qmd(
                     k_copy_f32,
                     (((dim as u32) + 255) / 256, 1, 1),
                     (256, 1, 1),
@@ -1560,7 +829,7 @@ impl QwenMegakernelEngine {
         }
 
         if let Some(norm_dst_va) = capture_norm_out_va {
-            let k_c2w_rms = &self.module.kernels["c2w_rmsnorm_f32_kernel"];
+            let k_c2w_rms = self.module.kernel("c2w_rmsnorm_f32_kernel")?;
             let mut a_nrm = [0u8; 36];
             put_u64(&mut a_nrm, 0, norm_dst_va);
             put_u64(&mut a_nrm, 8, self.ws_x_res.va_addr);
@@ -1568,7 +837,7 @@ impl QwenMegakernelEngine {
             put_u32(&mut a_nrm, 24, t_len as u32);
             put_u32(&mut a_nrm, 28, dim as u32);
             put_u32(&mut a_nrm, 32, eps_bits);
-            chain.push(self.gpu.prepare_qmd(
+            chain.push(gpu.prepare_qmd(
                 k_c2w_rms,
                 (t_len as u32, 1, 1),
                 (256, 1, 1),
@@ -1577,40 +846,24 @@ impl QwenMegakernelEngine {
             ));
         }
 
-        // Attach timeline release0 to the tail QMD and link the entire chain in hardware!
-        self.gpu.timeline_value += 1;
-        let target_sig = self.gpu.timeline_value;
-        let sig_va = self.gpu.timeline_buf.va_addr;
-        {
-            let (_, last_off) = *chain.last().unwrap();
-            let buf = self.gpu.kernargs_buf_mut_slice_at(last_off);
-            let mut tail_qmd = crate::nv_defs::QmdV3 {
-                bytes: buf[..256].try_into().unwrap(),
-            };
-            tail_qmd.set_release0(sig_va, target_sig);
-            buf[..256].copy_from_slice(&tail_qmd.bytes);
-        }
-
-        for i in 0..(chain.len() - 1) {
-            self.gpu.link_dependent_qmd(chain[i].1, chain[i + 1].0);
-        }
-
-        self.gpu.launch_qmd_chain(chain[0].0, true)?;
-        self.gpu.wait_timeline(target_sig, Duration::from_secs(30))
+        gpu.launch_qmd_chain_sync(&chain, true, Duration::from_secs(30))
     }
 
     /// Generate up to `max_tokens` tokens using the Persistent 68-SM Megakernel (+ optional `BM=4` lossless speculative verify).
+    #[allow(clippy::too_many_arguments)]
     pub fn generate<F>(
         &mut self,
+        gpu: &mut NvGpu,
         prompt_tokens: &[i32],
         max_tokens: usize,
         temperature: f32,
         enable_speculative: bool,
+        crossover_override: Option<usize>,
         external_cancel: Option<&std::sync::atomic::AtomicBool>,
         mut on_token: F,
     ) -> Result<(Vec<i32>, GenerationStats), String>
     where
-        F: FnMut(i32) -> bool,
+        F: FnMut(i32, &[u8]) -> bool,
     {
         if prompt_tokens.is_empty() {
             return Err("prompt_tokens cannot be empty".into());
@@ -1628,7 +881,7 @@ impl QwenMegakernelEngine {
         // 1. Chunked Hardware-Chained Prefill on `prompt_tokens[pos .. prompt_len - 1]`
         while pos < prompt_len - 1 {
             let take = (prompt_len - 1 - pos).min(PREFILL_MAX_CHUNK);
-            self.run_prefill_chunk(&prompt_tokens[pos..pos + take], pos, None, None, None)?;
+            self.run_prefill_chunk(gpu, &prompt_tokens[pos..pos + take], pos, None, None, None)?;
             pos += take;
             launches += 1;
         }
@@ -1640,10 +893,11 @@ impl QwenMegakernelEngine {
         let mut cur_pos = prompt_len - 1;
 
         let use_spec = enable_speculative && temperature <= 1e-6;
-        let eff_crossover = if self.spec_crossover_pos == 0 {
+        let raw_crossover = crossover_override.unwrap_or(self.spec_crossover_pos);
+        let eff_crossover = if raw_crossover == 0 {
             usize::MAX
         } else {
-            self.spec_crossover_pos
+            raw_crossover
         };
         let mut ngram = NgramDraftTable::new();
         if use_spec && cur_pos < eff_crossover {
@@ -1665,7 +919,7 @@ impl QwenMegakernelEngine {
         let num_sms = std::env::var("QWEN_NV_SMS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(self.gpu.active_sms);
+            .unwrap_or(gpu.active_sms);
 
         while out_tokens.len() < max_steps_cap {
             if cur_pos + 1 >= self.cfg.max_ctx {
@@ -1686,14 +940,14 @@ impl QwenMegakernelEngine {
             // Once sequence length reaches `eff_crossover`, automatically hand off to Path B's fused 68-SM persistent T=1 megakernel!
             if use_spec && cur_pos < eff_crossover && rem >= 2 && cur_pos + 4 < self.cfg.max_ctx + PREFILL_MAX_CHUNK {
                 let draft_opt = if let Some(ref mut dr) = self.drafter {
-                    if dr.calibrated_prior.is_some() {
+                    if dr.has_prior() {
                         if let Some(d4) = ngram.lookup_4gram_only(&full_seq) {
                             Some(d4)
                         } else {
-                            dr.draft_k3(&mut self.gpu, &self.module, &full_seq).ok()
+                            dr.draft_k3(gpu, &self.module, &full_seq).ok()
                         }
                     } else {
-                        dr.draft_k3(&mut self.gpu, &self.module, &full_seq).ok()
+                        dr.draft_k3(gpu, &self.module, &full_seq).ok()
                     }
                 } else {
                     ngram.lookup(&full_seq)
@@ -1709,25 +963,14 @@ impl QwenMegakernelEngine {
                     }
                     fence(Ordering::SeqCst);
 
-                    self.gpu.timeline_value += 1;
-                    let sig_val = self.gpu.timeline_value;
-                    let sig_va = self.gpu.timeline_buf.va_addr;
-                    let k_spec = &self.module.kernels["qwen_spec_verify_bm4_megakernel"];
-                    let (qmd_va, _) = self.gpu.prepare_qmd(
-                        k_spec,
-                        (num_sms, 1, 1),
-                        (512, 1, 1),
-                        &mk_args,
-                        Some((sig_va, sig_val)),
-                    );
-                    self.gpu.launch_qmd_chain(qmd_va, true)?;
+                    let k_spec = self.module.kernel("qwen_spec_verify_bm4_megakernel")?;
+                    gpu.launch_kernel_sync(k_spec, (num_sms, 1, 1), (512, 1, 1), &mk_args, true, Duration::from_secs(10))?;
                     launches += 1;
                     spec_verify_calls += 1;
-                    self.gpu.wait_timeline(sig_val, Duration::from_secs(10))?;
 
                     let (err, preds) = unsafe { ((*ctrl_ptr).error_code, (*ctrl_ptr).spec_tokens_out) };
                     if err != 0 {
-                        let _ = self.gpu.zero_vram(&self.ws_bar_state);
+                        let _ = gpu.zero_vram(&self.ws_bar_state);
                         return Err(format!("GPU BM=4 watchdog tripped at barrier step {}", err));
                     }
 
@@ -1752,7 +995,7 @@ impl QwenMegakernelEngine {
                         if k > 0 {
                             spec_accepted_extra += 1;
                         }
-                        if !on_token(yk) {
+                        if !on_token(yk, self.tok.token_bytes(yk)) {
                             stop_reason = "cancelled";
                             hit_stop = true;
                             break;
@@ -1785,24 +1028,13 @@ impl QwenMegakernelEngine {
             }
             fence(Ordering::SeqCst);
 
-            self.gpu.timeline_value += 1;
-            let sig_val = self.gpu.timeline_value;
-            let sig_va = self.gpu.timeline_buf.va_addr;
-            let k_mk = &self.module.kernels["qwen_persistent_decode_megakernel"];
-            let (qmd_va, _) = self.gpu.prepare_qmd(
-                k_mk,
-                (num_sms, 1, 1),
-                (512, 1, 1),
-                &mk_args,
-                Some((sig_va, sig_val)),
-            );
-            self.gpu.launch_qmd_chain(qmd_va, true)?;
+            let k_mk = self.module.kernel("qwen_persistent_decode_megakernel")?;
+            let sig_val = gpu.launch_persistent_async(k_mk, (num_sms, 1, 1), (512, 1, 1), &mk_args, true)?;
             launches += 1;
 
             let mut streamed = 0usize;
             let mut user_aborted = false;
             let mut stop_hit = false;
-            let sig_ptr = self.gpu.timeline_buf.as_ptr() as *const u64;
             let rollout_t0 = Instant::now();
 
             loop {
@@ -1824,7 +1056,7 @@ impl QwenMegakernelEngine {
                         break;
                     }
                     out_tokens.push(next_tok);
-                    if !on_token(next_tok) || external_cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+                    if !on_token(next_tok, self.tok.token_bytes(next_tok)) || external_cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
                         user_aborted = true;
                         stop_reason = "cancelled";
                         unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
@@ -1844,8 +1076,7 @@ impl QwenMegakernelEngine {
                     }
                 }
 
-                let cur_sig = unsafe { std::ptr::read_volatile(sig_ptr) };
-                if cur_sig >= sig_val {
+                if gpu.is_ticket_done(sig_val) {
                     // Drain any final token published right before QMD release0!
                     let final_steps = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).steps_completed) } as usize;
                     while streamed < final_steps && !stop_hit && !user_aborted {
@@ -1863,7 +1094,7 @@ impl QwenMegakernelEngine {
                             break;
                         }
                         out_tokens.push(next_tok);
-                        if !on_token(next_tok) {
+                        if !on_token(next_tok, self.tok.token_bytes(next_tok)) {
                             user_aborted = true;
                             stop_reason = "cancelled";
                             break;
@@ -1877,14 +1108,14 @@ impl QwenMegakernelEngine {
 
                 let err = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).error_code) };
                 if err != 0 {
-                    let _ = self.gpu.wait_timeline(sig_val, Duration::from_secs(1));
-                    let _ = self.gpu.zero_vram(&self.ws_bar_state);
+                    let _ = gpu.wait_timeline(sig_val, Duration::from_secs(1));
+                    let _ = gpu.zero_vram(&self.ws_bar_state);
                     return Err(format!("GPU megakernel barrier watchdog tripped at step {}", err));
                 }
-                self.gpu.poll_gsp_faults()?;
+                gpu.poll_gsp_faults()?;
                 if rollout_t0.elapsed() > Duration::from_secs(120) {
                     unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
-                    self.gpu.poll_gsp_faults()?;
+                    gpu.poll_gsp_faults()?;
                     return Err("Persistent megakernel rollout exceeded 120s timeout".into());
                 }
                 std::hint::spin_loop();
@@ -1930,7 +1161,7 @@ impl QwenMegakernelEngine {
             kernel_launches: launches,
             spec_verify_calls,
             spec_accepted_extra,
-            spec_crossover_pos: self.spec_crossover_pos,
+            spec_crossover_pos: raw_crossover,
             spec_crossover_switched,
             stop_reason,
         };
@@ -1941,24 +1172,8 @@ impl QwenMegakernelEngine {
     // 100%-on-RTX-3080 Same-Model Embeddings & `.qvec` GPU VectorDB (`Phase 5`)
     // -------------------------------------------------------------------------
 
-    fn execute_embed_post_chain(&mut self, chain: &[(u64, usize)]) -> Result<(), String> {
-        self.gpu.timeline_value += 1;
-        let target_sig = self.gpu.timeline_value;
-        let sig_va = self.gpu.timeline_buf.va_addr;
-        {
-            let (_, last_off) = *chain.last().unwrap();
-            let buf = self.gpu.kernargs_buf_mut_slice_at(last_off);
-            let mut tail_qmd = QmdV3 {
-                bytes: buf[..256].try_into().unwrap(),
-            };
-            tail_qmd.set_release0(sig_va, target_sig);
-            buf[..256].copy_from_slice(&tail_qmd.bytes);
-        }
-        for i in 0..(chain.len() - 1) {
-            self.gpu.link_dependent_qmd(chain[i].1, chain[i + 1].0);
-        }
-        self.gpu.launch_qmd_chain(chain[0].0, true)?;
-        self.gpu.wait_timeline(target_sig, Duration::from_secs(10))
+    fn execute_embed_post_chain(&mut self, gpu: &mut NvGpu, chain: &[(u64, usize)]) -> Result<(), String> {
+        gpu.launch_qmd_chain_sync(chain, true, Duration::from_secs(10))
     }
 
     /// Extract a single `L2`-normalized `[dim]` embedding vector **100.0% on the RTX 3080**:
@@ -1969,6 +1184,7 @@ impl QwenMegakernelEngine {
     /// - Writes the final `[dim]` `f32` vector directly into `self.embed_out_buf`.
     pub fn embed_tokens_on_gpu(
         &mut self,
+        gpu: &mut NvGpu,
         token_ids: &[i32],
         pool_start: usize,
         neg_mean_va: Option<u64>,
@@ -2003,15 +1219,15 @@ impl QwenMegakernelEngine {
             } else {
                 None
             };
-            self.run_prefill_chunk(&toks[pos..pos + take], pos, cap_va, None, None)?;
+            self.run_prefill_chunk(gpu, &toks[pos..pos + take], pos, cap_va, None, None)?;
             pos += take;
         }
         self.reset_cache();
 
         // Build 100%-GPU pooling + optional mean-centering + L2-unit-normalization QMD chain
-        let k_copy = &self.module.kernels["tts_copy_f32"];
-        let k_lin_bf16 = &self.module.kernels["c2w_linear_bf16_kernel"];
-        let k_rms_f32 = &self.module.kernels["c2w_rmsnorm_f32_kernel"];
+        let k_copy = self.module.kernel("tts_copy_f32")?;
+        let k_lin_bf16 = self.module.kernel("c2w_linear_bf16_kernel")?;
+        let k_rms_f32 = self.module.kernel("c2w_rmsnorm_f32_kernel")?;
         let l2_eps_bits = (1e-12f32).to_bits();
 
         let mut post_chain = Vec::with_capacity(captured_rows + 4);
@@ -2024,7 +1240,7 @@ impl QwenMegakernelEngine {
             put_u64(&mut a_cp, 0, self.ws_pool_acc.va_addr);
             put_u64(&mut a_cp, 8, self.ws_embed_pool.va_addr);
             put_u32(&mut a_cp, 16, dim as u32);
-            post_chain.push(self.gpu.prepare_qmd(
+            post_chain.push(gpu.prepare_qmd(
                 k_copy,
                 (((dim as u32) + 255) / 256, 1, 1),
                 (256, 1, 1),
@@ -2043,7 +1259,7 @@ impl QwenMegakernelEngine {
                 put_u32(&mut a_add, 48, 1);
                 put_u32(&mut a_add, 52, dim as u32);
                 put_u32(&mut a_add, 56, 4);
-                post_chain.push(self.gpu.prepare_qmd(
+                post_chain.push(gpu.prepare_qmd(
                     k_lin_bf16,
                     (((dim as u32) + 3) / 4, 1, 1),
                     (128, 1, 1),
@@ -2063,7 +1279,7 @@ impl QwenMegakernelEngine {
             put_u32(&mut a_l2_1, 24, 1);
             put_u32(&mut a_l2_1, 28, dim as u32);
             put_u32(&mut a_l2_1, 32, l2_eps_bits);
-            post_chain.push(self.gpu.prepare_qmd(k_rms_f32, (1, 1, 1), (256, 1, 1), &a_l2_1, None));
+            post_chain.push(gpu.prepare_qmd(k_rms_f32, (1, 1, 1), (256, 1, 1), &a_l2_1, None));
 
             // 2. Subtract corpus mean (`ws_pool_acc = ws_pool_norm + (-mu)`)
             let mut a_sub = [0u8; 60];
@@ -2076,7 +1292,7 @@ impl QwenMegakernelEngine {
             put_u32(&mut a_sub, 48, 1);
             put_u32(&mut a_sub, 52, dim as u32);
             put_u32(&mut a_sub, 56, 4);
-            post_chain.push(self.gpu.prepare_qmd(
+            post_chain.push(gpu.prepare_qmd(
                 k_lin_bf16,
                 (((dim as u32) + 3) / 4, 1, 1),
                 (128, 1, 1),
@@ -2092,7 +1308,7 @@ impl QwenMegakernelEngine {
             put_u32(&mut a_l2_2, 24, 1);
             put_u32(&mut a_l2_2, 28, dim as u32);
             put_u32(&mut a_l2_2, 32, l2_eps_bits);
-            post_chain.push(self.gpu.prepare_qmd(k_rms_f32, (1, 1, 1), (256, 1, 1), &a_l2_2, None));
+            post_chain.push(gpu.prepare_qmd(k_rms_f32, (1, 1, 1), (256, 1, 1), &a_l2_2, None));
         } else {
             let mut a_l2 = [0u8; 36];
             put_u64(&mut a_l2, 0, self.embed_out_buf.va_addr);
@@ -2101,10 +1317,10 @@ impl QwenMegakernelEngine {
             put_u32(&mut a_l2, 24, 1);
             put_u32(&mut a_l2, 28, dim as u32);
             put_u32(&mut a_l2, 32, l2_eps_bits);
-            post_chain.push(self.gpu.prepare_qmd(k_rms_f32, (1, 1, 1), (256, 1, 1), &a_l2, None));
+            post_chain.push(gpu.prepare_qmd(k_rms_f32, (1, 1, 1), (256, 1, 1), &a_l2, None));
         }
 
-        self.execute_embed_post_chain(&post_chain)?;
+        self.execute_embed_post_chain(gpu, &post_chain)?;
         fence(Ordering::SeqCst);
 
         let src_ptr = self.embed_out_buf.as_ptr() as *const f32;
@@ -2116,7 +1332,7 @@ impl QwenMegakernelEngine {
     }
 
     /// Center & re-normalize an already `L2`-normalized `[dim]` vector on the RTX 3080 (`u -> L2_norm(u - mu)`).
-    fn center_and_renorm_on_gpu(&mut self, raw_unit: &[f32], neg_mu_va: u64) -> Result<Vec<f32>, String> {
+    fn center_and_renorm_on_gpu(&mut self, gpu: &mut NvGpu, raw_unit: &[f32], neg_mu_va: u64) -> Result<Vec<f32>, String> {
         let dim = self.cfg.dim;
         {
             let dst = self.embed_in_buf.as_mut_slice();
@@ -2126,8 +1342,8 @@ impl QwenMegakernelEngine {
         }
         fence(Ordering::SeqCst);
 
-        let k_lin_bf16 = &self.module.kernels["c2w_linear_bf16_kernel"];
-        let k_rms_f32 = &self.module.kernels["c2w_rmsnorm_f32_kernel"];
+        let k_lin_bf16 = self.module.kernel("c2w_linear_bf16_kernel")?;
+        let k_rms_f32 = self.module.kernel("c2w_rmsnorm_f32_kernel")?;
         let l2_eps_bits = (1e-12f32).to_bits();
 
         let mut chain = Vec::with_capacity(2);
@@ -2141,7 +1357,7 @@ impl QwenMegakernelEngine {
         put_u32(&mut a_sub, 48, 1);
         put_u32(&mut a_sub, 52, dim as u32);
         put_u32(&mut a_sub, 56, 4);
-        chain.push(self.gpu.prepare_qmd(
+        chain.push(gpu.prepare_qmd(
             k_lin_bf16,
             (((dim as u32) + 3) / 4, 1, 1),
             (128, 1, 1),
@@ -2156,9 +1372,9 @@ impl QwenMegakernelEngine {
         put_u32(&mut a_l2, 24, 1);
         put_u32(&mut a_l2, 28, dim as u32);
         put_u32(&mut a_l2, 32, l2_eps_bits);
-        chain.push(self.gpu.prepare_qmd(k_rms_f32, (1, 1, 1), (256, 1, 1), &a_l2, None));
+        chain.push(gpu.prepare_qmd(k_rms_f32, (1, 1, 1), (256, 1, 1), &a_l2, None));
 
-        self.execute_embed_post_chain(&chain)?;
+        self.execute_embed_post_chain(gpu, &chain)?;
         fence(Ordering::SeqCst);
 
         let src_ptr = self.embed_out_buf.as_ptr() as *const f32;
@@ -2171,34 +1387,31 @@ impl QwenMegakernelEngine {
 
     pub fn embed_text(
         &mut self,
+        gpu: &mut NvGpu,
         strategy: EmbedStrategy,
         text: &str,
         is_query: bool,
         lora_path_opt: Option<&str>,
     ) -> Result<(Vec<f32>, f64), String> {
         let t0 = Instant::now();
-        let prev_lora = if self.lora_status.active {
-            Some((self.lora_status.path.clone(), self.lora_status.scale))
-        } else {
-            None
-        };
+        let prev_lora = self
+            .lora_mgr
+            .active_path_and_scale()
+            .map(|(p, sc)| (p.to_string(), sc));
 
         if strategy == EmbedStrategy::SvdLora {
             let lp = lora_path_opt
                 .filter(|s| !s.trim().is_empty())
                 .ok_or("svd_lora strategy requires a LoRA adapter path")?;
             if prev_lora.as_ref().map(|(p, _)| p.as_str()) != Some(lp) {
-                self.load_lora(lp, 1.0)?;
+                self.load_lora(gpu, lp, 1.0)?;
             }
         } else if prev_lora.is_some() && matches!(strategy, EmbedStrategy::Oracle) {
-            self.clear_lora()?;
+            self.clear_lora(gpu)?;
         }
 
         let neg_mu_va = if strategy.uses_corpus_centering() {
-            self.rag_db
-                .as_ref()
-                .filter(|db| db.strategy == strategy)
-                .and_then(|db| db.neg_mean_gpu.as_ref().map(|b| b.va_addr))
+            self.rag_db.as_ref().and_then(|db| db.neg_mean_va(strategy))
         } else {
             None
         };
@@ -2212,18 +1425,18 @@ impl QwenMegakernelEngine {
             is_query,
             max_tok_cap,
         );
-        let res = self.embed_tokens_on_gpu(&tok_ids, pool_start, neg_mu_va);
+        let res = self.embed_tokens_on_gpu(gpu, &tok_ids, pool_start, neg_mu_va);
 
         // Restore prior LoRA state (`<50 us` if toggling back to base Thinker)
         if strategy == EmbedStrategy::SvdLora {
             match prev_lora {
                 Some((old_p, old_s)) => {
-                    if self.lora_status.path != old_p {
-                        let _ = self.load_lora(&old_p, old_s);
+                    if self.lora_mgr.active_path_and_scale().map(|(p, _)| p) != Some(old_p.as_str()) {
+                        let _ = self.load_lora(gpu, &old_p, old_s);
                     }
                 }
                 None => {
-                    let _ = self.clear_lora();
+                    let _ = self.clear_lora(gpu);
                 }
             }
         }
@@ -2235,6 +1448,7 @@ impl QwenMegakernelEngine {
     /// Build a `.qvec` GPU VectorDB from `docs` on the RTX 3080, save to `out_path`, and optionally load it co-resident!
     pub fn build_qvec_index(
         &mut self,
+        gpu: &mut NvGpu,
         docs: &[RagDoc],
         strategy: EmbedStrategy,
         lora_path: &str,
@@ -2242,18 +1456,17 @@ impl QwenMegakernelEngine {
         load_into_vram: bool,
     ) -> Result<(f64, f64), String> {
         let t_start = Instant::now();
-        let prev_lora = if self.lora_status.active {
-            Some((self.lora_status.path.clone(), self.lora_status.scale))
-        } else {
-            None
-        };
+        let prev_lora = self
+            .lora_mgr
+            .active_path_and_scale()
+            .map(|(p, sc)| (p.to_string(), sc));
         if strategy == EmbedStrategy::SvdLora {
             if lora_path.trim().is_empty() {
                 return Err("build_qvec_index with svd_lora requires --lora <ADAPTER_PATH>".into());
             }
-            self.load_lora(lora_path, 1.0)?;
-        } else if self.lora_status.active {
-            self.clear_lora()?;
+            self.load_lora(gpu, lora_path, 1.0)?;
+        } else if self.lora_mgr.is_active() {
+            self.clear_lora(gpu)?;
         }
 
         let dim = self.cfg.dim;
@@ -2271,7 +1484,7 @@ impl QwenMegakernelEngine {
                 false,
                 max_tok_cap,
             );
-            let v = self.embed_tokens_on_gpu(&tok_ids, pool_start, None)?;
+            let v = self.embed_tokens_on_gpu(gpu, &tok_ids, pool_start, None)?;
             raw_vecs.push(v);
             if (idx + 1) % 200 == 0 || idx + 1 == docs.len() {
                 let elapsed = t_start.elapsed().as_secs_f64();
@@ -2288,11 +1501,11 @@ impl QwenMegakernelEngine {
         // Restore prior LoRA state immediately after prefill pass
         match prev_lora {
             Some((old_p, old_s)) => {
-                let _ = self.load_lora(&old_p, old_s);
+                let _ = self.load_lora(gpu, &old_p, old_s);
             }
             None => {
-                if self.lora_status.active {
-                    let _ = self.clear_lora();
+                if self.lora_mgr.is_active() {
+                    let _ = self.clear_lora(gpu);
                 }
             }
         }
@@ -2310,12 +1523,12 @@ impl QwenMegakernelEngine {
             for &m in &mean_f32 {
                 neg_bytes.extend_from_slice(&(-m).to_bits().to_le_bytes());
             }
-            let tmp_neg_gpu = self.gpu.alloc_vram((neg_bytes.len() as u64).max(4096))?;
-            self.gpu.upload_to_vram(&tmp_neg_gpu, 0, &neg_bytes)?;
+            let tmp_neg_gpu = gpu.alloc_vram((neg_bytes.len() as u64).max(4096))?;
+            gpu.upload_to_vram(&tmp_neg_gpu, 0, &neg_bytes)?;
 
             let mut centered = Vec::with_capacity(raw_vecs.len());
             for v in &raw_vecs {
-                centered.push(self.center_and_renorm_on_gpu(v, tmp_neg_gpu.va_addr)?);
+                centered.push(self.center_and_renorm_on_gpu(gpu, v, tmp_neg_gpu.va_addr)?);
             }
             (Some(mean_f32), centered)
         } else {
@@ -2343,14 +1556,14 @@ impl QwenMegakernelEngine {
         let docs_per_s = (docs.len() as f64) / total_s.max(1e-6);
 
         if load_into_vram {
-            let db = GpuVectorDb::load_qvec(&mut self.gpu, out_path, dim)?;
+            let db = GpuVectorDb::load_qvec(gpu, out_path, dim)?;
             self.rag_db = Some(db);
         }
 
         Ok((total_s * 1000.0, docs_per_s))
     }
 
-    pub fn load_rag_qvec(&mut self, path: &std::path::Path) -> Result<(), String> {
+    pub fn load_rag_qvec(&mut self, gpu: &mut NvGpu, path: &std::path::Path) -> Result<(), String> {
         let mut eff_path = path.to_path_buf();
         if self.cfg.dim == 4096 {
             if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
@@ -2362,17 +1575,23 @@ impl QwenMegakernelEngine {
                 }
             }
         }
-        let db = GpuVectorDb::load_qvec(&mut self.gpu, &eff_path, self.cfg.dim)?;
+        let db = GpuVectorDb::load_qvec(gpu, &eff_path, self.cfg.dim)?;
         // Pre-warm the paired Retrieval LoRA into `self.lora_arena` (then immediately suspend to `0`)
         // so every subsequent RAG query toggles LoRA ON/OFF in `<50 us`!
-        if db.strategy == EmbedStrategy::SvdLora && !db.lora_path.is_empty() {
-            let was_active = self.lora_status.active;
-            let prev = (self.lora_status.path.clone(), self.lora_status.scale);
-            self.load_lora(&db.lora_path, 1.0)?;
-            if !was_active {
-                self.clear_lora()?;
-            } else if prev.0 != db.lora_path {
-                self.load_lora(&prev.0, prev.1)?;
+        if db.strategy() == EmbedStrategy::SvdLora && !db.lora_path().is_empty() {
+            let prev = self
+                .lora_mgr
+                .active_path_and_scale()
+                .map(|(p, sc)| (p.to_string(), sc));
+            self.load_lora(gpu, db.lora_path(), 1.0)?;
+            match prev {
+                None => {
+                    self.clear_lora(gpu)?;
+                }
+                Some((old_p, old_sc)) if old_p != db.lora_path() => {
+                    self.load_lora(gpu, &old_p, old_sc)?;
+                }
+                Some(_) => {}
             }
         }
         self.rag_db = Some(db);
@@ -2383,17 +1602,18 @@ impl QwenMegakernelEngine {
         self.rag_db = None;
     }
 
-    pub fn rag_search(&mut self, query: &str, top_k: usize) -> Result<RagSearchStats, String> {
+    pub fn rag_search(&mut self, gpu: &mut NvGpu, query: &str, top_k: usize) -> Result<RagSearchStats, String> {
         let t_tot = Instant::now();
         let (strat, lora_p, num_docs) = {
             let db = self
                 .rag_db
                 .as_ref()
                 .ok_or("No RAG .qvec index currently loaded (run `qwen-nv rag load <file.qvec>` or `/rag <file.qvec>`)")?;
-            (db.strategy, db.lora_path.clone(), db.docs.len())
+            (db.strategy(), db.lora_path().to_string(), db.num_docs())
         };
 
         let (_, embed_ms) = self.embed_text(
+            gpu,
             strat,
             query,
             true,
@@ -2403,7 +1623,7 @@ impl QwenMegakernelEngine {
         // `self.embed_out_buf` already holds the exact `[1, dim]` `F32` query vector in GPU-accessible DMA memory!
         let db = self.rag_db.as_ref().unwrap();
         let (hits, gpu_search_us) =
-            db.search_cosine_on_gpu(&mut self.gpu, &self.module, self.embed_out_buf.va_addr, top_k)?;
+            db.search_cosine_on_gpu(gpu, &self.module, self.embed_out_buf.va_addr, top_k)?;
 
         Ok(RagSearchStats {
             hits,
@@ -2419,27 +1639,28 @@ impl QwenMegakernelEngine {
     // Topic Parametric LoRA Bank Router
     // -------------------------------------------------------------------------
 
-    pub fn load_topic_bank(&mut self, bank_dir: &Path) -> Result<(String, usize, usize), String> {
+    pub fn load_topic_bank(&mut self, gpu: &mut NvGpu, bank_dir: &Path) -> Result<(String, usize, usize), String> {
         let manifest = TopicBankManifest::load(bank_dir)?;
         let router_qvec = manifest.resolve_router_qvec_path();
-        self.load_rag_qvec(&router_qvec)?;
-        let n_docs = self.rag_db.as_ref().map(|d| d.docs.len()).unwrap_or(0);
+        self.load_rag_qvec(gpu, &router_qvec)?;
+        let n_docs = self.rag_db.as_ref().map(|d| d.num_docs()).unwrap_or(0);
         let n_topics = manifest.topics.len();
         let canonical = manifest.bank_dir.display().to_string();
         self.topic_bank = Some((canonical.clone(), manifest));
         Ok((canonical, n_topics, n_docs))
     }
 
-    pub fn clear_topic_bank(&mut self) -> Result<(), String> {
+    pub fn clear_topic_bank(&mut self, gpu: &mut NvGpu) -> Result<(), String> {
         self.topic_bank = None;
-        if self.lora_status.active {
-            let _ = self.clear_lora()?;
+        if self.lora_mgr.is_active() {
+            let _ = self.clear_lora(gpu)?;
         }
         Ok(())
     }
 
     pub fn topic_route(
         &mut self,
+        gpu: &mut NvGpu,
         query: &str,
         top_k: usize,
         min_score_override: Option<f32>,
@@ -2453,11 +1674,14 @@ impl QwenMegakernelEngine {
             .system_prompt
             .clone();
 
-        let search_st = self.rag_search(query, top_k.max(1))?;
+        let search_st = self.rag_search(gpu, query, top_k.max(1))?;
         let resolved = {
             let (_, ref manifest) = self.topic_bank.as_ref().unwrap();
             manifest
-                .resolve_topic(&search_st.hits, min_score_override)
+                .resolve_topic(
+                    search_st.hits.iter().map(|h| (h.title.as_str(), h.score)),
+                    min_score_override,
+                )
                 .map(|(entry, sc)| (entry.clone(), manifest.resolve_topic_lora_path(entry), sc))
         };
 
@@ -2465,7 +1689,7 @@ impl QwenMegakernelEngine {
             let lora_dir = lora_path.display().to_string();
             let mut swap_ms = 0.0f64;
             if auto_load {
-                let st = self.load_lora(&lora_dir, 1.0)?;
+                let st = self.load_lora(gpu, &lora_dir, 1.0)?;
                 swap_ms = st.swap_ms;
             }
             Ok(TopicRouteResult {
@@ -2481,8 +1705,8 @@ impl QwenMegakernelEngine {
             })
         } else {
             let mut swap_ms = 0.0f64;
-            if auto_load && self.lora_status.active {
-                let st = self.clear_lora()?;
+            if auto_load && self.lora_mgr.is_active() {
+                let st = self.clear_lora(gpu)?;
                 swap_ms = st.swap_ms;
             }
             let top_score = search_st.hits.first().map(|h| h.score).unwrap_or(0.0);
@@ -2506,7 +1730,7 @@ impl QwenMegakernelEngine {
 
     /// Stream residual-stream activations `[1 + 2*num_layers, dim]` at the final token of `token_ids`
     /// layer-by-layer from RTX 3080 to snooped host memory (`0` extra VRAM!).
-    pub fn extract_residual_hooks(&mut self, token_ids: &[i32]) -> Result<Vec<f32>, String> {
+    pub fn extract_residual_hooks(&mut self, gpu: &mut NvGpu, token_ids: &[i32]) -> Result<Vec<f32>, String> {
         if token_ids.is_empty() {
             return Err("extract_residual_hooks: empty token_ids".into());
         }
@@ -2521,7 +1745,7 @@ impl QwenMegakernelEngine {
             } else {
                 None
             };
-            self.run_prefill_chunk(&toks[pos..pos + take], pos, None, hook_va, None)?;
+            self.run_prefill_chunk(gpu, &toks[pos..pos + take], pos, None, hook_va, None)?;
             pos += take;
         }
         self.reset_cache();
@@ -2541,6 +1765,7 @@ impl QwenMegakernelEngine {
     /// using existing `c2w_swiglu_f32_kernel` + `tts_copy_f32` (`0` `.cu` edits, `0` extra VRAM).
     pub fn extract_mlp_kv_hooks(
         &mut self,
+        gpu: &mut NvGpu,
         token_ids: &[i32],
         key_layers: &[usize],
         pos_start: usize,
@@ -2578,7 +1803,7 @@ impl QwenMegakernelEngine {
         let mut pos = 0usize;
         while pos < pos_start {
             let take = (pos_start - pos).min(PREFILL_MAX_CHUNK);
-            self.run_prefill_chunk(&token_ids[pos..pos + take], pos, None, None, None)?;
+            self.run_prefill_chunk(gpu, &token_ids[pos..pos + take], pos, None, None, None)?;
             pos += take;
         }
 
@@ -2599,7 +1824,7 @@ impl QwenMegakernelEngine {
                 keys_va,
                 final_res_va,
             };
-            self.run_prefill_chunk(
+            self.run_prefill_chunk(gpu, 
                 &token_ids[cur_pos..cur_pos + take],
                 cur_pos,
                 None,
@@ -2633,7 +1858,7 @@ impl QwenMegakernelEngine {
 
     /// Evaluate the exact full-vocabulary `[vocab_size]` FP32 next-token logit vector at the end
     /// of `token_ids` on the RTX 3080 (used for exact `KL(P_base || P_patched)` control gates!).
-    pub fn eval_next_token_logits(&mut self, token_ids: &[i32]) -> Result<Vec<f32>, String> {
+    pub fn eval_next_token_logits(&mut self, gpu: &mut NvGpu, token_ids: &[i32]) -> Result<Vec<f32>, String> {
         if token_ids.is_empty() {
             return Err("eval_next_token_logits: empty token_ids".into());
         }
@@ -2643,7 +1868,7 @@ impl QwenMegakernelEngine {
         let mut pos = 0usize;
         while pos < total_len - 1 {
             let take = (total_len - 1 - pos).min(PREFILL_MAX_CHUNK);
-            self.run_prefill_chunk(&toks[pos..pos + take], pos, None, None, None)?;
+            self.run_prefill_chunk(gpu, &toks[pos..pos + take], pos, None, None, None)?;
             pos += take;
         }
 
@@ -2668,24 +1893,13 @@ impl QwenMegakernelEngine {
         put_u64(&mut mk_args, 0, self.model_desc_gpu.va_addr);
         put_u64(&mut mk_args, 8, self.ctrl_buf.va_addr);
 
-        self.gpu.timeline_value += 1;
-        let sig_val = self.gpu.timeline_value;
-        let sig_va = self.gpu.timeline_buf.va_addr;
-        let k_dec = &self.module.kernels["qwen_persistent_decode_megakernel"];
-        let (qmd_va, _) = self.gpu.prepare_qmd(
-            k_dec,
-            (self.gpu.active_sms, 1, 1),
-            (512, 1, 1),
-            &mk_args,
-            Some((sig_va, sig_val)),
-        );
-        self.gpu.launch_qmd_chain(qmd_va, true)?;
-        self.gpu.wait_timeline(sig_val, Duration::from_secs(10))?;
+        let k_dec = self.module.kernel("qwen_persistent_decode_megakernel")?;
+        gpu.launch_kernel_sync(k_dec, (gpu.active_sms, 1, 1), (512, 1, 1), &mk_args, true, Duration::from_secs(10))?;
         self.reset_cache();
 
         let err = unsafe { (*ctrl_ptr).error_code };
         if err != 0 {
-            let _ = self.gpu.zero_vram(&self.ws_bar_state);
+            let _ = gpu.zero_vram(&self.ws_bar_state);
             return Err(format!("Logits export watchdog tripped at {}", err));
         }
 

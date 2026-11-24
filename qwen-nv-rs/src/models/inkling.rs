@@ -12,24 +12,20 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::gguf::{
-    f32_to_f16_bits, resolve_model_path, BpeTokenizer, GgufFile, GgufVal, MmapFile,
-    Utf8StreamDecoder,
-};
-use crate::nv_defs::{get_u16, get_u64, put_u64};
-use crate::nv_hw::{CubinModule, HostMappedBuffer, NvGpu, VramBuffer};
+use super::dspark::{discover_mtp_safetensors, InkDSparkState, InkRunCtrl};
+use crate::gguf::{resolve_model_path, BpeTokenizer, GgufFile, Utf8StreamDecoder};
+use crate::hw::{put_u64, CubinModule, HostMappedBuffer, NvGpu, VramBuffer, VramCheckpoint};
 
 #[inline]
 fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
 
-pub static INKLING_CUBIN: &[u8] = include_bytes!("../kernels/inkling_sm86.cubin");
+pub static INKLING_CUBIN: &[u8] = include_bytes!("../../kernels/inkling_sm86.cubin");
 
 pub const TOK_END_SAMPLING: i32 = 200006; // <|content_model_end_sampling|>
 pub const TOK_EOT: i32 = 199999;          // <|endoftext|>
@@ -190,105 +186,10 @@ pub struct InkModelDesc {
     pub _pad_model: [i32; 2],
 }
 
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct InkDSparkLayerDesc {
-    pub dflare_norm: u64,
-    pub input_layernorm: u64,
-    pub post_attn_norm: u64,
-    pub qkv_proj: u64,
-    pub o_proj: u64,
-    pub kv_proj_ctx: u64,
-    pub q_norm: u64,
-    pub k_norm: u64,
-    pub k_norm_ctx: u64,
-    pub gate_up_proj: u64,
-    pub down_proj: u64,
-    pub is_local: i32,
-    pub _pad: [i32; 9],
-}
-
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Debug)]
-pub struct InkDSparkDesc {
-    pub layers: [InkDSparkLayerDesc; 3],
-    pub fuse_alpha: [f32; 16],
-    pub mask_embed_va: u64,
-    pub final_norm_va: u64,
-    pub markov_dflare_va: u64,
-    pub markov_w1_bf16_va: u64,
-    pub rnn_proj_w_va: u64,
-    pub rnn_proj_b_va: u64,
-    pub fold_w_va: u64,
-    pub fold_b_va: u64,
-
-    pub draft_k_va: u64,
-    pub draft_v_va: u64,
-    pub ws_f_rnn_va: u64,
-
-    pub ws_h_va: u64,
-    pub ws_qkv_va: u64,
-    pub ws_mlp_va: u64,
-    pub ws_xq_va: u64,
-    pub ws_xds_va: u64,
-    pub ws_base_logits_va: u64,
-    pub ws_rnn_state_va: u64,
-    pub ws_rnn_inp_va: u64,
-    pub ws_rnn_proj_va: u64,
-
-    pub max_ctx: i32,
-    pub swa_window: i32,
-    pub rope_theta: f32,
-    pub rms_eps: f32,
-}
-
-#[repr(C, align(64))]
-#[derive(Clone, Copy)]
-pub struct InkRunCtrl {
-    pub start_token: i32,
-    pub start_pos: i32,
-    pub max_steps: i32,
-    pub eff_passes: i32,
-    pub temperature: f32,
-    pub step_offset: u32,
-    pub rng_seed: u64,
-
-    pub cancel_flag: i32,
-    pub error_code: i32,
-    pub steps_completed: i32,
-    pub stop_reason: i32,
-    pub export_taps: i32,
-    pub save_conv_backup: i32,
-    pub batch_len: i32,
-    pub logits_mask: u32,
-
-    pub inject_pos: i32,
-    pub inject_cnt: i32,
-    pub _pad_ctrl: [i32; 2],
-
-    pub batch_tokens: [i32; 8],
-    pub batch_out_toks: [i32; 8],
-    pub done_seq: u64,
-    pub expected_seq: u64,
-    pub tokens_out: [i32; 4096],
-}
 
 const _: () = assert!(std::mem::size_of::<InkPhysLayerDesc>() == 256);
 const _: () = assert!(std::mem::size_of::<InkLoopCtrlDesc>() == 128);
 const _: () = assert!(std::mem::size_of::<InkModelDesc>() == 576);
-const _: () = assert!(std::mem::size_of::<InkDSparkLayerDesc>() == 128);
-const _: () = assert!(std::mem::size_of::<InkDSparkDesc>() == 624);
-const _: () = assert!(std::mem::size_of::<InkRunCtrl>() == 16576);
-
-pub struct InkDSparkState {
-    pub mtp_path: PathBuf,
-    pub weights_buf: VramBuffer,
-    pub draft_kv_buf: VramBuffer,
-    pub ws_buf: VramBuffer,
-    pub desc_buf: VramBuffer,
-    pub desc_va: u64,
-    pub total_vram_mb: f64,
-}
 
 #[derive(Clone, Copy, Debug)]
 struct WeightTensorGpu {
@@ -369,474 +270,11 @@ fn ggml_tensor_nbytes(dims: &[usize], ggml_type: i32) -> Result<usize, String> {
     }
 }
 
-fn parse_safetensors_offsets(hdr_json: &str) -> Result<HashMap<String, (usize, usize)>, String> {
-    let bytes = hdr_json.as_bytes();
-    let n = bytes.len();
-    let mut i = 0usize;
-    while i < n && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= n || bytes[i] != b'{' {
-        return Err("Invalid safetensors JSON header".into());
-    }
-    i += 1;
-    let mut map = HashMap::new();
-    while i < n {
-        while i < n && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
-            i += 1;
-        }
-        if i >= n || bytes[i] == b'}' {
-            break;
-        }
-        if bytes[i] != b'"' {
-            return Err("Expected string key in safetensors header".into());
-        }
-        i += 1;
-        let k_start = i;
-        while i < n && bytes[i] != b'"' {
-            if bytes[i] == b'\\' {
-                i += 1;
-            }
-            i += 1;
-        }
-        let key = hdr_json[k_start..i].to_string();
-        i += 1;
-        while i < n && (bytes[i].is_ascii_whitespace() || bytes[i] == b':') {
-            i += 1;
-        }
-        if i >= n || bytes[i] != b'{' {
-            return Err(format!("Expected object value for key '{}'", key));
-        }
-        let obj_start = i;
-        let mut depth = 0i32;
-        let mut in_str = false;
-        while i < n {
-            let b = bytes[i];
-            if in_str {
-                if b == b'\\' {
-                    i += 1;
-                } else if b == b'"' {
-                    in_str = false;
-                }
-            } else if b == b'"' {
-                in_str = true;
-            } else if b == b'{' {
-                depth += 1;
-            } else if b == b'}' {
-                depth -= 1;
-                if depth == 0 {
-                    i += 1;
-                    break;
-                }
-            }
-            i += 1;
-        }
-        let obj_str = &hdr_json[obj_start..i];
-        if key != "__metadata__" {
-            if let Some(do_idx) = obj_str.find("\"data_offsets\"") {
-                let sub = &obj_str[do_idx + 14..];
-                if let (Some(lb), Some(rb)) = (sub.find('['), sub.find(']')) {
-                    let inner = &sub[lb + 1..rb];
-                    let mut parts = inner.split(',');
-                    if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
-                        let s = a.trim().parse::<usize>().map_err(|e| e.to_string())?;
-                        let e = b.trim().parse::<usize>().map_err(|e| e.to_string())?;
-                        map.insert(key, (s, e));
-                    }
-                }
-            }
-        }
-    }
-    Ok(map)
-}
-
-fn bf16_bytes_to_f32_vec(raw: &[u8]) -> Vec<f32> {
-    let n = raw.len() / 2;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let u = get_u16(raw, i * 2);
-        out.push(f32::from_bits((u as u32) << 16));
-    }
-    out
-}
-
-fn bf16_bytes_to_f32_bytes(raw: &[u8]) -> Vec<u8> {
-    let vals = bf16_bytes_to_f32_vec(raw);
-    let mut out = Vec::with_capacity(vals.len() * 4);
-    for v in vals {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out
-}
-
-/// Quantize one or more row-stacked BF16 matrices (`[n_rows_i, k_cols]`) into
-/// Aligned Split `Q8_0` (`[qs: int8[tot_rows, k_cols] | d: half[tot_rows, k_cols/32]]`).
-fn bf16_slices_to_split_q8_0(slices: &[(&[u8], usize)], k_cols: usize) -> Vec<u8> {
-    assert_eq!(k_cols % 32, 0);
-    let n_blks_per_row = k_cols / 32;
-    let tot_rows: usize = slices.iter().map(|s| s.1).sum();
-    let qs_bytes = tot_rows * k_cols;
-    let d_bytes = tot_rows * n_blks_per_row * 2;
-    assert_eq!(qs_bytes % 16, 0);
-    let mut out = vec![0u8; qs_bytes + d_bytes];
-    let (qs_part, d_part) = out.split_at_mut(qs_bytes);
-
-    let mut row_cursor = 0usize;
-    for &(raw, n_rows) in slices {
-        assert_eq!(raw.len(), n_rows * k_cols * 2);
-        for r in 0..n_rows {
-            let g_row = row_cursor + r;
-            let row_raw = &raw[r * k_cols * 2..(r + 1) * k_cols * 2];
-            let row_qs = &mut qs_part[g_row * k_cols..(g_row + 1) * k_cols];
-            let row_d = &mut d_part[g_row * n_blks_per_row * 2..(g_row + 1) * n_blks_per_row * 2];
-
-            for b in 0..n_blks_per_row {
-                let blk_raw = &row_raw[b * 64..(b + 1) * 64];
-                let mut vals = [0.0f32; 32];
-                let mut amax = 0.0f32;
-                for l in 0..32 {
-                    let u = u16::from_le_bytes([blk_raw[l * 2], blk_raw[l * 2 + 1]]);
-                    let v = f32::from_bits((u as u32) << 16);
-                    vals[l] = v;
-                    let av = v.abs();
-                    if av > amax {
-                        amax = av;
-                    }
-                }
-                let d_f16 = f32_to_f16_bits(amax * (1.0 / 127.0));
-                row_d[b * 2..b * 2 + 2].copy_from_slice(&d_f16.to_le_bytes());
-                let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-                let dst_q = &mut row_qs[b * 32..(b + 1) * 32];
-                for l in 0..32 {
-                    let q = (vals[l] * id).round().clamp(-127.0, 127.0) as i8;
-                    dst_q[l] = q as u8;
-                }
-            }
-        }
-        row_cursor += n_rows;
-    }
-    out
-}
-
-fn discover_mtp_safetensors(gguf_path: &Path) -> Option<PathBuf> {
-    if std::env::var("INKLING_NO_DSPARK")
-        .ok()
-        .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"))
-    {
-        return None;
-    }
-    if let Ok(explicit) = std::env::var("INKLING_MTP_PATH") {
-        let p = PathBuf::from(explicit);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    let mut candidates = Vec::new();
-    if let Some(parent) = gguf_path.parent() {
-        candidates.push(parent.join("Inkling-2-Mini-mtp.safetensors"));
-        candidates.push(parent.join("mtp.safetensors"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let cache_dir = PathBuf::from(home).join(".cache/qwen-nv-rs/models");
-        candidates.push(cache_dir.join("Inkling-2-Mini-mtp.safetensors"));
-        candidates.push(cache_dir.join("mtp.safetensors"));
-    }
-    candidates.into_iter().find(|p| p.exists())
-}
-
-impl InkDSparkState {
-    pub fn load(
-        gpu: &mut NvGpu,
-        module: &CubinModule,
-        mtp_path: &Path,
-        cfg: &InklingConfig,
-        output_w_va: u64,
-        output_w_type: i32,
-    ) -> Result<Self, String> {
-        let t0 = Instant::now();
-        let mmap = MmapFile::open(mtp_path)?;
-        let raw_all = mmap.as_slice();
-        if raw_all.len() < 16 {
-            return Err("mtp.safetensors is too small".into());
-        }
-        let hdr_len = get_u64(raw_all, 0) as usize;
-        if 8 + hdr_len > raw_all.len() {
-            return Err("Invalid mtp.safetensors header length".into());
-        }
-        let hdr_str = std::str::from_utf8(&raw_all[8..8 + hdr_len])
-            .map_err(|e| format!("Invalid UTF-8 in mtp.safetensors header: {}", e))?;
-        let offsets = parse_safetensors_offsets(hdr_str)?;
-        let data_base = 8 + hdr_len;
-
-        let get_raw = |name: &str| -> Result<&[u8], String> {
-            let &(s, e) = offsets
-                .get(name)
-                .ok_or_else(|| format!("Missing tensor '{}' in {}", name, mtp_path.display()))?;
-            if data_base + e > raw_all.len() || s > e {
-                return Err(format!("Out-of-bounds tensor '{}' in {}", name, mtp_path.display()));
-            }
-            Ok(&raw_all[data_base + s..data_base + e])
-        };
-
-        // Compute row-wise softmax `fuse_alpha [4, 4]` from `fuse_weight [4, 4]`
-        let fw_vals = bf16_bytes_to_f32_vec(get_raw("fuse_weight")?);
-        if fw_vals.len() != 16 {
-            return Err(format!("Expected 16 elements in fuse_weight, got {}", fw_vals.len()));
-        }
-        let mut fuse_alpha = [0.0f32; 16];
-        for r in 0..4 {
-            let row = &fw_vals[r * 4..(r + 1) * 4];
-            let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for c in 0..4 {
-                let ev = (row[c] - mx).exp();
-                fuse_alpha[r * 4 + c] = ev;
-                sum += ev;
-            }
-            for c in 0..4 {
-                fuse_alpha[r * 4 + c] /= sum;
-            }
-        }
-
-        // Convert & pack all DSpark weights into one contiguous 256B-aligned VRAM arena
-        let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(48);
-        let mut rel_offs: Vec<u64> = Vec::with_capacity(48);
-        let mut cur_w_off = 0u64;
-        let mut push_blob = |b: Vec<u8>| -> u64 {
-            let o = align_up(cur_w_off, 256);
-            cur_w_off = o + (b.len() as u64);
-            rel_offs.push(o);
-            blobs.push(b);
-            o
-        };
-
-        let o_mask_embed = push_blob(bf16_bytes_to_f32_bytes(get_raw("mask_embed")?));
-        let o_final_norm = push_blob(bf16_bytes_to_f32_bytes(get_raw("norm.weight")?));
-        let o_markov_dflare = push_blob(bf16_bytes_to_f32_bytes(get_raw("markov_head.dflare_norm.weight")?));
-
-        let mw1_raw = get_raw("markov_head.markov_w1.weight")?;
-        let mw1_crop_bytes = cfg.vocab_unpadded * 256 * 2;
-        if mw1_raw.len() < mw1_crop_bytes {
-            return Err("markov_w1.weight smaller than vocab_unpadded * 256".into());
-        }
-        let o_markov_w1 = push_blob(mw1_raw[..mw1_crop_bytes].to_vec());
-        let o_rnn_proj_w = push_blob(bf16_slices_to_split_q8_0(
-            &[(get_raw("markov_head.rnn_proj.weight")?, 768)],
-            5120,
-        ));
-        let o_rnn_proj_b = push_blob(bf16_bytes_to_f32_bytes(get_raw("markov_head.rnn_proj.bias")?));
-
-        let mut layer_rel = [(0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64); 3];
-        for il in 0..3 {
-            let p = format!("layers.{}", il);
-            let dflare = push_blob(bf16_bytes_to_f32_bytes(get_raw(&format!("{}.dflare_norm.weight", p))?));
-            let in_ln = push_blob(bf16_bytes_to_f32_bytes(get_raw(&format!("{}.input_layernorm.weight", p))?));
-            let post_ln = push_blob(bf16_bytes_to_f32_bytes(get_raw(&format!(
-                "{}.post_attention_layernorm.weight",
-                p
-            ))?));
-            let qkv = push_blob(bf16_slices_to_split_q8_0(
-                &[
-                    (get_raw(&format!("{}.self_attn.q_proj.weight", p))?, 3072),
-                    (get_raw(&format!("{}.self_attn.k_proj.weight", p))?, 1024),
-                    (get_raw(&format!("{}.self_attn.v_proj.weight", p))?, 1024),
-                ],
-                2304,
-            ));
-            let o_p = push_blob(bf16_slices_to_split_q8_0(
-                &[(get_raw(&format!("{}.self_attn.o_proj.weight", p))?, 2304)],
-                3072,
-            ));
-            let kv_ctx = push_blob(bf16_slices_to_split_q8_0(
-                &[
-                    (get_raw(&format!("{}.self_attn.k_proj_ctx.weight", p))?, 1024),
-                    (get_raw(&format!("{}.self_attn.v_proj_ctx.weight", p))?, 1024),
-                ],
-                2304,
-            ));
-            let q_n = push_blob(bf16_bytes_to_f32_bytes(get_raw(&format!("{}.self_attn.q_norm.weight", p))?));
-            let k_n = push_blob(bf16_bytes_to_f32_bytes(get_raw(&format!("{}.self_attn.k_norm.weight", p))?));
-            let k_n_ctx = push_blob(bf16_bytes_to_f32_bytes(get_raw(&format!(
-                "{}.self_attn.k_norm_ctx.weight",
-                p
-            ))?));
-            let gu = push_blob(bf16_slices_to_split_q8_0(
-                &[
-                    (get_raw(&format!("{}.mlp.gate_proj.weight", p))?, 9216),
-                    (get_raw(&format!("{}.mlp.up_proj.weight", p))?, 9216),
-                ],
-                2304,
-            ));
-            let dn = push_blob(bf16_slices_to_split_q8_0(
-                &[(get_raw(&format!("{}.mlp.down_proj.weight", p))?, 2304)],
-                9216,
-            ));
-            layer_rel[il] = (dflare, in_ln, post_ln, qkv, o_p, kv_ctx, q_n, k_n, k_n_ctx, gu, dn);
-        }
-
-        // Reserve VRAM inside `weights_buf` for GPU-folded `_fold_weight [vocab, 256]` (Split Q8_0) + `_fold_bias [vocab]` (F32)
-        let fold_w_bytes = cfg.vocab_unpadded * 256 + cfg.vocab_unpadded * 8 * 2;
-        let o_fold_w = align_up(cur_w_off, 256);
-        cur_w_off = o_fold_w + (fold_w_bytes as u64);
-        let fold_b_bytes = cfg.vocab_unpadded * 4;
-        let o_fold_b = align_up(cur_w_off, 256);
-        cur_w_off = o_fold_b + (fold_b_bytes as u64);
-
-        let weights_buf = gpu.alloc_vram(cur_w_off)?;
-        let wb = weights_buf.va_addr;
-        const CHUNK: usize = 32 * 1024 * 1024;
-        for (blob, &off) in blobs.iter().zip(rel_offs.iter()) {
-            let mut p = 0usize;
-            while p < blob.len() {
-                let take = (blob.len() - p).min(CHUNK);
-                gpu.upload_to_vram(&weights_buf, off + (p as u64), &blob[p..p + take])?;
-                p += take;
-            }
-        }
-        drop(blobs);
-
-        // Allocate Draft Context KV Cache (`[2 (K,V), 3, max_ctx, 1024]` FP16 = 48 MiB @ ctx=4096)
-        let per_kv_bytes = (3 * cfg.max_ctx * 1024 * 2) as u64;
-        let draft_kv_buf = gpu.alloc_vram(2 * per_kv_bytes)?;
-        let draft_k_va = draft_kv_buf.va_addr;
-        let draft_v_va = draft_kv_buf.va_addr + per_kv_bytes;
-
-        // Allocate DSpark Workspace (`~4.8 MiB` total, also hosts temporary `hidden_out` during 8ms startup fold!)
-        let mut ws_off = 0u64;
-        let mut alloc_dws = |nb: usize| -> u64 {
-            let o = align_up(ws_off, 256);
-            ws_off = o + (nb as u64);
-            o
-        };
-        let d_f_rnn = alloc_dws(2304 * 4);
-        let d_h = alloc_dws(8 * 2304 * 4);
-        let d_qkv = alloc_dws(24 * 2048 * 4);
-        let d_mlp = alloc_dws(8 * 9216 * 4);
-        let d_xq = alloc_dws(8 * 9216);
-        let d_xds = alloc_dws(8 * 288 * 8);
-        let d_base_logits = alloc_dws(7 * cfg.vocab_unpadded * 2);
-        let d_rnn_state = alloc_dws(256 * 4);
-        let d_rnn_inp = alloc_dws(5120 * 4);
-        let d_rnn_proj = alloc_dws(768 * 4);
-        let ws_buf = gpu.alloc_vram(ws_off.max(2 * 1024 * 1024))?;
-        let dwb = ws_buf.va_addr;
-
-        // Pre-fold `_fold_weight` & `_fold_bias` on RTX 3080 using temporary space in `ws_buf` (`0` extra VRAM!)
-        let hout_w_raw = get_raw("markov_head.hidden_out.weight")?; // [2304, 256] BF16 = 1,179,648 B
-        let hout_b_f32 = bf16_bytes_to_f32_bytes(get_raw("markov_head.hidden_out.bias")?); // [2304] F32 = 9,216 B
-        gpu.upload_to_vram(&ws_buf, 0, hout_w_raw)?;
-        let hb_off = align_up(hout_w_raw.len() as u64, 256);
-        gpu.upload_to_vram(&ws_buf, hb_off, &hout_b_f32)?;
-
-        let mut fold_args = [0u8; 48];
-        put_u64(&mut fold_args, 0, wb + o_fold_w);
-        put_u64(&mut fold_args, 8, wb + o_fold_b);
-        put_u64(&mut fold_args, 16, output_w_va);
-        fold_args[24..28].copy_from_slice(&output_w_type.to_le_bytes());
-        fold_args[28..32].copy_from_slice(&(cfg.vocab_unpadded as i32).to_le_bytes());
-        put_u64(&mut fold_args, 32, dwb);
-        put_u64(&mut fold_args, 40, dwb + hb_off);
-
-        gpu.timeline_value += 1;
-        let sig_val = gpu.timeline_value;
-        let k_fold = &module.kernels["ink_dspark_build_fold_kernel"];
-        let (qmd_va, _) = gpu.prepare_qmd(
-            k_fold,
-            (gpu.active_sms, 1, 1),
-            (256, 1, 1),
-            &fold_args,
-            Some((gpu.timeline_buf.va_addr, sig_val)),
-        );
-        gpu.launch_qmd_chain(qmd_va, false)?;
-        gpu.wait_timeline(sig_val, Duration::from_secs(15))?;
-
-        let mut l_descs = [InkDSparkLayerDesc::default(); 3];
-        for il in 0..3 {
-            let (dflare, in_ln, post_ln, qkv, o_p, kv_ctx, q_n, k_n, k_n_ctx, gu, dn) = layer_rel[il];
-            l_descs[il] = InkDSparkLayerDesc {
-                dflare_norm: wb + dflare,
-                input_layernorm: wb + in_ln,
-                post_attn_norm: wb + post_ln,
-                qkv_proj: wb + qkv,
-                o_proj: wb + o_p,
-                kv_proj_ctx: wb + kv_ctx,
-                q_norm: wb + q_n,
-                k_norm: wb + k_n,
-                k_norm_ctx: wb + k_n_ctx,
-                gate_up_proj: wb + gu,
-                down_proj: wb + dn,
-                is_local: if il == 0 || il == 2 { 1 } else { 0 },
-                _pad: [0; 9],
-            };
-        }
-
-        let d_desc = InkDSparkDesc {
-            layers: l_descs,
-            fuse_alpha,
-            mask_embed_va: wb + o_mask_embed,
-            final_norm_va: wb + o_final_norm,
-            markov_dflare_va: wb + o_markov_dflare,
-            markov_w1_bf16_va: wb + o_markov_w1,
-            rnn_proj_w_va: wb + o_rnn_proj_w,
-            rnn_proj_b_va: wb + o_rnn_proj_b,
-            fold_w_va: wb + o_fold_w,
-            fold_b_va: wb + o_fold_b,
-            draft_k_va,
-            draft_v_va,
-            ws_f_rnn_va: dwb + d_f_rnn,
-            ws_h_va: dwb + d_h,
-            ws_qkv_va: dwb + d_qkv,
-            ws_mlp_va: dwb + d_mlp,
-            ws_xq_va: dwb + d_xq,
-            ws_xds_va: dwb + d_xds,
-            ws_base_logits_va: dwb + d_base_logits,
-            ws_rnn_state_va: dwb + d_rnn_state,
-            ws_rnn_inp_va: dwb + d_rnn_inp,
-            ws_rnn_proj_va: dwb + d_rnn_proj,
-            max_ctx: cfg.max_ctx as i32,
-            swa_window: 1024,
-            rope_theta: 1_000_000.0,
-            rms_eps: 1e-6,
-        };
-
-        let desc_buf = gpu.alloc_vram(1024)?;
-        let mut d_bytes = vec![0u8; std::mem::size_of::<InkDSparkDesc>()];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &d_desc as *const InkDSparkDesc as *const u8,
-                d_bytes.as_mut_ptr(),
-                d_bytes.len(),
-            );
-        }
-        gpu.upload_to_vram(&desc_buf, 0, &d_bytes)?;
-
-        let total_vram_mb =
-            ((weights_buf.size + draft_kv_buf.size + ws_buf.size + desc_buf.size) as f64) / (1024.0 * 1024.0);
-        eprintln!(
-            "[dspark-nv] Loaded official Inkling2MTP block-8 drafter ({:.1} MiB VRAM: Split-Q8_0 3L + BF16 Markov-256 + GPU-folded LM head) in {:.2}s",
-            total_vram_mb,
-            t0.elapsed().as_secs_f64()
-        );
-
-        let desc_va = desc_buf.va_addr;
-        Ok(Self {
-            mtp_path: mtp_path.to_path_buf(),
-            weights_buf,
-            draft_kv_buf,
-            ws_buf,
-            desc_buf,
-            desc_va,
-            total_vram_mb,
-        })
-    }
-}
-
 pub struct InklingEngine {
-    pub gpu: NvGpu,
-    pub module: CubinModule,
-    pub cfg: InklingConfig,
-    pub tok: BpeTokenizer,
-    pub model_ref: String,
+    module: CubinModule,
+    cfg: InklingConfig,
+    tok: BpeTokenizer,
+    model_ref: String,
     weights_buf: VramBuffer,
     swa_k_buf: VramBuffer,
     swa_v_buf: VramBuffer,
@@ -851,11 +289,12 @@ pub struct InklingEngine {
     ctrl_host: HostMappedBuffer,
     done_seq_counter: u64,
     conv_total_floats: usize,
-    pub dspark_taps_va: u64,
-    pub dspark: Option<InkDSparkState>,
-    pub dspark_gamma: usize,
+    dspark_taps_va: u64,
+    dspark: Option<InkDSparkState>,
+    pre_dspark_cp: Option<VramCheckpoint>,
+    dspark_gamma: usize,
     dspark_cache_valid: bool,
-    pub cached_tokens: Vec<i32>,
+    cached_tokens: Vec<i32>,
     cached_passes: usize,
 }
 
@@ -867,7 +306,7 @@ impl InklingEngine {
             }
         }
         if let Ok(gf) = GgufFile::open(path) {
-            if let Some(arch) = gf.kv.get("general.architecture").and_then(|v| v.as_str()) {
+            if let Some(arch) = gf.get_str("general.architecture") {
                 return arch.starts_with("inkling2");
             }
         }
@@ -885,39 +324,78 @@ impl InklingEngine {
         false
     }
 
-    pub fn new(model_ref: &str, max_context_req: usize) -> Result<Self, String> {
-        let model_path = resolve_model_path(model_ref)?;
-        let t_init = Instant::now();
-        let mut gpu = NvGpu::init()?;
-        eprintln!(
-            "[inkling-nv] Initialized GA102 (sm_86, {} active SMs, {:.2} GB GDDR6X) in {:.2}s",
-            gpu.active_sms,
-            (gpu.mm.vram_size as f64) / 1e9,
-            t_init.elapsed().as_secs_f64()
-        );
+    #[inline]
+    pub fn model_ref(&self) -> &str {
+        &self.model_ref
+    }
 
+    #[inline]
+    pub fn model_name(&self) -> &str {
+        &self.cfg.model_name
+    }
+
+    #[inline]
+    pub fn has_dspark(&self) -> bool {
+        self.dspark.is_some()
+    }
+
+    #[inline]
+    pub fn dspark_gamma(&self) -> usize {
+        self.dspark_gamma
+    }
+
+    #[inline]
+    pub fn set_dspark_gamma(&mut self, gamma: usize) {
+        self.dspark_gamma = gamma.clamp(1, 7);
+    }
+
+    pub fn dspark_status_json(&self) -> String {
+        if let Some(ref ds) = self.dspark {
+            format!(
+                "{{\"active\":true,\"model\":\"Inkling2MTP\",\"gamma\":{},\"vram_mb\":{:.1}}}",
+                self.dspark_gamma, ds.total_vram_mb
+            )
+        } else {
+            "{\"active\":false}".to_string()
+        }
+    }
+
+    /// Reclaim `DSpark` (`~447-471 MiB` GDDR6X) back to the high-VRAM bump allocator so
+    /// co-resident `Qwen3-ASR-0.6B` + `Qwen3-TTS-0.6B` + `12Hz Code2Wav` fit with ~400 MiB margin!
+    pub fn reclaim_dspark_for_voice(&mut self, gpu: &mut NvGpu) -> f64 {
+        if let (Some(ds), Some(cp)) = (self.dspark.take(), self.pre_dspark_cp.take()) {
+            let mb = ds.total_vram_mb;
+            drop(ds);
+            self.dspark_cache_valid = false;
+            gpu.restore_vram_checkpoint(cp);
+            mb
+        } else {
+            0.0
+        }
+    }
+
+    #[inline]
+    pub fn encode_raw(&self, text: &str) -> Vec<i32> {
+        self.tok.encode(text)
+    }
+
+    #[inline]
+    pub fn decode_tokens(&self, ids: &[i32]) -> String {
+        self.tok.decode(ids)
+    }
+
+    pub fn load(gpu: &mut NvGpu, model_ref: &str, max_context_req: usize) -> Result<Self, String> {
+        let model_path = resolve_model_path(model_ref)?;
         let t_load = Instant::now();
         let gguf = GgufFile::open(&model_path)?;
-        let arch = gguf
-            .kv
-            .get("general.architecture")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let arch = gguf.get_str("general.architecture").unwrap_or("");
         if arch != "inkling2_loop" {
             return Err(format!("Expected general.architecture='inkling2_loop', got '{}'", arch));
         }
 
-        let tok = BpeTokenizer::from_gguf(&gguf)?;
-        let get_u = |k: &str| -> Result<usize, String> {
-            gguf.kv
-                .get(k)
-                .and_then(|v| v.as_u64())
-                .map(|x| x as usize)
-                .ok_or_else(|| format!("Missing GGUF key {}", k))
-        };
-        let get_f = |k: &str, def: f32| -> f32 {
-            gguf.kv.get(k).and_then(|v| v.as_f32()).unwrap_or(def)
-        };
+        let tok = gguf.build_tokenizer()?;
+        let get_u = |k: &str| gguf.req_usize(k);
+        let get_f = |k: &str, def: f32| gguf.get_f32_or(k, def);
 
         let n_phys = get_u("inkling2_loop.block_count")?;
         let dim = get_u("inkling2_loop.embedding_length")?;
@@ -937,26 +415,23 @@ impl InklingEngine {
         let shortconv_len = get_u("inkling2_loop.shortconv.l_cache")?;
         let attn_res_block = get_u("inkling2_loop.attn_res.block_size")?;
 
-        let n_heads = match gguf.kv.get("inkling2_loop.attention.head_count") {
-            Some(GgufVal::IntArr(v)) if !v.is_empty() => v[0] as usize,
-            _ => 24,
-        };
-        let n_kv_heads = match gguf.kv.get("inkling2_loop.attention.head_count_kv") {
-            Some(GgufVal::IntArr(v)) if !v.is_empty() => v[0] as usize,
-            _ => 8,
-        };
-        let swa_pattern: Vec<bool> = match gguf.kv.get("inkling2_loop.attention.sliding_window_pattern") {
-            Some(GgufVal::IntArr(v)) if v.len() == n_phys => v.iter().map(|&x| x != 0).collect(),
+        let n_heads = gguf
+            .get_i32_arr("inkling2_loop.attention.head_count")
+            .and_then(|v| v.first().copied())
+            .map(|v| v as usize)
+            .unwrap_or(24);
+        let n_kv_heads = gguf
+            .get_i32_arr("inkling2_loop.attention.head_count_kv")
+            .and_then(|v| v.first().copied())
+            .map(|v| v as usize)
+            .unwrap_or(8);
+        let swa_pattern: Vec<bool> = match gguf.get_i32_arr("inkling2_loop.attention.sliding_window_pattern") {
+            Some(v) if v.len() == n_phys => v.iter().map(|&x| x != 0).collect(),
             _ => (0..n_phys).map(|i| (i % 6) != 5).collect(),
         };
 
         let cfg = InklingConfig {
-            model_name: gguf
-                .kv
-                .get("general.name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Inkling-2-Mini")
-                .to_string(),
+            model_name: gguf.get_str("general.name").unwrap_or("Inkling-2-Mini").to_string(),
             n_phys_layers: n_phys,
             dim,
             n_ff_exp,
@@ -991,14 +466,13 @@ impl InklingEngine {
         let module = gpu.load_cubin(INKLING_CUBIN)?;
 
         // Compute deterministic 256-byte-aligned VRAM layout for all GGUF tensors
-        let mut names_sorted: Vec<String> = gguf.tensors.keys().cloned().collect();
-        names_sorted.sort_by_key(|n| gguf.tensors[n].offset);
+        let names_sorted = gguf.tensor_names_by_offset();
 
         let mut total_w_bytes: u64 = 0;
         let mut tensor_rel_off =
             std::collections::HashMap::<String, (u64, usize, i32)>::with_capacity(names_sorted.len());
         for name in &names_sorted {
-            let info = &gguf.tensors[name];
+            let info = gguf.req_tensor_info(name)?;
             let nb = if name == "output.weight" && info.dims.len() == 2 && info.dims[1] >= vocab_unpadded {
                 ggml_tensor_nbytes(&[info.dims[0], vocab_unpadded], info.ggml_type)?
             } else {
@@ -1077,7 +551,7 @@ impl InklingEngine {
         let mut scratch = vec![0u8; 4 * 1024 * 1024];
         let t_dma = Instant::now();
         for name in &names_sorted {
-            let info = &gguf.tensors[name];
+            let info = gguf.req_tensor_info(name)?;
             let (dst_off, nb, tt) = tensor_rel_off[name];
             let raw = gguf.tensor_bytes(info, nb);
 
@@ -1136,7 +610,7 @@ impl InklingEngine {
                         }
                     }
                     coalescer.write_at(
-                        &mut gpu,
+                        gpu,
                         dst_off + ((b_cur * pay_len) as u64),
                         &scratch[..take * pay_len],
                     )?;
@@ -1153,17 +627,17 @@ impl InklingEngine {
                         scratch[bi * 2..bi * 2 + 2].copy_from_slice(&raw[s_off..s_off + 2]);
                     }
                     coalescer.write_at(
-                        &mut gpu,
+                        gpu,
                         d_base_off + ((b_cur * 2) as u64),
                         &scratch[..take * 2],
                     )?;
                     b_cur += take;
                 }
             } else {
-                coalescer.write_at(&mut gpu, dst_off, raw)?;
+                coalescer.write_at(gpu, dst_off, raw)?;
             }
         }
-        coalescer.flush(&mut gpu)?;
+        coalescer.flush(gpu)?;
         drop(scratch);
         drop(coalescer);
         let dma_gbps = (total_w_bytes as f64 / 1e9) / t_dma.elapsed().as_secs_f64().max(1e-6);
@@ -1523,20 +997,30 @@ impl InklingEngine {
             .unwrap_or(7)
             .clamp(1, 7);
 
-        let dspark = if cfg.loop_passes == 3 {
+        let (dspark, pre_dspark_cp) = if cfg.loop_passes == 3 {
             if let Some(mtp_path) = discover_mtp_safetensors(&model_path) {
-                match InkDSparkState::load(&mut gpu, &module, &mtp_path, &cfg, output_w.va, output_w.ggml_type) {
-                    Ok(st) => Some(st),
+                let cp = gpu.checkpoint_vram();
+                match InkDSparkState::load(
+                    gpu,
+                    &module,
+                    &mtp_path,
+                    cfg.vocab_unpadded,
+                    cfg.max_ctx,
+                    output_w.va,
+                    output_w.ggml_type,
+                ) {
+                    Ok(st) => (Some(st), Some(cp)),
                     Err(e) => {
+                        gpu.restore_vram_checkpoint(cp);
                         eprintln!("[dspark-nv] Warning: failed to load {}: {} (falling back to B=1 persistent)", mtp_path.display(), e);
-                        None
+                        (None, None)
                     }
                 }
             } else {
-                None
+                (None, None)
             }
         } else {
-            None
+            (None, None)
         };
 
         let kv_mb = ((swa_k_buf.size + swa_v_buf.size + full_k_buf.size + full_v_buf.size + conv_state_buf.size)
@@ -1560,7 +1044,6 @@ impl InklingEngine {
         );
 
         Ok(Self {
-            gpu,
             module,
             cfg,
             tok,
@@ -1581,6 +1064,7 @@ impl InklingEngine {
             conv_total_floats,
             dspark_taps_va: wb + o_dspark_taps,
             dspark,
+            pre_dspark_cp,
             dspark_gamma,
             dspark_cache_valid: false,
             cached_tokens: Vec::new(),
@@ -1588,8 +1072,8 @@ impl InklingEngine {
         })
     }
 
-    pub fn reset_cache(&mut self) -> Result<(), String> {
-        self.gpu.zero_vram(&self.conv_state_buf)?;
+    pub fn reset_cache(&mut self, gpu: &mut NvGpu) -> Result<(), String> {
+        gpu.zero_vram(&self.conv_state_buf)?;
         self.cached_tokens.clear();
         self.dspark_cache_valid = false;
         Ok(())
@@ -1700,8 +1184,9 @@ impl InklingEngine {
 
     /// Execute one batched `BM <= 8` 48-layer forward pass (`ink_batch_forward_bm8_megakernel`) across all 68 SMs.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_batch(
+    fn forward_batch(
         &mut self,
+        gpu: &mut NvGpu,
         tokens: &[i32],
         start_pos: usize,
         logits_mask: u32,
@@ -1752,52 +1237,28 @@ impl InklingEngine {
         put_u64(&mut mk_args, 0, self.model_desc_va);
         put_u64(&mut mk_args, 8, self.ctrl_host.va_addr);
 
-        self.gpu.timeline_value += 1;
-        let sig_val = self.gpu.timeline_value;
-        let sig_va = self.gpu.timeline_buf.va_addr;
-        let k_bm8 = &self.module.kernels["ink_batch_forward_bm8_megakernel"];
-        let (qmd_va, _) = self.gpu.prepare_qmd(
+        let k_bm8 = self.module.kernel("ink_batch_forward_bm8_megakernel")?;
+        let err = gpu.launch_kernel_watched(
             k_bm8,
-            (self.gpu.active_sms, 1, 1),
+            (gpu.active_sms, 1, 1),
             (512, 1, 1),
             &mk_args,
-            Some((sig_va, sig_val)),
-        );
-        self.gpu.launch_qmd_chain(qmd_va, true)?;
-
-        let sig_ptr = self.gpu.timeline_buf.as_ptr() as *const u64;
-        let t_wait = Instant::now();
-        let mut iter = 0u32;
-        loop {
-            let cur_sig = unsafe { std::ptr::read_volatile(sig_ptr) };
-            if cur_sig >= sig_val || (sig_val < (1u64 << 31) && (cur_sig & 0xffff_ffff) >= sig_val) {
-                break;
-            }
-            let err = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).error_code) };
-            if err != 0 {
-                let _ = self.gpu.zero_vram(&self.ws_bar_state_buf);
-                return Err(format!("ink_batch_forward_bm8_megakernel barrier watchdog tripped at {}", err));
-            }
-            iter = iter.wrapping_add(1);
-            if (iter & 0x3fff) == 0 {
-                self.gpu.poll_gsp_faults()?;
-                if t_wait.elapsed() > Duration::from_millis(2) {
-                    let _ = self.gpu.pci.ring_doorbell(self.gpu.compute_gpfifo.token);
-                }
-                if t_wait.elapsed() > Duration::from_secs(30) {
-                    unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
-                    return Err("ink_batch_forward_bm8_megakernel timed out (>30s)".into());
-                }
-            }
-            std::hint::spin_loop();
+            true,
+            unsafe { &(*ctrl_ptr).error_code as *const i32 },
+            unsafe { &mut (*ctrl_ptr).cancel_flag as *mut i32 },
+            Duration::from_secs(30),
+            "ink_batch_forward_bm8_megakernel",
+        )?;
+        if err != 0 {
+            let _ = gpu.zero_vram(&self.ws_bar_state_buf);
+            return Err(format!("ink_batch_forward_bm8_megakernel barrier watchdog tripped at {}", err));
         }
-
         let out = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).batch_out_toks) };
         Ok(out)
     }
 
     /// Restore `ShortConv` state from `conv_backup[slot_b]` (`~5 us` VRAM-to-VRAM copy) after speculative rejection.
-    pub fn restore_conv_backup(&mut self, slot_b: usize) -> Result<(), String> {
+    fn restore_conv_backup(&mut self, gpu: &mut NvGpu, slot_b: usize) -> Result<(), String> {
         assert!(slot_b < 8);
         let src_va = self.conv_backup_buf.va_addr + ((slot_b * self.conv_total_floats * 4) as u64);
         let mut args = [0u8; 20];
@@ -1805,95 +1266,34 @@ impl InklingEngine {
         put_u64(&mut args, 8, src_va);
         args[16..20].copy_from_slice(&(self.conv_total_floats as i32).to_le_bytes());
 
-        self.gpu.timeline_value += 1;
-        let sig_val = self.gpu.timeline_value;
-        let sig_va = self.gpu.timeline_buf.va_addr;
-        let k_cp = &self.module.kernels["ink_copy_f32_vram_kernel"];
-        let (qmd_va, _) = self.gpu.prepare_qmd(
-            k_cp,
-            (self.gpu.active_sms, 1, 1),
-            (512, 1, 1),
-            &args,
-            Some((sig_va, sig_val)),
-        );
-        self.gpu.launch_qmd_chain(qmd_va, false)?;
-        self.gpu.wait_timeline(sig_val, Duration::from_secs(5))
+        let k_cp = self.module.kernel("ink_copy_f32_vram_kernel")?;
+        gpu.launch_kernel_sync(k_cp, (gpu.active_sms, 1, 1), (512, 1, 1), &args, false, Duration::from_secs(5))
     }
 
-    /// Inject `inject_cnt` (`1..=8`) target hidden tap rows from `ws_dspark_taps` into `draft_k/v [inject_pos ..]` + `ws_f_rnn`.
-    pub fn dspark_inject_kv(&mut self, inject_pos: usize, inject_cnt: usize) -> Result<(), String> {
-        let dspark_va = match self.dspark {
-            Some(ref d) => d.desc_va,
-            None => return Ok(()),
+    fn dspark_inject_kv(&mut self, gpu: &mut NvGpu, inject_pos: usize, inject_cnt: usize) -> Result<(), String> {
+        let Some(ref d) = self.dspark else {
+            return Ok(());
         };
         if inject_cnt == 0 {
             return Ok(());
         }
-        assert!(inject_cnt <= 8);
-
         self.done_seq_counter += 1;
-        let expected_seq = self.done_seq_counter;
-        let ctrl_ptr = self.ctrl_host.as_ptr() as *mut InkRunCtrl;
-        unsafe {
-            (*ctrl_ptr).cancel_flag = 0;
-            (*ctrl_ptr).error_code = 0;
-            (*ctrl_ptr).inject_pos = inject_pos as i32;
-            (*ctrl_ptr).inject_cnt = inject_cnt as i32;
-            (*ctrl_ptr).expected_seq = expected_seq;
-        }
-        fence(Ordering::SeqCst);
-
-        let mut args = [0u8; 24];
-        put_u64(&mut args, 0, self.model_desc_va);
-        put_u64(&mut args, 8, dspark_va);
-        put_u64(&mut args, 16, self.ctrl_host.va_addr);
-
-        self.gpu.timeline_value += 1;
-        let sig_val = self.gpu.timeline_value;
-        let sig_va = self.gpu.timeline_buf.va_addr;
-        let k_inj = &self.module.kernels["ink_dspark_inject_kv_kernel"];
-        let (qmd_va, _) = self.gpu.prepare_qmd(
-            k_inj,
-            (self.gpu.active_sms, 1, 1),
-            (512, 1, 1),
-            &args,
-            Some((sig_va, sig_val)),
-        );
-        self.gpu.launch_qmd_chain(qmd_va, true)?;
-
-        let sig_ptr = self.gpu.timeline_buf.as_ptr() as *const u64;
-        let t_wait = Instant::now();
-        let mut iter = 0u32;
-        loop {
-            let cur_sig = unsafe { std::ptr::read_volatile(sig_ptr) };
-            if cur_sig >= sig_val || (sig_val < (1u64 << 31) && (cur_sig & 0xffff_ffff) >= sig_val) {
-                break;
-            }
-            let err = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).error_code) };
-            if err != 0 {
-                let _ = self.gpu.zero_vram(&self.ws_bar_state_buf);
-                return Err(format!("ink_dspark_inject_kv_kernel barrier watchdog tripped at {}", err));
-            }
-            iter = iter.wrapping_add(1);
-            if (iter & 0x3fff) == 0 {
-                self.gpu.poll_gsp_faults()?;
-                if t_wait.elapsed() > Duration::from_millis(2) {
-                    let _ = self.gpu.pci.ring_doorbell(self.gpu.compute_gpfifo.token);
-                }
-                if t_wait.elapsed() > Duration::from_secs(10) {
-                    unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
-                    return Err("ink_dspark_inject_kv_kernel timed out (>10s)".into());
-                }
-            }
-            std::hint::spin_loop();
-        }
-        Ok(())
+        d.inject_kv(
+            gpu,
+            &self.module,
+            self.model_desc_va,
+            &self.ctrl_host,
+            &self.ws_bar_state_buf,
+            self.done_seq_counter,
+            inject_pos,
+            inject_cnt,
+        )
     }
 
-    /// Propose `bd_len - 1` (`gamma = 7` for `bd_len = 8`) draft tokens in one fused 68-SM launch (`~2.3 ms`),
-    /// optionally folding in `inject_cnt` committed context taps from `ws_dspark_taps` (`0` extra doorbells!).
-    pub fn dspark_propose(
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_propose(
         &mut self,
+        gpu: &mut NvGpu,
         anchor_tok: i32,
         anchor_pos: usize,
         bd_len: usize,
@@ -1901,108 +1301,28 @@ impl InklingEngine {
         inject_pos: usize,
         inject_cnt: usize,
     ) -> Result<[i32; 8], String> {
-        let dspark_va = self
-            .dspark
-            .as_ref()
-            .ok_or_else(|| "DSpark drafter is not loaded".to_string())?
-            .desc_va;
-        assert!((2..=8).contains(&bd_len));
-        assert!(inject_cnt <= 8);
-
+        let d = self.dspark.as_ref().ok_or_else(|| "DSpark drafter is not loaded".to_string())?;
         self.done_seq_counter += 1;
-        let expected_seq = self.done_seq_counter;
-        let ctrl_ptr = self.ctrl_host.as_ptr() as *mut InkRunCtrl;
-        unsafe {
-            (*ctrl_ptr).start_token = anchor_tok;
-            (*ctrl_ptr).start_pos = anchor_pos as i32;
-            (*ctrl_ptr).max_steps = req_gamma.clamp(1, 7) as i32;
-            (*ctrl_ptr).batch_len = bd_len as i32;
-            (*ctrl_ptr).cancel_flag = 0;
-            (*ctrl_ptr).error_code = 0;
-            (*ctrl_ptr).inject_pos = inject_pos as i32;
-            (*ctrl_ptr).inject_cnt = inject_cnt as i32;
-            (*ctrl_ptr).batch_out_toks = [0; 8];
-            (*ctrl_ptr).expected_seq = expected_seq;
-        }
-        fence(Ordering::SeqCst);
-
-        let mut args = [0u8; 24];
-        put_u64(&mut args, 0, self.model_desc_va);
-        put_u64(&mut args, 8, dspark_va);
-        put_u64(&mut args, 16, self.ctrl_host.va_addr);
-
-        self.gpu.timeline_value += 1;
-        let sig_val = self.gpu.timeline_value;
-        let sig_va = self.gpu.timeline_buf.va_addr;
-        let k_prop = &self.module.kernels["ink_dspark_propose_megakernel"];
-        let (qmd_va, _) = self.gpu.prepare_qmd(
-            k_prop,
-            (self.gpu.active_sms, 1, 1),
-            (512, 1, 1),
-            &args,
-            Some((sig_va, sig_val)),
-        );
-        self.gpu.launch_qmd_chain(qmd_va, true)?;
-
-        let sig_ptr = self.gpu.timeline_buf.as_ptr() as *const u64;
-        let t_wait = Instant::now();
-        let mut iter = 0u32;
-        loop {
-            let cur_sig = unsafe { std::ptr::read_volatile(sig_ptr) };
-            if cur_sig >= sig_val || (sig_val < (1u64 << 31) && (cur_sig & 0xffff_ffff) >= sig_val) {
-                break;
-            }
-            let err = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).error_code) };
-            if err != 0 {
-                let _ = self.gpu.zero_vram(&self.ws_bar_state_buf);
-                return Err(format!("ink_dspark_propose_megakernel barrier watchdog tripped at {}", err));
-            }
-            iter = iter.wrapping_add(1);
-            if (iter & 0x3fff) == 0 {
-                self.gpu.poll_gsp_faults()?;
-                if t_wait.elapsed() > Duration::from_millis(2) {
-                    let _ = self.gpu.pci.ring_doorbell(self.gpu.compute_gpfifo.token);
-                }
-                if t_wait.elapsed() > Duration::from_secs(15) {
-                    unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
-                    return Err("ink_dspark_propose_megakernel timed out (>15s)".into());
-                }
-            }
-            std::hint::spin_loop();
-        }
-
-        let out = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).batch_out_toks) };
-        Ok(out)
-    }
-
-    pub fn forward_one_token(
-        &mut self,
-        tok_id: i32,
-        pos: usize,
-        compute_logits: bool,
-        temperature: f32,
-        rng_seed: u64,
-        step: u32,
-        passes_override: Option<usize>,
-    ) -> Result<i32, String> {
-        let eff_passes = passes_override.unwrap_or(self.cfg.loop_passes).clamp(1, 3);
-        let out = self.forward_batch(
-            &[tok_id],
-            pos,
-            if compute_logits { 1 } else { 0 },
-            false,
-            false,
-            temperature,
-            rng_seed,
-            step,
-            eff_passes,
-        )?;
-        Ok(out[0])
+        d.propose(
+            gpu,
+            &self.module,
+            self.model_desc_va,
+            &self.ctrl_host,
+            &self.ws_bar_state_buf,
+            self.done_seq_counter,
+            anchor_tok,
+            anchor_pos,
+            bd_len,
+            req_gamma,
+            inject_pos,
+            inject_cnt,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn generate_with_cancel<F>(
         &mut self,
+        gpu: &mut NvGpu,
         prompt_tokens: &[i32],
         max_tokens: usize,
         temperature: f32,
@@ -2034,7 +1354,7 @@ impl InklingEngine {
             && self.dspark_gamma >= 1;
 
         if reset_kv || self.cached_passes != eff_passes || (use_dspark && !self.dspark_cache_valid && !self.cached_tokens.is_empty()) {
-            self.reset_cache()?;
+            self.reset_cache(gpu)?;
             self.cached_passes = eff_passes;
         }
         if !use_dspark {
@@ -2058,7 +1378,7 @@ impl InklingEngine {
             self.cached_tokens.len()
         } else {
             if !self.cached_tokens.is_empty() {
-                self.reset_cache()?;
+                self.reset_cache(gpu)?;
             }
             0
         };
@@ -2075,7 +1395,7 @@ impl InklingEngine {
             let take = (prompt_len - pos).min(8);
             let is_final_chunk = pos + take == prompt_len;
             let logits_mask = if is_final_chunk { 1u32 << (take - 1) } else { 0u32 };
-            let out = self.forward_batch(
+            let out = self.forward_batch(gpu, 
                 &prompt_tokens[pos..pos + take],
                 pos,
                 logits_mask,
@@ -2089,7 +1409,7 @@ impl InklingEngine {
             launches += 1;
             if use_dspark {
                 if !is_final_chunk {
-                    self.dspark_inject_kv(pos, take)?;
+                    self.dspark_inject_kv(gpu, pos, take)?;
                     launches += 1;
                 } else {
                     pending_inject = (pos, take);
@@ -2144,7 +1464,7 @@ impl InklingEngine {
             stop_reason = "stop";
             if use_dspark {
                 if pending_inject.1 > 0 {
-                    self.dspark_inject_kv(pending_inject.0, pending_inject.1)?;
+                    self.dspark_inject_kv(gpu, pending_inject.0, pending_inject.1)?;
                     launches += 1;
                 }
                 self.dspark_cache_valid = true;
@@ -2191,10 +1511,10 @@ impl InklingEngine {
 
                 if rem_gen == 1 || rem_ctx == 1 {
                     if pending_inject.1 > 0 {
-                        self.dspark_inject_kv(pending_inject.0, pending_inject.1)?;
+                        self.dspark_inject_kv(gpu, pending_inject.0, pending_inject.1)?;
                         launches += 1;
                     }
-                    let out = self.forward_batch(
+                    let out = self.forward_batch(gpu, 
                         &[cur_tok],
                         cur_pos,
                         1,
@@ -2229,7 +1549,7 @@ impl InklingEngine {
                 // Cap verification length by gamma, remaining context, and remaining budget!
                 let mut k_ver = self.dspark_gamma.min(rem_ctx - 1).min(rem_gen - 1);
                 // Propose `k_ver` draft tokens in 1 fused 68-SM launch (folding in `pending_inject` for 0 extra doorbells!)
-                let drafts = self.dspark_propose(cur_tok, cur_pos, 8, k_ver, pending_inject.0, pending_inject.1)?;
+                let drafts = self.dspark_propose(gpu, cur_tok, cur_pos, 8, k_ver, pending_inject.0, pending_inject.1)?;
                 launches += 1;
 
                 // Stop verification before any drafted EOS token!
@@ -2246,7 +1566,7 @@ impl InklingEngine {
                     verify_in[1 + j] = drafts[j];
                 }
                 let logits_mask = (1u32 << v_len) - 1;
-                let verify_out = self.forward_batch(
+                let verify_out = self.forward_batch(gpu, 
                     &verify_in[..v_len],
                     cur_pos,
                     logits_mask,
@@ -2300,7 +1620,7 @@ impl InklingEngine {
                 committed_seq.extend_from_slice(&verify_in[..commit_count]);
                 spec_accepted_extra += last_t_idx;
                 if commit_count < v_len {
-                    self.restore_conv_backup(commit_count - 1)?;
+                    self.restore_conv_backup(gpu, commit_count - 1)?;
                     launches += 1;
                 }
                 pending_inject = (cur_pos, commit_count);
@@ -2316,7 +1636,7 @@ impl InklingEngine {
             }
 
             if pending_inject.1 > 0 {
-                self.dspark_inject_kv(pending_inject.0, pending_inject.1)?;
+                self.dspark_inject_kv(gpu, pending_inject.0, pending_inject.1)?;
                 launches += 1;
             }
             self.dspark_cache_valid = true;
@@ -2350,21 +1670,9 @@ impl InklingEngine {
             put_u64(&mut mk_args, 0, self.model_desc_va);
             put_u64(&mut mk_args, 8, self.ctrl_host.va_addr);
 
-            self.gpu.timeline_value += 1;
-            let sig_val = self.gpu.timeline_value;
-            let sig_va = self.gpu.timeline_buf.va_addr;
-            let k_mk = &self.module.kernels["ink_persistent_decode_megakernel"];
-            let (qmd_va, _) = self.gpu.prepare_qmd(
-                k_mk,
-                (self.gpu.active_sms, 1, 1),
-                (512, 1, 1),
-                &mk_args,
-                Some((sig_va, sig_val)),
-            );
-            self.gpu.launch_qmd_chain(qmd_va, true)?;
+            let k_mk = self.module.kernel("ink_persistent_decode_megakernel")?;
+            let sig_val = gpu.launch_persistent_async(k_mk, (gpu.active_sms, 1, 1), (512, 1, 1), &mk_args, true)?;
             launches += 1;
-
-            let sig_ptr = self.gpu.timeline_buf.as_ptr() as *const u64;
             let rollout_t0 = Instant::now();
             let mut streamed = 0usize;
             let mut prev_uncommitted = first_tok;
@@ -2404,8 +1712,7 @@ impl InklingEngine {
                     unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
                 }
 
-                let cur_sig = unsafe { std::ptr::read_volatile(sig_ptr) };
-                if cur_sig >= sig_val || (sig_val < (1u64 << 31) && (cur_sig & 0xffff_ffff) >= sig_val) {
+                if gpu.is_ticket_done(sig_val) {
                     let final_steps =
                         unsafe { std::ptr::read_volatile(&(*ctrl_ptr).steps_completed) } as usize;
                     while streamed < final_steps {
@@ -2462,24 +1769,18 @@ impl InklingEngine {
 
                 let err = unsafe { std::ptr::read_volatile(&(*ctrl_ptr).error_code) };
                 if err != 0 {
-                    let _ = self.gpu.zero_vram(&self.ws_bar_state_buf);
+                    let _ = gpu.zero_vram(&self.ws_bar_state_buf);
                     self.cached_tokens.clear();
                     return Err(format!(
                         "ink_persistent_decode_megakernel barrier watchdog tripped at step {}",
                         err
                     ));
                 }
-                iter = iter.wrapping_add(1);
-                if (iter & 0x3fff) == 0 {
-                    self.gpu.poll_gsp_faults()?;
-                    if streamed == 0 && rollout_t0.elapsed() > Duration::from_millis(2) {
-                        let _ = self.gpu.pci.ring_doorbell(self.gpu.compute_gpfifo.token);
-                    }
-                    if rollout_t0.elapsed() > Duration::from_secs(180) {
-                        unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
-                        self.cached_tokens.clear();
-                        return Err("ink_persistent_decode_megakernel exceeded 180s timeout".into());
-                    }
+                gpu.poll_persistent_maintenance(&mut iter, streamed == 0 && rollout_t0.elapsed() > Duration::from_millis(2))?;
+                if (iter & 0x3fff) == 0 && rollout_t0.elapsed() > Duration::from_secs(180) {
+                    unsafe { std::ptr::write_volatile(&mut (*ctrl_ptr).cancel_flag, 1) };
+                    self.cached_tokens.clear();
+                    return Err("ink_persistent_decode_megakernel exceeded 180s timeout".into());
                 }
                 std::hint::spin_loop();
             }
@@ -2513,6 +1814,7 @@ impl InklingEngine {
 
     pub fn generate<F>(
         &mut self,
+        gpu: &mut NvGpu,
         prompt_tokens: &[i32],
         max_tokens: usize,
         temperature: f32,
@@ -2525,6 +1827,7 @@ impl InklingEngine {
         F: FnMut(i32, &str),
     {
         self.generate_with_cancel(
+            gpu,
             prompt_tokens,
             max_tokens,
             temperature,

@@ -1,6 +1,14 @@
-//! Auto-generated exact Unicode L / N / Z category tables (< 0x323b0) matching llama.cpp & Python unicodedata.
+//! Exact Qwen2 / Qwen3 / Llama3 / Inkling2 GPT-2 Byte-Level BPE Tokenizer and UTF-8 Stream Decoder.
 
-pub const UCAT_L: &[(u32, u32)] = &[
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+
+// -----------------------------------------------------------------------------
+// Exact Unicode L / N / Z Category Tables (< 0x323b0) Matching llama.cpp & Python unicodedata
+// -----------------------------------------------------------------------------
+
+const UCAT_L: &[(u32, u32)] = &[
     (0x41, 0x5a), (0x61, 0x7a), (0xaa, 0xaa), (0xb5, 0xb5), (0xba, 0xba), (0xc0, 0xd6), (0xd8, 0xf6), (0xf8, 0x2c1),
     (0x2c6, 0x2d1), (0x2e0, 0x2e4), (0x2ec, 0x2ec), (0x2ee, 0x2ee), (0x370, 0x374), (0x376, 0x377), (0x37a, 0x37d), (0x37f, 0x37f),
     (0x386, 0x386), (0x388, 0x38a), (0x38c, 0x38c), (0x38e, 0x3a1), (0x3a3, 0x3f5), (0x3f7, 0x481), (0x48a, 0x52f), (0x531, 0x556),
@@ -88,7 +96,7 @@ pub const UCAT_L: &[(u32, u32)] = &[
     (0x2ceb0, 0x2ebe0), (0x2ebf0, 0x2ee5d), (0x2f800, 0x2fa1d), (0x30000, 0x3134a), (0x31350, 0x323af),
 ];
 
-pub const UCAT_N: &[(u32, u32)] = &[
+const UCAT_N: &[(u32, u32)] = &[
     (0x30, 0x39), (0xb2, 0xb3), (0xb9, 0xb9), (0xbc, 0xbe), (0x660, 0x669), (0x6f0, 0x6f9), (0x7c0, 0x7c9), (0x966, 0x96f),
     (0x9e6, 0x9ef), (0x9f4, 0x9f9), (0xa66, 0xa6f), (0xae6, 0xaef), (0xb66, 0xb6f), (0xb72, 0xb77), (0xbe6, 0xbf2), (0xc66, 0xc6f),
     (0xc78, 0xc7e), (0xce6, 0xcef), (0xd58, 0xd5e), (0xd66, 0xd78), (0xde6, 0xdef), (0xe50, 0xe59), (0xed0, 0xed9), (0xf20, 0xf33),
@@ -109,36 +117,460 @@ pub const UCAT_N: &[(u32, u32)] = &[
     (0x1e950, 0x1e959), (0x1ec71, 0x1ecab), (0x1ecad, 0x1ecaf), (0x1ecb1, 0x1ecb4), (0x1ed01, 0x1ed2d), (0x1ed2f, 0x1ed3d), (0x1f100, 0x1f10c), (0x1fbf0, 0x1fbf9),
 ];
 
-pub const UCAT_Z: &[(u32, u32)] = &[
+const UCAT_Z: &[(u32, u32)] = &[
     (0x20, 0x20), (0xa0, 0xa0), (0x1680, 0x1680), (0x2000, 0x200a), (0x2028, 0x2029), (0x202f, 0x202f), (0x205f, 0x205f), (0x3000, 0x3000),
 ];
 
 #[inline]
 fn in_ranges(cp: u32, ranges: &[(u32, u32)]) -> bool {
-    ranges.binary_search_by(|&(lo, hi)| {
-        if cp < lo { std::cmp::Ordering::Greater }
-        else if cp > hi { std::cmp::Ordering::Less }
-        else { std::cmp::Ordering::Equal }
-    }).is_ok()
+    ranges
+        .binary_search_by(|&(lo, hi)| {
+            if cp < lo {
+                std::cmp::Ordering::Greater
+            } else if cp > hi {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 #[inline]
-pub fn is_ucat_l(c: char) -> bool {
+fn is_ucat_l(c: char) -> bool {
     let cp = c as u32;
-    if cp < 128 { return c.is_ascii_alphabetic(); }
+    if cp < 128 {
+        return c.is_ascii_alphabetic();
+    }
     in_ranges(cp, UCAT_L)
 }
 
 #[inline]
-pub fn is_ucat_n(c: char) -> bool {
+fn is_ucat_n(c: char) -> bool {
     let cp = c as u32;
-    if cp < 128 { return c.is_ascii_digit(); }
+    if cp < 128 {
+        return c.is_ascii_digit();
+    }
     in_ranges(cp, UCAT_N)
 }
 
 #[inline]
-pub fn is_gpt2_ws(c: char) -> bool {
+fn is_gpt2_ws(c: char) -> bool {
     let cp = c as u32;
-    if cp < 128 { return matches!(cp, 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x20); }
+    if cp < 128 {
+        return matches!(cp, 0x09 | 0x0a | 0x0b | 0x0c | 0x0d | 0x20);
+    }
     cp == 0x85 || in_ranges(cp, UCAT_Z)
+}
+
+// -----------------------------------------------------------------------------
+// Exact Qwen2 / Qwen3 / Llama3 / Inkling2 GPT-2 Byte-Level BPE Tokenizer
+// -----------------------------------------------------------------------------
+
+pub struct BpeTokenizer {
+    preset: String,
+    normal_tokens: HashMap<Vec<u8>, i32>,
+    special_tokens: HashMap<String, i32>,
+    special_list: Vec<(String, i32)>,
+    tok2bytes: Vec<Vec<u8>>,
+}
+
+impl BpeTokenizer {
+    pub fn from_vocab(
+        tokens: &[String],
+        types_opt: Option<&[i32]>,
+        raw_pre: &str,
+    ) -> Result<Self, String> {
+        let preset = match raw_pre {
+            "qwen35" | "qwen35moe" => "qwen2",
+            other => other,
+        }
+        .to_string();
+
+        let mut byte_dec = HashMap::<char, u8>::with_capacity(256);
+        let mut direct = [false; 256];
+        for b in (33u16..127).chain(161..173).chain(174..256) {
+            direct[b as usize] = true;
+            byte_dec.insert(char::from_u32(b as u32).unwrap(), b as u8);
+        }
+        let mut extra_idx = 0u32;
+        for b in 0..256usize {
+            if !direct[b] {
+                byte_dec.insert(char::from_u32(256 + extra_idx).unwrap(), b as u8);
+                extra_idx += 1;
+            }
+        }
+
+        let mut normal_tokens = HashMap::with_capacity(tokens.len());
+        let mut special_tokens = HashMap::new();
+        let mut special_list = Vec::new();
+        let mut tok2bytes = vec![Vec::new(); tokens.len()];
+
+        for (idx, tok_str) in tokens.iter().enumerate() {
+            let tid = idx as i32;
+            let ttype = types_opt.map(|ts| ts[idx]).unwrap_or(1);
+            if ttype == 1 {
+                let mut raw_bytes = Vec::with_capacity(tok_str.len());
+                let mut ok = true;
+                for c in tok_str.chars() {
+                    if let Some(&b) = byte_dec.get(&c) {
+                        raw_bytes.push(b);
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    tok2bytes[idx] = raw_bytes.clone();
+                    normal_tokens.insert(raw_bytes, tid);
+                } else {
+                    let fb = tok_str.as_bytes().to_vec();
+                    tok2bytes[idx] = fb.clone();
+                    normal_tokens.insert(fb, tid);
+                }
+            } else {
+                let sb = tok_str.as_bytes().to_vec();
+                tok2bytes[idx] = sb;
+                if !tok_str.is_empty() {
+                    special_tokens.insert(tok_str.clone(), tid);
+                    special_list.push((tok_str.clone(), tid));
+                }
+            }
+        }
+
+        Ok(Self {
+            preset,
+            normal_tokens,
+            special_tokens,
+            special_list,
+            tok2bytes,
+        })
+    }
+
+    #[inline]
+    pub fn preset(&self) -> &str {
+        &self.preset
+    }
+
+    #[inline]
+    pub fn special_id(&self, s: &str) -> Option<i32> {
+        self.special_tokens.get(s).copied()
+    }
+
+    /// Exact implementation of llama.cpp / Qwen2 / Llama3 GPT-2 regex pre-tokenizer:
+    /// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{N}\p{L}]?[\p{L}]+|[\p{N}]{1,3}| ?[^\s\p{N}\p{L}]+[\r\n]*|[\s]*[\r\n]+|[\s]+(?![^\s])|[\s]+`
+    pub fn split_to_words(chunk: &str) -> Vec<&str> {
+        if chunk.is_empty() {
+            return Vec::new();
+        }
+        let chars: Vec<(usize, char)> = chunk.char_indices().collect();
+        let n = chars.len();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+
+        let slice_range = |start_ci: usize, end_ci: usize| -> &str {
+            let b0 = chars[start_ci].0;
+            let b1 = if end_ci < n { chars[end_ci].0 } else { chunk.len() };
+            &chunk[b0..b1]
+        };
+
+        while i < n {
+            let c0 = chars[i].1;
+
+            // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+            if c0 == '\'' && i + 1 < n {
+                let c1 = chars[i + 1].1.to_ascii_lowercase();
+                if i + 2 < n {
+                    let c2 = chars[i + 2].1.to_ascii_lowercase();
+                    if (c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l') {
+                        out.push(slice_range(i, i + 3));
+                        i += 3;
+                        continue;
+                    }
+                }
+                if matches!(c1, 's' | 't' | 'm' | 'd') {
+                    out.push(slice_range(i, i + 2));
+                    i += 2;
+                    continue;
+                }
+            }
+
+            // 2. [^\r\n\p{N}\p{L}]?[\p{L}]+
+            if is_ucat_l(c0) {
+                let mut j = i + 1;
+                while j < n && is_ucat_l(chars[j].1) {
+                    j += 1;
+                }
+                out.push(slice_range(i, j));
+                i = j;
+                continue;
+            }
+            if c0 != '\r' && c0 != '\n' && !is_ucat_n(c0) && i + 1 < n && is_ucat_l(chars[i + 1].1) {
+                let mut j = i + 2;
+                while j < n && is_ucat_l(chars[j].1) {
+                    j += 1;
+                }
+                out.push(slice_range(i, j));
+                i = j;
+                continue;
+            }
+
+            // 3. [\p{N}]{1,3}
+            if is_ucat_n(c0) {
+                let mut j = i + 1;
+                while j < n && j - i < 3 && is_ucat_n(chars[j].1) {
+                    j += 1;
+                }
+                out.push(slice_range(i, j));
+                i = j;
+                continue;
+            }
+
+            // 4. ` ?[^\s\p{N}\p{L}]+[\r\n]*`
+            {
+                let p0 = if c0 == ' ' { i + 1 } else { i };
+                if p0 < n {
+                    let cp = chars[p0].1;
+                    if !is_gpt2_ws(cp) && !is_ucat_n(cp) && !is_ucat_l(cp) {
+                        let mut j = p0 + 1;
+                        while j < n {
+                            let cj = chars[j].1;
+                            if !is_gpt2_ws(cj) && !is_ucat_n(cj) && !is_ucat_l(cj) {
+                                j += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        while j < n && (chars[j].1 == '\r' || chars[j].1 == '\n') {
+                            j += 1;
+                        }
+                        out.push(slice_range(i, j));
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+
+            // Branches 5, 6, 7 all start with `is_gpt2_ws(c0)`
+            if is_gpt2_ws(c0) {
+                let mut ws_end = i + 1;
+                let mut last_crlf = if c0 == '\r' || c0 == '\n' { Some(i + 1) } else { None };
+                while ws_end < n && is_gpt2_ws(chars[ws_end].1) {
+                    if chars[ws_end].1 == '\r' || chars[ws_end].1 == '\n' {
+                        last_crlf = Some(ws_end + 1);
+                    }
+                    ws_end += 1;
+                }
+
+                // 5. [\s]*[\r\n]+
+                if let Some(crlf_end) = last_crlf {
+                    out.push(slice_range(i, crlf_end));
+                    i = crlf_end;
+                    continue;
+                }
+
+                // 6. [\s]+(?![^\s])
+                if ws_end == n {
+                    out.push(slice_range(i, ws_end));
+                    i = ws_end;
+                    continue;
+                }
+                if ws_end - i >= 2 {
+                    out.push(slice_range(i, ws_end - 1));
+                    i = ws_end - 1;
+                    continue;
+                }
+
+                // 7. [\s]+
+                out.push(slice_range(i, ws_end));
+                i = ws_end;
+                continue;
+            }
+
+            out.push(slice_range(i, i + 1));
+            i += 1;
+        }
+        out
+    }
+
+    fn encode_word(&self, word: &[u8]) -> Vec<i32> {
+        if let Some(&tid) = self.normal_tokens.get(word) {
+            return vec![tid];
+        }
+        let mut parts: Vec<Vec<u8>> = word.iter().map(|&b| vec![b]).collect();
+        while parts.len() >= 2 {
+            let mut best_rank = i32::MAX;
+            let mut best_idx = None;
+            let mut merged_probe = Vec::with_capacity(32);
+            for j in 0..(parts.len() - 1) {
+                merged_probe.clear();
+                merged_probe.extend_from_slice(&parts[j]);
+                merged_probe.extend_from_slice(&parts[j + 1]);
+                if let Some(&rank) = self.normal_tokens.get(&merged_probe) {
+                    if rank < best_rank {
+                        best_rank = rank;
+                        best_idx = Some(j);
+                    }
+                }
+            }
+            let Some(idx) = best_idx else { break };
+            let right = parts.remove(idx + 1);
+            parts[idx].extend_from_slice(&right);
+        }
+        parts
+            .into_iter()
+            .filter_map(|p| self.normal_tokens.get(&p).copied())
+            .collect()
+    }
+
+    fn encode_sentence(&self, chunk: &str, out: &mut Vec<i32>) {
+        if matches!(self.preset.as_str(), "inkling2" | "gpt-4o") {
+            let words = Self::split_to_words(chunk);
+            let mut k = 0usize;
+            while k < words.len() {
+                if k + 1 < words.len()
+                    && words[k + 1].starts_with('\'')
+                    && words[k].chars().last().map(is_ucat_l).unwrap_or(false)
+                {
+                    let mut combined = Vec::with_capacity(words[k].len() + words[k + 1].len());
+                    combined.extend_from_slice(words[k].as_bytes());
+                    combined.extend_from_slice(words[k + 1].as_bytes());
+                    out.extend(self.encode_word(&combined));
+                    k += 2;
+                    continue;
+                }
+                out.extend(self.encode_word(words[k].as_bytes()));
+                k += 1;
+            }
+            return;
+        }
+        for w in Self::split_to_words(chunk) {
+            out.extend(self.encode_word(w.as_bytes()));
+        }
+    }
+
+    pub fn encode(&self, text: &str) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos < text.len() {
+            let rem = &text[pos..];
+            let mut best_match: Option<(usize, usize, i32)> = None;
+            if rem.contains('<') {
+                for (stok, tid) in &self.special_list {
+                    if let Some(rel) = rem.find(stok.as_str()) {
+                        if best_match.map_or(true, |(cur_rel, _, _)| rel < cur_rel) {
+                            best_match = Some((rel, stok.len(), *tid));
+                        }
+                    }
+                }
+            }
+            if let Some((rel, slen, tid)) = best_match {
+                if rel > 0 {
+                    self.encode_sentence(&rem[..rel], &mut out);
+                }
+                out.push(tid);
+                pos += rel + slen;
+            } else {
+                self.encode_sentence(rem, &mut out);
+                break;
+            }
+        }
+        out
+    }
+
+    pub fn role_tokens(&self, role: &str) -> Vec<i32> {
+        match self.preset.as_str() {
+            "olmo" => self.encode(&format!("<|{}|>\n", role)),
+            "kimi-k2" => self.encode(&format!("<|im_{}|>{}<|im_middle|>", role, role)),
+            "qwen2" => self.encode(&format!("<|im_start|>{}\n", role)),
+            _ => self.encode(&format!("<|start_header_id|>{}<|end_header_id|>\n\n", role)),
+        }
+    }
+
+    pub fn end_turn_tokens(&self, im_end_id: i32) -> Vec<i32> {
+        match self.preset.as_str() {
+            "olmo" => self.encode("\n"),
+            "qwen2" => {
+                let mut v = vec![im_end_id];
+                v.extend(self.encode("\n"));
+                v
+            }
+            _ => vec![im_end_id],
+        }
+    }
+
+    #[inline]
+    pub fn token_bytes(&self, tid: i32) -> &[u8] {
+        if tid >= 0 && (tid as usize) < self.tok2bytes.len() {
+            &self.tok2bytes[tid as usize]
+        } else {
+            &[]
+        }
+    }
+
+    pub fn decode(&self, ids: &[i32]) -> String {
+        let mut bytes = Vec::with_capacity(ids.len() * 4);
+        for &id in ids {
+            bytes.extend_from_slice(self.token_bytes(id));
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    pub fn find_token_id(&self, s: &str) -> Option<i32> {
+        if let Some(&id) = self.special_tokens.get(s) {
+            return Some(id);
+        }
+        self.normal_tokens.get(s.as_bytes()).copied()
+    }
+}
+
+/// Incremental UTF-8 stream decoder so multi-byte UTF-8 characters never emit `U+FFFD` mid-char.
+pub struct Utf8StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8StreamDecoder {
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::with_capacity(8),
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(valid) => {
+                    out.push_str(valid);
+                    self.pending.clear();
+                    break;
+                }
+                Err(e) => {
+                    let valid_up_to = e.valid_up_to();
+                    if valid_up_to > 0 {
+                        out.push_str(unsafe { std::str::from_utf8_unchecked(&self.pending[..valid_up_to]) });
+                        self.pending.drain(..valid_up_to);
+                    }
+                    if let Some(err_len) = e.error_len() {
+                        out.push('\u{FFFD}');
+                        self.pending.drain(..err_len);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn flush(&mut self) -> String {
+        if self.pending.is_empty() {
+            String::new()
+        } else {
+            let s = String::from_utf8_lossy(&self.pending).into_owned();
+            self.pending.clear();
+            s
+        }
+    }
 }

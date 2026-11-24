@@ -13,14 +13,13 @@ use std::path::Path;
 use std::sync::atomic::{fence, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::engine::{QwenDecodeCtrl, QwenLayerDesc, QwenModelDesc};
+use super::qwen_abi::{QwenDecodeCtrl, QwenLayerDesc, QwenModelDesc};
 use crate::gguf::{
     decode_1d_f32, extract_quant_weight_bytes, precompute_freqs_cis_f32, resolve_model_path,
-    BpeTokenizer, GgufFile, QwenModelConfig,
+    GgufFile, QwenModelConfig,
 };
+use crate::hw::{put_u32, put_u64, CubinModule, HostMappedBuffer, NvGpu, VramBuffer};
 use crate::lora::{prepare_lora_from_path, QwenLayerLoraDesc, LORA_ARENA_DEFAULT_BYTES};
-use crate::nv_defs::{put_u32, put_u64, QmdV3};
-use crate::nv_hw::{CubinModule, HostMappedBuffer, NvGpu, VramBuffer};
 
 const DRAFT_PREFILL_CHUNK: usize = 64;
 const NGRAM_BIN_MAGIC: &[u8; 4] = b"QDNG";
@@ -29,14 +28,39 @@ const NGRAM_BIN_MAGIC: &[u8; 4] = b"QDNG";
 // Patched-Trace Calibrated High-Precision N-Gram Prior (`5`-gram + `4`-gram)
 // -----------------------------------------------------------------------------
 
+fn json_esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[derive(Clone, Default)]
 pub struct CalibratedNgramPrior {
-    pub map5: HashMap<(i32, i32, i32, i32, i32), [i32; 3]>,
-    pub map4: HashMap<(i32, i32, i32, i32), [i32; 3]>,
-    pub source_path: String,
+    map5: HashMap<(i32, i32, i32, i32, i32), [i32; 3]>,
+    map4: HashMap<(i32, i32, i32, i32), [i32; 3]>,
+    source_path: String,
 }
 
 impl CalibratedNgramPrior {
+    #[inline]
+    pub fn counts(&self) -> (usize, usize) {
+        (self.map5.len(), self.map4.len())
+    }
+
+    #[inline]
+    pub fn source_path(&self) -> &str {
+        &self.source_path
+    }
+
     pub fn load_bin(path: &Path) -> Result<Self, String> {
         let b = fs::read(path)
             .map_err(|e| format!("Failed reading calibrated drafter prior {}: {}", path.display(), e))?;
@@ -186,9 +210,9 @@ impl CalibratedNgramPrior {
 // -----------------------------------------------------------------------------
 
 pub struct QwenNeuralDrafter {
-    pub model_ref: String,
-    pub cfg: QwenModelConfig,
-    pub vram_bytes: u64,
+    model_ref: String,
+    cfg: QwenModelConfig,
+    vram_bytes: u64,
 
     _owned_vram: Vec<VramBuffer>,
     layers_host: Vec<QwenLayerDesc>,
@@ -214,11 +238,64 @@ pub struct QwenNeuralDrafter {
 
     ctrl_buf: HostMappedBuffer,
     prefill_toks_buf: HostMappedBuffer,
-    pub synced_tokens: Vec<i32>,
-    pub calibrated_prior: Option<CalibratedNgramPrior>,
+    synced_tokens: Vec<i32>,
+    calibrated_prior: Option<CalibratedNgramPrior>,
 }
 
 impl QwenNeuralDrafter {
+    #[inline]
+    pub fn model_ref(&self) -> &str {
+        &self.model_ref
+    }
+
+    #[inline]
+    pub fn has_prior(&self) -> bool {
+        self.calibrated_prior.is_some()
+    }
+
+    pub fn set_prior(&mut self, prior: CalibratedNgramPrior) -> (usize, usize) {
+        let counts = prior.counts();
+        self.calibrated_prior = Some(prior);
+        counts
+    }
+
+    pub fn load_prior(&mut self, prior_path: &Path) -> Result<(usize, usize), String> {
+        let prior = CalibratedNgramPrior::load_bin(prior_path)?;
+        let counts = prior.counts();
+        self.calibrated_prior = Some(prior);
+        Ok(counts)
+    }
+
+    pub fn status_json(&self, load_ms_opt: Option<f64>) -> String {
+        let (n5, n4, ppath) = if let Some(ref pr) = self.calibrated_prior {
+            let (c5, c4) = pr.counts();
+            (c5, c4, pr.source_path())
+        } else {
+            (0, 0, "")
+        };
+        if let Some(load_ms) = load_ms_opt {
+            format!(
+                "{{\"active\":true,\"model_ref\":\"{}\",\"model_name\":\"{}\",\"vram_mb\":{:.2},\"prior_5grams\":{},\"prior_4grams\":{},\"load_ms\":{:.2}}}",
+                json_esc(&self.model_ref),
+                json_esc(&self.cfg.model_name),
+                (self.vram_bytes as f64) / (1024.0 * 1024.0),
+                n5,
+                n4,
+                load_ms
+            )
+        } else {
+            format!(
+                "{{\"active\":true,\"model_ref\":\"{}\",\"model_name\":\"{}\",\"vram_mb\":{:.2},\"prior_5grams\":{},\"prior_4grams\":{},\"prior_path\":\"{}\"}}",
+                json_esc(&self.model_ref),
+                json_esc(&self.cfg.model_name),
+                (self.vram_bytes as f64) / (1024.0 * 1024.0),
+                n5,
+                n4,
+                json_esc(ppath)
+            )
+        }
+    }
+
     pub fn load(gpu: &mut NvGpu, draft_ref: &str, max_context: usize) -> Result<Self, String> {
         let t0 = Instant::now();
         let eff_ref = if draft_ref.trim().is_empty() {
@@ -229,7 +306,7 @@ impl QwenNeuralDrafter {
         let local_path = resolve_model_path(eff_ref)?;
         let stem = local_path.file_stem().and_then(|s| s.to_str()).unwrap_or("qwen-draft");
         let gguf = GgufFile::open(&local_path)?;
-        let tok = BpeTokenizer::from_gguf(&gguf)?;
+        let tok = gguf.build_tokenizer()?;
         let cfg = QwenModelConfig::from_gguf(&gguf, &tok, max_context, stem)?;
 
         let mut owned_vram = Vec::<VramBuffer>::new();
@@ -267,7 +344,7 @@ impl QwenNeuralDrafter {
         let emb_gpu_va = emb_buf.va_addr;
         owned_vram.push(emb_buf);
 
-        let (lm_head_va, lm_head_type) = if gguf.tensors.contains_key("output.weight") {
+        let (lm_head_va, lm_head_type) = if gguf.has_tensor("output.weight") {
             let (lh_cow, lh_type, _, _) = extract_quant_weight_bytes(&gguf, "output.weight")?;
             let lh_buf = alloc_track(gpu, lh_cow.len() as u64)?;
             gpu.upload_to_vram(&lh_buf, 0, &lh_cow)?;
@@ -670,13 +747,13 @@ impl QwenNeuralDrafter {
         let m_i32 = t_len as i32;
         let grid_m = ((t_len + 7) / 8) as u32;
 
-        let k_emb = &module.kernels["qwen_prefill_embed"];
-        let k_rms = &module.kernels["qwen_prefill_rmsnorm_q8_1"];
-        let k_gemm = &module.kernels["qwen_prefill_gemm"];
-        let k_qknorm = &module.kernels["qwen_prefill_qknorm_rope_kv"];
-        let k_attn = &module.kernels["qwen_prefill_flash_gqa"];
-        let k_quant = &module.kernels["qwen_prefill_quant_q8_1"];
-        let k_swiglu = &module.kernels["qwen_prefill_swiglu_q8_1"];
+        let k_emb = module.kernel("qwen_prefill_embed")?;
+        let k_rms = module.kernel("qwen_prefill_rmsnorm_q8_1")?;
+        let k_gemm = module.kernel("qwen_prefill_gemm")?;
+        let k_qknorm = module.kernel("qwen_prefill_qknorm_rope_kv")?;
+        let k_attn = module.kernel("qwen_prefill_flash_gqa")?;
+        let k_quant = module.kernel("qwen_prefill_quant_q8_1")?;
+        let k_swiglu = module.kernel("qwen_prefill_swiglu_q8_1")?;
 
         let mut chain: Vec<(u64, usize)> = Vec::with_capacity(1 + self.cfg.num_layers * 9);
 
@@ -911,23 +988,7 @@ impl QwenNeuralDrafter {
             ));
         }
 
-        gpu.timeline_value += 1;
-        let target_sig = gpu.timeline_value;
-        let sig_va = gpu.timeline_buf.va_addr;
-        {
-            let (_, last_off) = *chain.last().unwrap();
-            let buf = gpu.kernargs_buf_mut_slice_at(last_off);
-            let mut tail_qmd = QmdV3 {
-                bytes: buf[..256].try_into().unwrap(),
-            };
-            tail_qmd.set_release0(sig_va, target_sig);
-            buf[..256].copy_from_slice(&tail_qmd.bytes);
-        }
-        for i in 0..(chain.len() - 1) {
-            gpu.link_dependent_qmd(chain[i].1, chain[i + 1].0);
-        }
-        gpu.launch_qmd_chain(chain[0].0, true)?;
-        gpu.wait_timeline(target_sig, Duration::from_secs(20))
+        gpu.launch_qmd_chain_sync(&chain, true, Duration::from_secs(20))
     }
 
     /// Draft 3 candidate tokens `[d0, d1, d2]` 100% on the RTX 3080 from `full_seq`!
@@ -963,7 +1024,7 @@ impl QwenNeuralDrafter {
         let mut mk_args = [0u8; 16];
         put_u64(&mut mk_args, 0, self.model_desc_gpu.va_addr);
         put_u64(&mut mk_args, 8, self.ctrl_buf.va_addr);
-        let k_dec = &module.kernels["qwen_persistent_decode_megakernel"];
+        let k_dec = module.kernel("qwen_persistent_decode_megakernel")?;
 
         let mut pos = common;
         while pos < n - 1 {
@@ -984,17 +1045,7 @@ impl QwenNeuralDrafter {
                     (*ctrl_ptr).export_logits = 0;
                 }
                 fence(Ordering::SeqCst);
-                gpu.timeline_value += 1;
-                let sig_c = gpu.timeline_value;
-                let (q_va, _) = gpu.prepare_qmd(
-                    k_dec,
-                    (gpu.active_sms, 1, 1),
-                    (512, 1, 1),
-                    &mk_args,
-                    Some((gpu.timeline_buf.va_addr, sig_c)),
-                );
-                gpu.launch_qmd_chain(q_va, true)?;
-                gpu.wait_timeline(sig_c, Duration::from_secs(10))?;
+                gpu.launch_kernel_sync(k_dec, (gpu.active_sms, 1, 1), (512, 1, 1), &mk_args, true, Duration::from_secs(10))?;
                 self.synced_tokens.push(catch_tok);
                 pos += 1;
             } else {
@@ -1021,18 +1072,7 @@ impl QwenNeuralDrafter {
         }
         fence(Ordering::SeqCst);
 
-        gpu.timeline_value += 1;
-        let sig_val = gpu.timeline_value;
-        let sig_va = gpu.timeline_buf.va_addr;
-        let (qmd_va, _) = gpu.prepare_qmd(
-            k_dec,
-            (gpu.active_sms, 1, 1),
-            (512, 1, 1),
-            &mk_args,
-            Some((sig_va, sig_val)),
-        );
-        gpu.launch_qmd_chain(qmd_va, true)?;
-        gpu.wait_timeline(sig_val, Duration::from_secs(10))?;
+        gpu.launch_kernel_sync(k_dec, (gpu.active_sms, 1, 1), (512, 1, 1), &mk_args, true, Duration::from_secs(10))?;
 
         let (err, d0, d1, d2) = unsafe {
             (

@@ -11,8 +11,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::gguf::BpeTokenizer;
-use crate::nv_defs::{put_u32, put_u64, QmdV3};
-use crate::nv_hw::{CubinModule, HostMappedBuffer, NvGpu, VramBuffer};
+use crate::hw::{put_u32, put_u64, CubinModule, HostMappedBuffer, NvGpu, VramBuffer};
+pub use crate::safetensors::f32_to_bf16_bits;
 
 const QVEC_MAGIC: &[u8; 4] = b"QVEC";
 const QVEC_VERSION: u32 = 1;
@@ -180,17 +180,21 @@ impl EmbedStrategy {
     }
 }
 
-#[inline]
-pub fn f32_to_bf16_bits(v: f32) -> u16 {
-    let b = v.to_bits();
-    if (b & 0x7f80_0000) == 0x7f80_0000 {
-        // Preserve NaN / Inf upper bits
-        ((b >> 16) as u16) | if (b & 0x007f_ffff) != 0 { 1 } else { 0 }
-    } else {
-        let round = 0x7fff_u32 + ((b >> 16) & 1);
-        (b.wrapping_add(round) >> 16) as u16
+fn json_esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
     }
+    out
 }
+
 
 #[derive(Clone, Debug)]
 pub struct RagDoc {
@@ -220,19 +224,67 @@ pub struct RagSearchStats {
 /// Co-resident RTX 3080 `BF16` Vector Database (`5.12 MB` VRAM per `1,000` `2560`-D Wikipedia passages).
 #[allow(dead_code)]
 pub struct GpuVectorDb {
-    pub path: String,
-    pub strategy: EmbedStrategy,
-    pub lora_path: String,
-    pub dim: usize,
-    pub docs: Vec<RagDoc>,
-    pub has_mean: bool,
-    pub mean_vec: Vec<f32>,
-    pub vectors_bf16_gpu: VramBuffer,
-    pub neg_mean_gpu: Option<VramBuffer>,
+    path: String,
+    strategy: EmbedStrategy,
+    lora_path: String,
+    dim: usize,
+    docs: Vec<RagDoc>,
+    has_mean: bool,
+    mean_vec: Vec<f32>,
+    vectors_bf16_gpu: VramBuffer,
+    neg_mean_gpu: Option<VramBuffer>,
     scores_buf: HostMappedBuffer,
 }
 
 impl GpuVectorDb {
+    #[inline]
+    pub fn strategy(&self) -> EmbedStrategy {
+        self.strategy
+    }
+
+    #[inline]
+    pub fn lora_path(&self) -> &str {
+        &self.lora_path
+    }
+
+    #[inline]
+    pub fn num_docs(&self) -> usize {
+        self.docs.len()
+    }
+
+    #[inline]
+    pub fn neg_mean_va(&self, strat: EmbedStrategy) -> Option<u64> {
+        if self.strategy == strat {
+            self.neg_mean_gpu.as_ref().map(|b| b.va_addr)
+        } else {
+            None
+        }
+    }
+
+    pub fn status_json(&self, load_ms_opt: Option<f64>) -> String {
+        if let Some(load_ms) = load_ms_opt {
+            format!(
+                "{{\"active\":true,\"path\":\"{}\",\"strategy\":\"{}\",\"num_docs\":{},\"dim\":{},\"vram_mb\":{:.2},\"load_ms\":{:.2}}}",
+                json_esc(&self.path),
+                self.strategy.as_str(),
+                self.docs.len(),
+                self.dim,
+                self.vram_mb(),
+                load_ms
+            )
+        } else {
+            format!(
+                "{{\"active\":true,\"path\":\"{}\",\"strategy\":\"{}\",\"num_docs\":{},\"dim\":{},\"vram_mb\":{:.2},\"lora_path\":\"{}\"}}",
+                json_esc(&self.path),
+                self.strategy.as_str(),
+                self.docs.len(),
+                self.dim,
+                self.vram_mb(),
+                json_esc(&self.lora_path)
+            )
+        }
+    }
+
     pub fn vram_mb(&self) -> f64 {
         let neg_sz = self.neg_mean_gpu.as_ref().map(|b| b.size).unwrap_or(0);
         ((self.vectors_bf16_gpu.size + neg_sz) as f64) / (1024.0 * 1024.0)
@@ -421,7 +473,7 @@ impl GpuVectorDb {
         }
 
         let t0 = Instant::now();
-        let k_lin_bf16 = &module.kernels["c2w_linear_bf16_kernel"];
+        let k_lin_bf16 = module.kernel("c2w_linear_bf16_kernel")?;
         let mut args = [0u8; 60];
         put_u64(&mut args, 0, self.scores_buf.va_addr);
         put_u64(&mut args, 8, self.vectors_bf16_gpu.va_addr);
@@ -433,26 +485,7 @@ impl GpuVectorDb {
         put_u32(&mut args, 52, num_docs as u32);
         put_u32(&mut args, 56, self.dim as u32);
 
-        gpu.timeline_value += 1;
-        let target_sig = gpu.timeline_value;
-        let sig_va = gpu.timeline_buf.va_addr;
-        let (qmd_va, qmd_off) = gpu.prepare_qmd(
-            k_lin_bf16,
-            (((num_docs as u32) + 3) / 4, 1, 1),
-            (128, 1, 1),
-            &args,
-            None,
-        );
-        {
-            let buf = gpu.kernargs_buf_mut_slice_at(qmd_off);
-            let mut qmd = QmdV3 {
-                bytes: buf[..256].try_into().unwrap(),
-            };
-            qmd.set_release0(sig_va, target_sig);
-            buf[..256].copy_from_slice(&qmd.bytes);
-        }
-        gpu.launch_qmd_chain(qmd_va, true)?;
-        gpu.wait_timeline(target_sig, Duration::from_secs(5))?;
+        gpu.launch_kernel_sync(k_lin_bf16, (((num_docs as u32) + 3) / 4, 1, 1), (128, 1, 1), &args, true, Duration::from_secs(5))?;
         let gpu_us = t0.elapsed().as_secs_f64() * 1e6;
 
         let scores_ptr = self.scores_buf.as_ptr() as *const f32;

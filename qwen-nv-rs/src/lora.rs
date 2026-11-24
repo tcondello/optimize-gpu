@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::gguf::{f16_to_f32, f32_to_f16_bits, GgufFile, MmapFile};
-use crate::nv_defs::{get_u16, get_u32, get_u64};
+use crate::gguf::{f16_to_f32, f32_to_f16_bits, GgufFile};
+use crate::hw::{get_u16, get_u32};
+use crate::safetensors::SafeTensorsFile;
 
 #[link(name = "Accelerate", kind = "framework")]
 extern "C" {
@@ -92,257 +93,6 @@ impl Default for LoraStatus {
             swap_ms: 0.0,
         }
     }
-}
-
-// -----------------------------------------------------------------------------
-// Zero-Crate `.safetensors` Header & Tensor Parser
-// -----------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-struct SafeTensorEntry {
-    dtype: String,
-    shape: Vec<usize>,
-    data_start: usize,
-    data_end: usize,
-}
-
-struct SafeTensorsFile {
-    mmap: MmapFile,
-    body_offset: usize,
-    tensors: HashMap<String, SafeTensorEntry>,
-}
-
-impl SafeTensorsFile {
-    fn open(path: &Path) -> Result<Self, String> {
-        let mmap = MmapFile::open(path)?;
-        let bytes = mmap.as_slice();
-        if bytes.len() < 8 {
-            return Err(format!("Safetensors file too small: {}", path.display()));
-        }
-        let hdr_len = get_u64(bytes, 0) as usize;
-        if 8 + hdr_len > bytes.len() {
-            return Err(format!("Invalid safetensors header length {} in {}", hdr_len, path.display()));
-        }
-        let hdr_str = std::str::from_utf8(&bytes[8..8 + hdr_len])
-            .map_err(|e| format!("Invalid UTF-8 in safetensors header: {}", e))?;
-        let tensors = parse_safetensors_header(hdr_str)?;
-        Ok(Self {
-            mmap,
-            body_offset: 8 + hdr_len,
-            tensors,
-        })
-    }
-
-    fn decode_f32(&self, entry: &SafeTensorEntry) -> Result<Vec<f32>, String> {
-        let raw = &self.mmap.as_slice()[self.body_offset + entry.data_start..self.body_offset + entry.data_end];
-        let nel: usize = entry.shape.iter().product();
-        let mut out = Vec::with_capacity(nel);
-        match entry.dtype.as_str() {
-            "F32" => {
-                if raw.len() != nel * 4 {
-                    return Err("F32 tensor byte length mismatch".into());
-                }
-                for i in 0..nel {
-                    out.push(f32::from_bits(get_u32(raw, i * 4)));
-                }
-            }
-            "F16" => {
-                if raw.len() != nel * 2 {
-                    return Err("F16 tensor byte length mismatch".into());
-                }
-                for i in 0..nel {
-                    out.push(f16_to_f32(get_u16(raw, i * 2)));
-                }
-            }
-            "BF16" => {
-                if raw.len() != nel * 2 {
-                    return Err("BF16 tensor byte length mismatch".into());
-                }
-                for i in 0..nel {
-                    out.push(f32::from_bits((get_u16(raw, i * 2) as u32) << 16));
-                }
-            }
-            other => return Err(format!("Unsupported LoRA safetensors dtype '{}'", other)),
-        }
-        Ok(out)
-    }
-}
-
-/// Minimal recursive-free scanner for flat `.safetensors` JSON headers:
-/// `{ "tensor_name": { "dtype": "F16", "shape": [16, 2560], "data_offsets": [0, 81920] }, "__metadata__": {...} }`
-fn parse_safetensors_header(s: &str) -> Result<HashMap<String, SafeTensorEntry>, String> {
-    let b = s.as_bytes();
-    let mut i = 0usize;
-    let skip_ws = |idx: &mut usize| {
-        while *idx < b.len() && matches!(b[*idx], b' ' | b'\n' | b'\r' | b'\t') {
-            *idx += 1;
-        }
-    };
-    let read_json_str = |idx: &mut usize| -> Result<String, String> {
-        skip_ws(idx);
-        if *idx >= b.len() || b[*idx] != b'"' {
-            return Err(format!("Expected '\"' at byte {}", *idx));
-        }
-        *idx += 1;
-        let mut out = String::new();
-        while *idx < b.len() {
-            let ch = b[*idx];
-            *idx += 1;
-            if ch == b'"' {
-                return Ok(out);
-            }
-            if ch == b'\\' && *idx < b.len() {
-                let esc = b[*idx];
-                *idx += 1;
-                match esc {
-                    b'"' | b'\\' | b'/' => out.push(esc as char),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    _ => out.push(esc as char),
-                }
-            } else {
-                out.push(ch as char);
-            }
-        }
-        Err("Unterminated JSON string".into())
-    };
-    let skip_balanced = |idx: &mut usize| -> Result<(), String> {
-        skip_ws(idx);
-        if *idx >= b.len() {
-            return Ok(());
-        }
-        if b[*idx] == b'"' {
-            let _ = read_json_str(idx)?;
-            return Ok(());
-        }
-        if b[*idx] == b'{' || b[*idx] == b'[' {
-            let open = b[*idx];
-            let close = if open == b'{' { b'}' } else { b']' };
-            let mut depth = 1usize;
-            *idx += 1;
-            while *idx < b.len() && depth > 0 {
-                if b[*idx] == b'"' {
-                    let _ = read_json_str(idx)?;
-                    continue;
-                }
-                if b[*idx] == open {
-                    depth += 1;
-                } else if b[*idx] == close {
-                    depth -= 1;
-                }
-                *idx += 1;
-            }
-            return Ok(());
-        }
-        while *idx < b.len() && !matches!(b[*idx], b',' | b'}' | b']') {
-            *idx += 1;
-        }
-        Ok(())
-    };
-    let read_usize_list = |idx: &mut usize| -> Result<Vec<usize>, String> {
-        skip_ws(idx);
-        if *idx >= b.len() || b[*idx] != b'[' {
-            return Err("Expected '['".into());
-        }
-        *idx += 1;
-        let mut nums = Vec::new();
-        loop {
-            skip_ws(idx);
-            if *idx >= b.len() {
-                return Err("Unterminated array".into());
-            }
-            if b[*idx] == b']' {
-                *idx += 1;
-                break;
-            }
-            let start = *idx;
-            while *idx < b.len() && b[*idx].is_ascii_digit() {
-                *idx += 1;
-            }
-            if *idx > start {
-                let n: usize = s[start..*idx].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
-                nums.push(n);
-            }
-            skip_ws(idx);
-            if *idx < b.len() && b[*idx] == b',' {
-                *idx += 1;
-            }
-        }
-        Ok(nums)
-    };
-
-    skip_ws(&mut i);
-    if i >= b.len() || b[i] != b'{' {
-        return Err("Safetensors header must start with '{'".into());
-    }
-    i += 1;
-
-    let mut map = HashMap::new();
-    loop {
-        skip_ws(&mut i);
-        if i >= b.len() || b[i] == b'}' {
-            break;
-        }
-        let key = read_json_str(&mut i)?;
-        skip_ws(&mut i);
-        if i >= b.len() || b[i] != b':' {
-            return Err("Expected ':' after top-level key".into());
-        }
-        i += 1;
-        skip_ws(&mut i);
-
-        if key == "__metadata__" {
-            skip_balanced(&mut i)?;
-        } else {
-            if i >= b.len() || b[i] != b'{' {
-                return Err(format!("Expected object for tensor '{}'", key));
-            }
-            i += 1;
-            let mut dtype = String::new();
-            let mut shape = Vec::new();
-            let mut offsets = Vec::new();
-            loop {
-                skip_ws(&mut i);
-                if i >= b.len() || b[i] == b'}' {
-                    i += 1;
-                    break;
-                }
-                let fk = read_json_str(&mut i)?;
-                skip_ws(&mut i);
-                if i < b.len() && b[i] == b':' {
-                    i += 1;
-                }
-                match fk.as_str() {
-                    "dtype" => dtype = read_json_str(&mut i)?,
-                    "shape" => shape = read_usize_list(&mut i)?,
-                    "data_offsets" => offsets = read_usize_list(&mut i)?,
-                    _ => skip_balanced(&mut i)?,
-                }
-                skip_ws(&mut i);
-                if i < b.len() && b[i] == b',' {
-                    i += 1;
-                }
-            }
-            if offsets.len() == 2 {
-                map.insert(
-                    key,
-                    SafeTensorEntry {
-                        dtype,
-                        shape,
-                        data_start: offsets[0],
-                        data_end: offsets[1],
-                    },
-                );
-            }
-        }
-
-        skip_ws(&mut i);
-        if i < b.len() && b[i] == b',' {
-            i += 1;
-        }
-    }
-    Ok(map)
 }
 
 fn parse_adapter_config_alpha_rank(dir: &Path) -> (Option<f32>, Option<usize>) {
@@ -447,15 +197,15 @@ pub fn prepare_lora_from_path(
     let (cfg_alpha, cfg_rank) = cfg_dir.map(parse_adapter_config_alpha_rank).unwrap_or((None, None));
     let st = SafeTensorsFile::open(&st_path)?;
 
-    let mut pairs: HashMap<(usize, usize), (Option<&SafeTensorEntry>, Option<&SafeTensorEntry>)> = HashMap::new();
-    for (name, entry) in &st.tensors {
-        if let Some((l, proj, is_b)) = classify_lora_tensor_name(name) {
+    let mut pairs: HashMap<(usize, usize), (Option<String>, Option<String>)> = HashMap::new();
+    for name in st.tensor_names() {
+        if let Some((l, proj, is_b)) = classify_lora_tensor_name(&name) {
             if l < num_layers {
                 let slot = pairs.entry((l, proj)).or_insert((None, None));
                 if is_b {
-                    slot.1 = Some(entry);
+                    slot.1 = Some(name);
                 } else {
-                    slot.0 = Some(entry);
+                    slot.0 = Some(name);
                 }
             }
         }
@@ -490,31 +240,31 @@ pub fn prepare_lora_from_path(
     keys.sort_unstable();
 
     for (l, proj) in keys {
-        let (Some(ent_a), Some(ent_b)) = pairs[&(l, proj)] else {
+        let (Some(ref key_a), Some(ref key_b)) = pairs[&(l, proj)] else {
             continue;
         };
         let (exp_n, exp_k, out_off) = expected_dims(proj);
-        if ent_a.shape.len() != 2 || ent_b.shape.len() != 2 {
+        let (a_decoded, a_shape) = st.decode_f32(key_a)?;
+        let (b_decoded, b_shape) = st.decode_f32(key_b)?;
+        if a_shape.len() != 2 || b_shape.len() != 2 {
             return Err(format!("LoRA layer {} proj {} is not 2D", l, proj));
         }
 
-        // Support standard PEFT `A: [r, K], B: [N, r]` (and transposed `[K, r], [r, N]` if encountered)
-        let (a_f32_raw, r) = if ent_a.shape[1] == exp_k {
-            (st.decode_f32(ent_a)?, ent_a.shape[0])
-        } else if ent_a.shape[0] == exp_k {
-            let raw = st.decode_f32(ent_a)?;
-            let r = ent_a.shape[1];
+        let (a_f32_raw, r) = if a_shape[1] == exp_k {
+            (a_decoded, a_shape[0])
+        } else if a_shape[0] == exp_k {
+            let r = a_shape[1];
             let mut tr = vec![0.0f32; r * exp_k];
             for kk in 0..exp_k {
                 for rr in 0..r {
-                    tr[rr * exp_k + kk] = raw[kk * r + rr];
+                    tr[rr * exp_k + kk] = a_decoded[kk * r + rr];
                 }
             }
             (tr, r)
         } else {
             return Err(format!(
                 "LoRA A shape {:?} mismatches expected K={} on layer {} proj {}",
-                ent_a.shape, exp_k, l, proj
+                a_shape, exp_k, l, proj
             ));
         };
 
@@ -528,21 +278,20 @@ pub fn prepare_lora_from_path(
             detected_rank = r;
         }
 
-        let b_f32 = if ent_b.shape == [exp_n, r] {
-            st.decode_f32(ent_b)?
-        } else if ent_b.shape == [r, exp_n] {
-            let raw = st.decode_f32(ent_b)?;
+        let b_f32 = if b_shape == [exp_n, r] {
+            b_decoded
+        } else if b_shape == [r, exp_n] {
             let mut tr = vec![0.0f32; exp_n * r];
             for rr in 0..r {
                 for nn in 0..exp_n {
-                    tr[nn * r + rr] = raw[rr * exp_n + nn];
+                    tr[nn * r + rr] = b_decoded[rr * exp_n + nn];
                 }
             }
             tr
         } else {
             return Err(format!(
                 "LoRA B shape {:?} mismatches expected [{}, {}] on layer {} proj {}",
-                ent_b.shape, exp_n, r, l, proj
+                b_shape, exp_n, r, l, proj
             ));
         };
 
@@ -668,10 +417,7 @@ pub fn write_synthetic_peft_adapter(
 /// Dequantize a 2D GGUF weight tensor (`Q8_0=8`, `Q4_K=12`, `Q6_K=14`, `F32=0`, `F16=1`, `BF16=30`)
 /// into row-major `[out_rows, in_cols]` `f32` matching our CUDA kernel dequantization bit-for-bit.
 pub fn dequant_gguf_2d_f32(gguf: &GgufFile, name: &str) -> Result<(Vec<f32>, usize, usize), String> {
-    let info = gguf
-        .tensors
-        .get(name)
-        .ok_or_else(|| format!("Missing tensor '{}' in GGUF", name))?;
+    let info = gguf.req_tensor_info(name)?;
     if info.dims.len() != 2 {
         return Err(format!("Expected 2D tensor for '{}', got {:?}", name, info.dims));
     }

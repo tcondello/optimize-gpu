@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Exact GA102 (Ampere sm_86) Hardware Register, MMU, GSP-RM, and QMDv3 Definitions.
 //! Zero runtime parsing, zero Python/C header dependencies.
 
