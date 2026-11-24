@@ -169,29 +169,22 @@ pub(super) fn term_size() -> (usize, usize) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Rgb(pub u8, pub u8, pub u8);
 
-// Cyberpunk / Dark Slate Palette
+// Base Markdown / Badge Palette Constants
 pub(super) const BG_MAIN: Rgb      = Rgb(13, 17, 23);
-pub(super) const BG_HEADER: Rgb    = Rgb(22, 27, 36);
-pub(super) const BG_FOOTER: Rgb    = Rgb(18, 23, 31);
-pub(super) const BG_CODE: Rgb      = Rgb(20, 26, 36);
-pub(super) const BG_CODE_HDR: Rgb  = Rgb(28, 36, 50);
-pub(super) const BG_INLINE: Rgb    = Rgb(32, 39, 52);
-pub(super) const BG_USER_TAG: Rgb  = Rgb(23, 63, 95);
-pub(super) const BG_BOT_TAG: Rgb   = Rgb(18, 78, 68);
+pub(super) const BG_CODE: Rgb      = Rgb(14, 19, 32);
+pub(super) const BG_CODE_HDR: Rgb  = Rgb(22, 30, 48);
+pub(super) const BG_INLINE: Rgb    = Rgb(28, 36, 54);
 pub(super) const BG_BADGE_ON: Rgb  = Rgb(20, 83, 45);
 pub(super) const BG_BADGE_T1: Rgb  = Rgb(30, 58, 95);
 
 pub(super) const FG_TEXT: Rgb      = Rgb(230, 237, 243);
-pub(super) const FG_MUTED: Rgb     = Rgb(125, 138, 156);
-pub(super) const FG_DIM: Rgb       = Rgb(84, 96, 114);
 pub(super) const FG_CYAN: Rgb      = Rgb(88, 204, 246);
 pub(super) const FG_GREEN: Rgb     = Rgb(74, 222, 128);
 pub(super) const FG_AMBER: Rgb     = Rgb(251, 191, 36);
 pub(super) const FG_CORAL: Rgb     = Rgb(248, 113, 113);
 pub(super) const FG_PURPLE: Rgb    = Rgb(192, 132, 252);
 pub(super) const FG_CODE: Rgb      = Rgb(210, 228, 255);
-pub(super) const FG_BORDER: Rgb    = Rgb(56, 70, 92);
-pub(super) const FG_BORDER_HI: Rgb = Rgb(88, 204, 246);
+pub(super) const FG_BORDER: Rgb    = Rgb(56, 84, 124);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Style {
@@ -418,10 +411,12 @@ pub(super) enum InputEvent {
     ScrollDown(usize),
     Esc,
     CtrlC,
+    CtrlD,
     CtrlQ,
     CtrlL,
     CtrlR,
     CtrlS,
+    CtrlT,
     CtrlY,
     CtrlW,
     CtrlU,
@@ -583,10 +578,12 @@ pub(super) fn poll_input_events(timeout_ms: i32, paste_acc: &mut Option<String>)
 
         match b {
             0x03 => events.push(InputEvent::CtrlC),
+            0x04 => events.push(InputEvent::CtrlD),
             0x11 => events.push(InputEvent::CtrlQ),
             0x0c => events.push(InputEvent::CtrlL),
             0x12 => events.push(InputEvent::CtrlR),
             0x13 => events.push(InputEvent::CtrlS),
+            0x14 => events.push(InputEvent::CtrlT),
             0x19 => events.push(InputEvent::CtrlY),
             0x17 => events.push(InputEvent::CtrlW),
             0x15 => events.push(InputEvent::CtrlU),

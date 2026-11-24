@@ -579,6 +579,15 @@ impl CoreAudioRecorder {
         }
     }
 
+    /// Copy up to `max_len` most recent `16 kHz` PCM samples for real-time TUI oscilloscope/spectrum rendering.
+    pub fn recent_samples(&self, max_len: usize, out: &mut Vec<f32>) {
+        out.clear();
+        if let Ok(st) = self.shared.state.lock() {
+            let start = st.samples.len().saturating_sub(max_len);
+            out.extend_from_slice(&st.samples[start..]);
+        }
+    }
+
     pub fn finish_and_take_samples(&mut self) -> Vec<f32> {
         if let Ok(mut st) = self.shared.state.lock() {
             st.stopped = true;

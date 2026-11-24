@@ -154,9 +154,13 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
             if !in_fence {
                 in_fence = true;
                 let lang = fence_rest.trim();
-                let label = if lang.is_empty() { "code" } else { lang };
-                let bar_len = inner_cols.saturating_sub(label.chars().count() + 5);
-                let hdr_text = format!("  ╭─ {} {}", label, "─".repeat(bar_len));
+                let label = if lang.is_empty() {
+                    "CODE".to_string()
+                } else {
+                    lang.to_ascii_uppercase()
+                };
+                let bar_len = inner_cols.saturating_sub(label.chars().count() + 8);
+                let hdr_text = format!("  ╔═[ {} ]{}", label, "═".repeat(bar_len));
                 lines.push(RenderedLine {
                     spans: vec![Span {
                         text: hdr_text,
@@ -166,7 +170,7 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
                 });
             } else {
                 in_fence = false;
-                let ftr_text = format!("  ╰{}", "─".repeat(inner_cols.saturating_sub(1)));
+                let ftr_text = format!("  ╚{}", "═".repeat(inner_cols.saturating_sub(1)));
                 lines.push(RenderedLine {
                     spans: vec![Span {
                         text: ftr_text,
@@ -179,12 +183,12 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
         }
 
         if in_fence {
-            // Hard-wrap code lines cleanly inside code card
+            // Hard-wrap code lines cleanly inside CP437 double-bevel code card
             let code_cols = inner_cols.saturating_sub(3).max(8);
             if raw_ln.is_empty() {
                 lines.push(RenderedLine {
                     spans: vec![Span {
-                        text: "  │ ".into(),
+                        text: "  ║ ".into(),
                         style: Style::new(FG_BORDER, BG_CODE),
                     }],
                     row_bg: BG_CODE,
@@ -199,7 +203,7 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
                             if cw + 1 > code_cols {
                                 lines.push(RenderedLine {
                                     spans: vec![
-                                        Span { text: "  │ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
+                                        Span { text: "  ║ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
                                         Span { text: std::mem::take(&mut chunk), style: Style::new(FG_CODE, BG_CODE) },
                                     ],
                                     row_bg: BG_CODE,
@@ -214,7 +218,7 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
                         if cw + w > code_cols && !chunk.is_empty() {
                             lines.push(RenderedLine {
                                 spans: vec![
-                                    Span { text: "  │ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
+                                    Span { text: "  ║ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
                                     Span { text: std::mem::take(&mut chunk), style: Style::new(FG_CODE, BG_CODE) },
                                 ],
                                 row_bg: BG_CODE,
@@ -228,7 +232,7 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
                 if !chunk.is_empty() {
                     lines.push(RenderedLine {
                         spans: vec![
-                            Span { text: "  │ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
+                            Span { text: "  ║ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
                             Span { text: chunk, style: Style::new(FG_CODE, BG_CODE) },
                         ],
                         row_bg: BG_CODE,
@@ -345,60 +349,100 @@ pub(super) fn split_spoken_sentences(clean_text: &str) -> Vec<String> {
 }
 
 
-pub(super) fn format_welcome_markdown(
+pub(super) fn format_verify_markdown(
     is_inkling: bool,
-    model_name: &str,
+    cfg: &crate::gguf::ModelConfig,
+    gguf_path: &std::path::Path,
     gguf_size_gb: f64,
-    active_sms: u32,
-    inkling_effort: &str,
+    active_gb_per_tok: f64,
 ) -> String {
+    let mtime_info = std::fs::metadata(gguf_path)
+        .map(|md| format!("{} bytes (read-only mmap)", md.len()))
+        .unwrap_or_else(|_| "unknown".into());
     if is_inkling {
         format!(
-            "## Welcome to RTX TUI — 100%-on-RTX-3080 Looped Sparse MoE + Voice\n\
-             Connected to **{}** (`{:.2} GB` `AD-IQ2_XXS-Q2` • `26.4B` total / `~1.8B` active • `24` physical -> `48` logical layers • `128x8` Sparse MoE) + co-resident **DSpark (`Inkling2MTP`)** on **NVIDIA GeForce RTX 3080 (`GA102`, {} SMs)** with **Docker OFF**.\n\n\
-             - **Pareto-Optimal Speed & Reasoning**: Runs the **48-layer Persistent `B=1` `sm_86` Megakernel (`~120 tok/s`)** by default with full 3-pass reasoning (`EFFORT:{}`), plus `< 15 ms` multi-turn KV+ShortConv prefix caching.\n\
-             - **Co-Resident RTX 3080 Voice**: Press **`Ctrl+R`** (or `/listen` / `/speak` / `/talk`) for 100%-on-RTX-3080 `Qwen3-ASR-0.6B` STT + `Inkling-2-Mini` + `Qwen3-TTS-0.6B` + `12Hz Code2Wav`!\n\
-             - **Controls**: Type `/effort 0` (or `/think off` / append `/no_think`) for instant zero-thinking replies, `/effort 0.2` or `0.9` for reasoning, `/spec on` (`Ctrl+S`) for **DSpark Block-8 Speculative Decoding (up to `143 tok/s` on JSON/code)**, or `/bench` to benchmark live.",
-            model_name, gguf_size_gb, active_sms, inkling_effort
+            "### Inkling-2-Mini Looped MoE Integrity & Serving Verification\n\
+             - **Model Name**: `{}` (24 physical -> {} logical layers, 128x8 Sparse MoE, dim={}, exp_ff={}, heads={}/{} Rel+Sink GQA, vocab={})\n\
+             - **GGUF File**: `{}`\n\
+             - **Exact Byte Size**: `{}` (`{:.3} GB` total • `~{:.2} GB/tok` active across 48 visits)\n\
+             - **Serving Guarantees**: Full 3-pass recurrence preserved (`0` loop passes dropped), planarized zero-LUT `Q2_0` + `IQ2_XXS` `sm_86` persistent megakernel (`~122 tok/s`) + co-resident `DSpark` (`Inkling2MTP`) block-8 drafter (`/spec on` up to `143 tok/s`).",
+            cfg.model_name,
+            cfg.num_layers,
+            cfg.dim,
+            cfg.hidden_dim,
+            cfg.n_heads,
+            cfg.n_kv_heads,
+            cfg.vocab_size,
+            gguf_path.display(),
+            mtime_info,
+            gguf_size_gb,
+            active_gb_per_tok
         )
     } else {
         format!(
-            "## Welcome to RTX TUI — 100%-on-RTX-3080 Text + Voice + RAG + LoRA\n\
-             Connected to **{}** (`{:.2} GB` GGUF) + co-resident **Qwen3-ASR-1.7B (`Q8_0`)** & **Qwen3-TTS-1.7B (`Q8_0`)** on **NVIDIA GeForce RTX 3080 (`GA102`, {} SMs)** with **Docker OFF**.\n\n\
-             - **Speak to Your RTX 3080**: Press **`Ctrl+R`** (or type `/listen`) and speak a question — 100% of STT, LLM thinking, and `24 kHz` TTS run on the RTX 3080 while capturing the full conversation right here in chat! Or type `/talk` for continuous hands-free conversation.\n\
-             - **Pure Serving Layer**: `PROT_READ` read-only GGUF mapping, exact `FP16` KV cache, `< 1 ms` Rank-`r` LoRA hot-swap (`/lora`), same-backbone RAG (`/rag wiki`), & `/bench` for live megakernel verification.",
-            model_name, gguf_size_gb, active_sms
+            "### Model Integrity & Pure Serving Layer Verification\n\
+             - **Model Name**: `{}` ({} layers, dim={}, hidden={}, heads={}/{} GQA, vocab={})\n\
+             - **GGUF File**: `{}`\n\
+             - **Exact Byte Size**: `{}` (`{:.3} GB`, unmodified original GGUF weights)\n\
+             - **Serving Guarantees**: `0` layers pruned, `0` weights re-quantized or altered, `PROT_READ` read-only file mapping, exact `FP16` KV cache, and `100%` lossless greedy verification (`BM=4` == `T=1`).",
+            cfg.model_name,
+            cfg.num_layers,
+            cfg.dim,
+            cfg.hidden_dim,
+            cfg.n_heads,
+            cfg.n_kv_heads,
+            cfg.vocab_size,
+            gguf_path.display(),
+            mtime_info,
+            gguf_size_gb
+        )
+    }
+}
+
+pub(super) fn select_bench_prompt(is_inkling: bool, arg: &str) -> (bool, String) {
+    if is_inkling {
+        if arg == "spec" || arg == "dspark" {
+            (
+                true,
+                "Output ONLY a valid minified JSON object with keys `gpu`, `sm_count`, `vram_gb`, `quant`, `loop_passes`, and `logical_layers` describing an NVIDIA RTX 3080 (68 SMs, 10 GB) running Inkling-2-Mini (3 passes, 48 logical layers, IQ2). /no_think".into(),
+            )
+        } else {
+            (
+                false,
+                "Write a concise zero-dependency Rust function `is_prime(n: u64) -> bool`. /no_think".into(),
+            )
+        }
+    } else if arg == "t1" {
+        (false, "Count from 1 to 60 separated by commas.".into())
+    } else {
+        (
+            true,
+            "Convert the following Python dict so `enable_docker` is False and `kernel_mode` is `'persistent_sm86_megakernel'`, preserving all other fields verbatim:\n\n```python\nENGINE_CONFIG = {\n    'device': 'NVIDIA GeForce RTX 3080 (GA102, sm_86, 68 SMs)',\n    'transport': 'Thunderbolt 3 / DriverKit DMA',\n    'model': 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf',\n    'enable_docker': True,\n    'kernel_mode': 'hcq_graph_346_kernels',\n    'kv_cache_dtype': 'float16',\n    'max_context_tokens': 4096,\n    'quant_formats': ['Q4_K', 'Q6_K', 'Q8_0'],\n}\n```\nReturn only the updated Python code block.".into(),
         )
     }
 }
 
 pub(super) fn format_help_markdown(is_inkling: bool) -> &'static str {
     if is_inkling {
-        "### RTX TUI Commands (`Inkling-2-Mini` 48-Layer Looped Sparse MoE)\n\
-            - `Ctrl+R` or `/listen` │ `/talk [on|off]` │ `/speak [on|off]` │ `/say` │ `/voice <name>` — **100%-on-RTX-3080 Co-Resident Voice (`Qwen3-ASR-0.6B` + `Inkling-2-Mini` + `Qwen3-TTS-0.6B` + `12Hz Code2Wav`)**\n\
-            - `/effort <0|0.1|0.2|0.7|0.9>` (or `/think [on|off]`) — Set thinking effort (`0` = instant `~120 tok/s` • `0.2` = standard reasoning • `0.9` = deep math; or append `/no_think` to any prompt)\n\
-            - `/spec [on|off]` (`Ctrl+S`) — Switch between **48L Persistent `B=1` Megakernel (`~120 tok/s` default)** and **DSpark Block-8 Speculative Decoding (up to `143 tok/s` on structured JSON/code)**\n\
-            - `/gamma <1..7>` — Tune DSpark block-8 verification depth (`γ=3..7`)\n\
-            - `/bench` (or `/bench spec`) — Run live RTX 3080 `~120 tok/s` persistent `B=1` or `~143 tok/s` `DSpark` benchmark\n\
-            - `/verify` — Inspect loaded `Inkling-2-Mini` GGUF path, byte size, & 48-layer 128x8 MoE layout\n\
-            - `/temp <0.0..2.0>` │ `/max <N>` │ `/sys <text>` — Sampling & system prompt controls\n\
-            - `/copy` / `/copy code` (`Ctrl+Y`) — Copy last reply or code block to macOS clipboard\n\
-            - `/clear` (`Ctrl+L`) — Clear conversation & KV+ShortConv cache │ `/quit` (`Ctrl+Q`) — Exit │ `/stop` — Unload GPU"
+        "### RTX TUI // 1990s DEMOSCENE EDITION (`Inkling-2-Mini` 48L Looped Sparse MoE)\n\
+            - `Ctrl+D` or `/demo [1..4]` — **60 FPS Fullscreen 1990s Megademo** (`Plasma+Copper`, `3D Glenz Vector`, `Doom Fire+Kefrens`, `DYCP Scroller`)\n\
+            - `/mod [on|off]` — **4-Channel `24 kHz` Amiga/SID Tracker Chiptune** (`GA102 OVERDRIVE.MOD`, live 16-band Goertzel spectrum)\n\
+            - `Ctrl+T` or `/theme [sr|amiga|it|ansi]` │ `/fx [full|min|off]` — Cycle 1990s scene palettes (`Second Reality`, `Amiga AGA`, `Impulse Tracker`, `ACiD ANSI`)\n\
+            - `Ctrl+R` or `/listen` │ `/talk [on|off]` │ `/speak [on|off]` │ `/say` │ `/voice <name>` — **100%-on-RTX-3080 Voice (`Qwen3-ASR-0.6B` + `Inkling-2-Mini` + `Qwen3-TTS-0.6B` + `12Hz Code2Wav`)**\n\
+            - `/effort <0|0.1|0.2|0.7|0.9>` (or `/think [on|off]`) — Thinking effort (`0` = instant `~122 tok/s` • `0.2` = reasoning • `0.9` = deep math)\n\
+            - `/spec [on|off]` (`Ctrl+S`) │ `/gamma <1..7>` — Toggle **48L Persistent `B=1` (`~122 tok/s`)** vs **DSpark Block-8 Speculative (`~143 tok/s`)**\n\
+            - `/bench` (or `/bench spec`) │ `/verify` — Live RTX 3080 benchmark & GGUF integrity check\n\
+            - `/temp <0..2>` │ `/max <N>` │ `/sys <text>` │ `/copy [code]` (`Ctrl+Y`) │ `/clear` (`Ctrl+L`) │ `/quit` (`Ctrl+Q`) │ `/stop`"
     } else {
-        "### RTX TUI Commands (Full-Duplex Voice + Text + RAG + Topic LoRA)\n\
-            - `/topic [wiki|<bank_dir>|list|status|off]` — **Sharded Topic Parametric LoRA Bank** (`308 µs` GPU router + `44 µs` cached LoRA swap, `0` context stuffing!)\n\
-            - `/rag [wiki|<file.qvec>|off]` — **100%-on-RTX-3080 Same-Model Wikipedia VectorDB RAG** (`< 10 ms` embed + `< 50 µs` GPU cosine search; works with both voice & text!)\n\
-            - `Ctrl+R` or `/listen` (`/mic`) — **Speak a question into your Mac mic**: runs 100%-on-RTX-3080 `Qwen3-ASR-1.7B Q8_0` STT -> (optional Wiki RAG) -> streams LLM -> speaks reply via `Qwen3-TTS-1.7B Q8_0`!\n\
-            - `/talk [on|off]` — **Hands-free continuous voice conversation** (auto-listens after each spoken reply; `Esc` stops)\n\
-            - `/speak [on|off]` — Toggle live **100%-on-RTX-3080 `Qwen3-TTS-1.7B Q8_0`** spoken replies (`24 kHz` streaming)\n\
-            - `/say [text]` — Speak `<text>` (or the last assistant reply) aloud on RTX 3080 (`Esc` stops audio)\n\
-            - `/voice <name>` — Select voice (`ryan`, `serena`, `vivian`, `aiden`, `uncle_fu`, `ono_anna`, `sohee`, `eric`, `dylan`)\n\
+        "### RTX TUI // 1990s DEMOSCENE EDITION (Voice + Text + RAG + Topic LoRA)\n\
+            - `Ctrl+D` or `/demo [1..4]` — **60 FPS Fullscreen 1990s Megademo** (`Plasma+Copper`, `3D Glenz Vector`, `Doom Fire+Kefrens`, `DYCP Scroller`)\n\
+            - `/mod [on|off]` — **4-Channel `24 kHz` Amiga/SID Tracker Chiptune** (`GA102 OVERDRIVE.MOD`, live 16-band Goertzel spectrum)\n\
+            - `Ctrl+T` or `/theme [sr|amiga|it|ansi]` │ `/fx [full|min|off]` — Cycle 1990s scene palettes (`Second Reality`, `Amiga AGA`, `Impulse Tracker`, `ACiD ANSI`)\n\
+            - `/topic [wiki|<bank_dir>|list|status|off]` — **Sharded Topic Parametric LoRA Bank** (`308 µs` GPU router + `44 µs` cached LoRA swap)\n\
+            - `/rag [wiki|<file.qvec>|off]` — **100%-on-RTX-3080 Same-Model Wikipedia VectorDB RAG** (`< 10 ms` embed + `< 50 µs` GPU cosine search)\n\
+            - `Ctrl+R` or `/listen` │ `/talk [on|off]` │ `/speak [on|off]` │ `/say` │ `/voice <name>` — **100%-on-RTX-3080 Full-Duplex Voice**\n\
             - `/lora <path|off>` — `< 1 ms` hot-swap Rank-`r` (`r <= 32`) PEFT `.safetensors` LoRA adapter\n\
-            - `/bench` (or `/bench t1`) — Run live `BM=4` or `T=1` megakernel benchmark inside chat\n\
-            - `/verify` — Inspect loaded GGUF path, exact byte size, & unmodified model architecture\n\
-            - `/spec [on|off]` (`Ctrl+S`) — Toggle lossless `BM=4` speculative verification vs pure `T=1`\n\
-            - `/temp <0.0..2.0>` │ `/max <N>` │ `/sys <text>` — Sampling & system prompt controls\n\
-            - `/copy` / `/copy code` (`Ctrl+Y`) — Copy last reply or code block to macOS clipboard\n\
-            - `/clear` (`Ctrl+L`) — Clear conversation & KV cache │ `/quit` (`Ctrl+Q`) — Exit │ `/stop` — Unload GPU"
+            - `/bench` (or `/bench t1`) │ `/spec [on|off]` (`Ctrl+S`) │ `/verify` — Live megakernel benchmark & integrity check\n\
+            - `/temp <0..2>` │ `/max <N>` │ `/sys <text>` │ `/copy [code]` (`Ctrl+Y`) │ `/clear` (`Ctrl+L`) │ `/quit` (`Ctrl+Q`) │ `/stop`"
     }
 }

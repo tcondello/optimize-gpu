@@ -74,6 +74,7 @@ pub(super) fn parse_stats_json(j: &str) -> TurnStats {
 
 pub(super) enum StreamEvent {
     Token {
+        tok_id: i32,
         piece: String,
         tok_count: usize,
         elapsed_s: f64,
@@ -123,6 +124,7 @@ pub(super) fn spawn_generation_stream(
                     .unwrap_or(0.0);
                 if !piece.is_empty() {
                     let _ = tx.send(StreamEvent::Token {
+                        tok_id,
                         piece: piece.to_string(),
                         tok_count: count,
                         elapsed_s: dec_elapsed,
@@ -158,6 +160,7 @@ pub(super) fn spawn_tts_sentences(
     lang: String,
     speaking_bg: Arc<AtomicBool>,
     ttfa_bg: Arc<Mutex<f64>>,
+    viz_pcm_bg: Arc<Mutex<Vec<f32>>>,
 ) -> Arc<AtomicBool> {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_bg = Arc::clone(&cancel);
@@ -194,6 +197,15 @@ pub(super) fn spawn_tts_sentences(
                     if let Ok(mut g) = ttfa_bg.lock() {
                         *g = t_turn.elapsed().as_secs_f64() * 1000.0;
                     }
+                }
+                if let Ok(mut ring) = viz_pcm_bg.lock() {
+                    let take = chunk.len().min(512);
+                    let tail = &chunk[chunk.len() - take..];
+                    if ring.len() + tail.len() > 1024 {
+                        let drop_n = (ring.len() + tail.len() - 1024).min(ring.len());
+                        ring.drain(..drop_n);
+                    }
+                    ring.extend_from_slice(tail);
                 }
                 let _ = player.push_samples(chunk);
                 true

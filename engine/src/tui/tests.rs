@@ -100,12 +100,23 @@
             spinner_tick: 0,
             toast: None,
             mouse_capture: false,
+            demo: DemosceneEngine::new(),
+            viz_pcm: Arc::new(Mutex::new(Vec::new())),
+            mic_viz_scratch: Vec::new(),
         };
 
-        // Render welcome banner + `/verify` + `/help`
+        // Render 1990s demoscene attract banner, all 4 megademo scenes, palettes, + `/verify` + `/help`
         let mut scr = ScreenBuf::new(120, 36);
         let cur0 = app.draw(&mut scr, 120, 36);
         assert!(!scr.render_ansi(cur0).is_empty());
+        for scene_idx in 1..=4 {
+            let _ = app.handle_slash_command(&format!("/demo {}", scene_idx), None);
+            let _ = app.demo.step(Some((&[0.25f32; 256], 24_000)), true, true);
+            assert!(app.draw(&mut scr, 120, 36).is_none());
+            assert!(scr.render_ansi(None).len() > 1500);
+            let _ = app.handle_slash_command("/theme", None);
+        }
+        let _ = app.handle_slash_command("/demo off", None);
         let _ = app.handle_slash_command("/verify", None);
         let _ = app.handle_slash_command("/help", None);
         let cur1 = app.draw(&mut scr, 120, 36);
