@@ -154,13 +154,9 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
             if !in_fence {
                 in_fence = true;
                 let lang = fence_rest.trim();
-                let label = if lang.is_empty() {
-                    "CODE".to_string()
-                } else {
-                    lang.to_ascii_uppercase()
-                };
-                let bar_len = inner_cols.saturating_sub(label.chars().count() + 8);
-                let hdr_text = format!("  ╔═[ {} ]{}", label, "═".repeat(bar_len));
+                let label = if lang.is_empty() { "code" } else { lang };
+                let bar_len = inner_cols.saturating_sub(label.chars().count() + 6);
+                let hdr_text = format!("   ╭─ {} {}", label, "─".repeat(bar_len));
                 lines.push(RenderedLine {
                     spans: vec![Span {
                         text: hdr_text,
@@ -170,7 +166,7 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
                 });
             } else {
                 in_fence = false;
-                let ftr_text = format!("  ╚{}", "═".repeat(inner_cols.saturating_sub(1)));
+                let ftr_text = format!("   ╰{}", "─".repeat(inner_cols.saturating_sub(2)));
                 lines.push(RenderedLine {
                     spans: vec![Span {
                         text: ftr_text,
@@ -183,12 +179,11 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
         }
 
         if in_fence {
-            // Hard-wrap code lines cleanly inside CP437 double-bevel code card
-            let code_cols = inner_cols.saturating_sub(3).max(8);
+            let code_cols = inner_cols.saturating_sub(4).max(8);
             if raw_ln.is_empty() {
                 lines.push(RenderedLine {
                     spans: vec![Span {
-                        text: "  ║ ".into(),
+                        text: "   │ ".into(),
                         style: Style::new(FG_BORDER, BG_CODE),
                     }],
                     row_bg: BG_CODE,
@@ -203,7 +198,7 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
                             if cw + 1 > code_cols {
                                 lines.push(RenderedLine {
                                     spans: vec![
-                                        Span { text: "  ║ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
+                                        Span { text: "   │ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
                                         Span { text: std::mem::take(&mut chunk), style: Style::new(FG_CODE, BG_CODE) },
                                     ],
                                     row_bg: BG_CODE,
@@ -218,7 +213,7 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
                         if cw + w > code_cols && !chunk.is_empty() {
                             lines.push(RenderedLine {
                                 spans: vec![
-                                    Span { text: "  ║ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
+                                    Span { text: "   │ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
                                     Span { text: std::mem::take(&mut chunk), style: Style::new(FG_CODE, BG_CODE) },
                                 ],
                                 row_bg: BG_CODE,
@@ -232,7 +227,7 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
                 if !chunk.is_empty() {
                     lines.push(RenderedLine {
                         spans: vec![
-                            Span { text: "  ║ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
+                            Span { text: "   │ ".into(), style: Style::new(FG_BORDER, BG_CODE) },
                             Span { text: chunk, style: Style::new(FG_CODE, BG_CODE) },
                         ],
                         row_bg: BG_CODE,
@@ -245,7 +240,7 @@ pub(super) fn format_markdown_block(content: &str, max_cols: usize, is_user: boo
                 wl.spans.insert(
                     0,
                     Span {
-                        text: "  ".into(),
+                        text: "   ".into(),
                         style: Style::new(FG_TEXT, BG_MAIN),
                     },
                 );
@@ -422,27 +417,142 @@ pub(super) fn select_bench_prompt(is_inkling: bool, arg: &str) -> (bool, String)
     }
 }
 
+/// Splits `<think>...</think>` reasoning from the visible reply and renders collapsible
+/// Claude Code / Hermes-style thought summaries (`Ctrl+O` to expand/collapse).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn format_assistant_markdown(
+    raw_content: &str,
+    max_cols: usize,
+    is_streaming: bool,
+    expand_thinking: bool,
+    bg_void: Rgb,
+    fg_muted: Rgb,
+    fg_dim: Rgb,
+    fg_accent: Rgb,
+) -> (Vec<RenderedLine>, usize, usize) {
+    let inner_cols = max_cols.saturating_sub(6).max(16);
+
+    if let Some(ts) = raw_content.find("<think>") {
+        let after_open = &raw_content[ts + 7..];
+        if let Some(te) = after_open.find("</think>") {
+            let think_txt = after_open[..te].trim();
+            let ans_txt = after_open[te + 8..].trim_start_matches(['\r', '\n']);
+            let th_words = think_txt.split_whitespace().count();
+            let ans_words = ans_txt.split_whitespace().count();
+            let mut out = Vec::new();
+
+            if th_words > 0 {
+                let arrow = if expand_thinking { "▾" } else { "▸" };
+                let hint = if expand_thinking { "Ctrl+O to collapse" } else { "Ctrl+O to expand" };
+                out.push(RenderedLine {
+                    spans: vec![
+                        Span { text: "   ".into(), style: Style::new(fg_dim, bg_void) },
+                        Span {
+                            text: format!("{} Thought · {} words ", arrow, th_words),
+                            style: Style::new(fg_accent, bg_void),
+                        },
+                        Span {
+                            text: format!("({})", hint),
+                            style: Style::new(fg_dim, bg_void),
+                        },
+                    ],
+                    row_bg: bg_void,
+                });
+                if expand_thinking {
+                    for ln in think_txt.split('\n') {
+                        for mut wl in wrap_inline_markdown(ln, inner_cols, fg_muted, bg_void) {
+                            wl.spans.insert(
+                                0,
+                                Span { text: "   ┆ ".into(), style: Style::new(fg_dim, bg_void) },
+                            );
+                            out.push(wl);
+                        }
+                    }
+                    out.push(RenderedLine { spans: Vec::new(), row_bg: bg_void });
+                }
+            }
+
+            let body = if is_streaming {
+                if ans_txt.is_empty() { "▍".to_string() } else { format!("{}▍", ans_txt) }
+            } else {
+                ans_txt.to_string()
+            };
+            if !body.is_empty() {
+                out.extend(format_markdown_block(&body, max_cols, false));
+            }
+            return (out, th_words, ans_words);
+        } else {
+            let think_txt = after_open.trim_start_matches(['\r', '\n']);
+            let th_words = think_txt.split_whitespace().count();
+            let mut out = Vec::new();
+            out.push(RenderedLine {
+                spans: vec![
+                    Span { text: "   ".into(), style: Style::new(fg_dim, bg_void) },
+                    Span {
+                        text: format!("◈ Thinking · {} words ", th_words),
+                        style: Style::new(fg_accent, bg_void).bold(),
+                    },
+                    Span {
+                        text: if expand_thinking {
+                            "(Ctrl+O for compact preview)"
+                        } else {
+                            "(live preview · Ctrl+O for full)"
+                        }
+                        .into(),
+                        style: Style::new(fg_dim, bg_void),
+                    },
+                ],
+                row_bg: bg_void,
+            });
+            let raw_lines: Vec<&str> = think_txt.split('\n').filter(|l| !l.trim().is_empty()).collect();
+            let slice = if expand_thinking || !is_streaming {
+                &raw_lines[..]
+            } else {
+                &raw_lines[raw_lines.len().saturating_sub(3)..]
+            };
+            for ln in slice {
+                for mut wl in wrap_inline_markdown(ln, inner_cols, fg_muted, bg_void) {
+                    wl.spans.insert(
+                        0,
+                        Span { text: "   ┆ ".into(), style: Style::new(fg_dim, bg_void) },
+                    );
+                    out.push(wl);
+                }
+            }
+            return (out, th_words, 0);
+        }
+    }
+
+    let body = if is_streaming && raw_content.is_empty() {
+        "▍".to_string()
+    } else if is_streaming {
+        format!("{}▍", raw_content)
+    } else {
+        raw_content.to_string()
+    };
+    let ans_words = raw_content.split_whitespace().count();
+    (format_markdown_block(&body, max_cols, false), 0, ans_words)
+}
+
 pub(super) fn format_help_markdown(is_inkling: bool) -> &'static str {
     if is_inkling {
-        "### RTX TUI // 1990s DEMOSCENE EDITION (`Inkling-2-Mini` 48L Looped Sparse MoE)\n\
-            - `Ctrl+D` or `/demo [1..4]` — **60 FPS Fullscreen 1990s Megademo** (`Plasma+Copper`, `3D Glenz Vector`, `Doom Fire+Kefrens`, `DYCP Scroller`)\n\
-            - `/mod [on|off]` — **4-Channel `24 kHz` Amiga/SID Tracker Chiptune** (`GA102 OVERDRIVE.MOD`, live 16-band Goertzel spectrum)\n\
-            - `Ctrl+T` or `/theme [sr|amiga|it|ansi]` │ `/fx [full|min|off]` — Cycle 1990s scene palettes (`Second Reality`, `Amiga AGA`, `Impulse Tracker`, `ACiD ANSI`)\n\
-            - `Ctrl+R` or `/listen` │ `/talk [on|off]` │ `/speak [on|off]` │ `/say` │ `/voice <name>` — **100%-on-RTX-3080 Voice (`Qwen3-ASR-0.6B` + `Inkling-2-Mini` + `Qwen3-TTS-0.6B` + `12Hz Code2Wav`)**\n\
-            - `/effort <0|0.1|0.2|0.7|0.9>` (or `/think [on|off]`) — Thinking effort (`0` = instant `~122 tok/s` • `0.2` = reasoning • `0.9` = deep math)\n\
-            - `/spec [on|off]` (`Ctrl+S`) │ `/gamma <1..7>` — Toggle **48L Persistent `B=1` (`~122 tok/s`)** vs **DSpark Block-8 Speculative (`~143 tok/s`)**\n\
-            - `/bench` (or `/bench spec`) │ `/verify` — Live RTX 3080 benchmark & GGUF integrity check\n\
-            - `/temp <0..2>` │ `/max <N>` │ `/sys <text>` │ `/copy [code]` (`Ctrl+Y`) │ `/clear` (`Ctrl+L`) │ `/quit` (`Ctrl+Q`) │ `/stop`"
+        "### RTX TUI · Informative HUD & Controls (`Inkling-2-Mini` 48L Sparse MoE)\n\
+            - `Type /` — **Interactive Command Palette** (`↑`/`↓` select · `Tab` complete · live `[current]` values)\n\
+            - `Ctrl+O` or `/fold` — **Expand / Collapse `<think>` Reasoning Traces** (3-line live preview while thinking)\n\
+            - `Ctrl+B` or `/inspector [on|off|auto]` — **Toggle Hardware & Session Telemetry Sidebar** (GDDR6X VRAM map, Roofline `GB/s`, Prefix Cache, Voice Spectrum)\n\
+            - `Ctrl+R` or `/listen` · `/talk [on|off]` · `/speak [on|off]` · `/say` · `/voice <name>` — **100%-on-RTX-3080 Voice (`Qwen3-ASR-0.6B` + `Inkling-2-Mini` + `Qwen3-TTS-0.6B` + `24 kHz` Code2Wav)**\n\
+            - `/effort <0|0.1|0.2|0.7|0.9>` (or `/think [on|off]`) — Thinking depth (`0` = instant `~122 tok/s` · `0.2` = reasoning · `0.9` = deep math)\n\
+            - `Ctrl+S` or `/spec [on|off]` · `/gamma <1..7>` — Toggle **48L Persistent `B=1`** vs **DSpark Block-8 Speculative (`~143 tok/s`)**\n\
+            - `Ctrl+T` or `/theme [charm|sr|it|amiga]` — Switch palette (`Charm Copper`, `Second Reality`, `Impulse Tracker`, `Amiga Dusk`)\n\
+            - `/bench [spec]` · `/verify` · `/copy [code]` (`Ctrl+Y`) · `/clear` (`Ctrl+L`) · `/demo [1..4]` · `/mod` · `/quit` (`Ctrl+Q`)"
     } else {
-        "### RTX TUI // 1990s DEMOSCENE EDITION (Voice + Text + RAG + Topic LoRA)\n\
-            - `Ctrl+D` or `/demo [1..4]` — **60 FPS Fullscreen 1990s Megademo** (`Plasma+Copper`, `3D Glenz Vector`, `Doom Fire+Kefrens`, `DYCP Scroller`)\n\
-            - `/mod [on|off]` — **4-Channel `24 kHz` Amiga/SID Tracker Chiptune** (`GA102 OVERDRIVE.MOD`, live 16-band Goertzel spectrum)\n\
-            - `Ctrl+T` or `/theme [sr|amiga|it|ansi]` │ `/fx [full|min|off]` — Cycle 1990s scene palettes (`Second Reality`, `Amiga AGA`, `Impulse Tracker`, `ACiD ANSI`)\n\
-            - `/topic [wiki|<bank_dir>|list|status|off]` — **Sharded Topic Parametric LoRA Bank** (`308 µs` GPU router + `44 µs` cached LoRA swap)\n\
-            - `/rag [wiki|<file.qvec>|off]` — **100%-on-RTX-3080 Same-Model Wikipedia VectorDB RAG** (`< 10 ms` embed + `< 50 µs` GPU cosine search)\n\
-            - `Ctrl+R` or `/listen` │ `/talk [on|off]` │ `/speak [on|off]` │ `/say` │ `/voice <name>` — **100%-on-RTX-3080 Full-Duplex Voice**\n\
-            - `/lora <path|off>` — `< 1 ms` hot-swap Rank-`r` (`r <= 32`) PEFT `.safetensors` LoRA adapter\n\
-            - `/bench` (or `/bench t1`) │ `/spec [on|off]` (`Ctrl+S`) │ `/verify` — Live megakernel benchmark & integrity check\n\
-            - `/temp <0..2>` │ `/max <N>` │ `/sys <text>` │ `/copy [code]` (`Ctrl+Y`) │ `/clear` (`Ctrl+L`) │ `/quit` (`Ctrl+Q`) │ `/stop`"
+        "### RTX TUI · Informative HUD & Controls (Voice + Text + RAG + Topic LoRA)\n\
+            - `Type /` — **Interactive Command Palette** (`↑`/`↓` select · `Tab` complete · live `[current]` values)\n\
+            - `Ctrl+O` or `/fold` — **Expand / Collapse `<think>` Reasoning Traces** (3-line live preview while thinking)\n\
+            - `Ctrl+B` or `/inspector [on|off|auto]` — **Toggle Hardware & Session Telemetry Sidebar** (GDDR6X VRAM map, Roofline `GB/s`, Prefix Cache, Voice Spectrum)\n\
+            - `Ctrl+R` or `/listen` · `/talk [on|off]` · `/speak [on|off]` · `/say` · `/voice <name>` — **100%-on-RTX-3080 Full-Duplex Voice**\n\
+            - `/topic [wiki|<bank_dir>|list|off]` · `/rag [wiki|<file.qvec>|off]` · `/lora <path|off>` — **Same-Backbone GPU RAG & `< 1 ms` LoRA Hot-Swap**\n\
+            - `Ctrl+T` or `/theme [charm|sr|it|amiga]` — Switch palette (`Charm Copper`, `Second Reality`, `Impulse Tracker`, `Amiga Dusk`)\n\
+            - `/bench [t1]` · `Ctrl+S` (`/spec`) · `/verify` · `/copy [code]` (`Ctrl+Y`) · `/clear` (`Ctrl+L`) · `/demo [1..4]` · `/mod` · `/quit` (`Ctrl+Q`)"
     }
 }

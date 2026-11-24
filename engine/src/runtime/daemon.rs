@@ -114,6 +114,10 @@ fn handle_daemon_client(session: &mut RuntimeSession, mut stream: UnixStream) ->
             let _ = stream.write_all(format!("PONG\t{}\t{}\t{}\n", mref, mname, sms).as_bytes());
             Ok(false)
         }
+        "TELEMETRY" => {
+            write_reply_res(&mut stream, Ok(session.telemetry_json()));
+            Ok(false)
+        }
         "RESET" => {
             session.reset_cache();
             let _ = stream.write_all(b"OK\n");

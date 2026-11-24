@@ -301,6 +301,22 @@ impl ScreenBuf {
         }
     }
 
+    pub(super) fn fill_row_range_help(&mut self, x0: usize, y: usize, w: usize, bg: Rgb) {
+        if y >= self.h || x0 >= self.w {
+            return;
+        }
+        let st = Style::new(FG_TEXT, bg);
+        let row_start = y * self.w;
+        let end = (x0 + w).min(self.w);
+        for x in x0..end {
+            self.cells[row_start + x] = Cell {
+                ch: ' ',
+                style: st,
+                continuation: false,
+            };
+        }
+    }
+
     pub(super) fn put_char(&mut self, x: usize, y: usize, ch: char, style: Style) -> usize {
         if y >= self.h || x >= self.w {
             return 0;
@@ -395,6 +411,7 @@ impl ScreenBuf {
 pub(super) enum InputEvent {
     Char(char),
     Paste(String),
+    Tab,
     Enter,
     Newline,
     Backspace,
@@ -410,8 +427,10 @@ pub(super) enum InputEvent {
     ScrollUp(usize),
     ScrollDown(usize),
     Esc,
+    CtrlB,
     CtrlC,
     CtrlD,
+    CtrlO,
     CtrlQ,
     CtrlL,
     CtrlR,
@@ -577,8 +596,10 @@ pub(super) fn poll_input_events(timeout_ms: i32, paste_acc: &mut Option<String>)
         }
 
         match b {
+            0x02 => events.push(InputEvent::CtrlB),
             0x03 => events.push(InputEvent::CtrlC),
             0x04 => events.push(InputEvent::CtrlD),
+            0x0f => events.push(InputEvent::CtrlO),
             0x11 => events.push(InputEvent::CtrlQ),
             0x0c => events.push(InputEvent::CtrlL),
             0x12 => events.push(InputEvent::CtrlR),
@@ -592,11 +613,7 @@ pub(super) fn poll_input_events(timeout_ms: i32, paste_acc: &mut Option<String>)
             0x0a => events.push(InputEvent::Newline), // Ctrl+J
             0x0d => events.push(InputEvent::Enter),   // Enter (\r)
             0x7f | 0x08 => events.push(InputEvent::Backspace),
-            0x09 => {
-                for _ in 0..4 {
-                    events.push(InputEvent::Char(' '));
-                }
-            }
+            0x09 => events.push(InputEvent::Tab),
             c if c >= 0x20 => {
                 // Decode UTF-8 scalar
                 let width = if c < 0x80 {

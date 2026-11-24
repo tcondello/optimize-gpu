@@ -17,6 +17,7 @@ use crate::voice::tts::TtsSynthParams;
 #[derive(Clone, Default)]
 pub(super) struct TurnStats {
     pub decode_tok_s: f64,
+    pub prefill_tok_s: f64,
     pub ttft_ms: f64,
     pub completion_tokens: usize,
     pub prompt_tokens: usize,
@@ -61,6 +62,7 @@ pub(super) fn parse_stats_json(j: &str) -> TurnStats {
         .unwrap_or_default();
     TurnStats {
         decode_tok_s: get_num("\"decode_tok_per_s\""),
+        prefill_tok_s: get_num("\"prefill_tok_per_s\""),
         ttft_ms: get_num("\"ttft_ms\""),
         completion_tokens: get_num("\"completion_tokens\"") as usize,
         prompt_tokens: get_num("\"prompt_tokens\"") as usize,
@@ -74,7 +76,6 @@ pub(super) fn parse_stats_json(j: &str) -> TurnStats {
 
 pub(super) enum StreamEvent {
     Token {
-        tok_id: i32,
         piece: String,
         tok_count: usize,
         elapsed_s: f64,
@@ -124,7 +125,6 @@ pub(super) fn spawn_generation_stream(
                     .unwrap_or(0.0);
                 if !piece.is_empty() {
                     let _ = tx.send(StreamEvent::Token {
-                        tok_id,
                         piece: piece.to_string(),
                         tok_count: count,
                         elapsed_s: dec_elapsed,
@@ -328,5 +328,40 @@ pub(super) fn query_topic_badge_from_daemon() -> Option<String> {
         return None;
     };
     let ntopics = json_find_num(&j, "num_topics").unwrap_or(0.0) as usize;
-    Some(format!(" ⚡ TOPIC:{} ", ntopics))
+    Some(format!(" TOPIC:{} ", ntopics))
+}
+
+#[derive(Clone, Default)]
+pub(super) struct HwTelemetry {
+    pub total_mb: f64,
+    pub thinker_mb: f64,
+    pub aux_mb: f64,
+    pub aux_label: String,
+    pub voice_mb: f64,
+    pub asr_mb: f64,
+    pub tts_mb: f64,
+    pub free_mb: f64,
+}
+
+pub(super) fn query_hw_telemetry_from_daemon() -> Option<HwTelemetry> {
+    let Ok(j) = DaemonControl::query(DaemonQuery::Telemetry) else {
+        return None;
+    };
+    let find_str = |key: &str| -> String {
+        crate::topic_lora::json_find_str(&j, key).unwrap_or_default()
+    };
+    let total_mb = json_find_num(&j, "total_mb").unwrap_or(0.0);
+    if total_mb <= 0.0 {
+        return None;
+    }
+    Some(HwTelemetry {
+        total_mb,
+        thinker_mb: json_find_num(&j, "thinker_mb").unwrap_or(0.0),
+        aux_mb: json_find_num(&j, "aux_mb").unwrap_or(0.0),
+        aux_label: find_str("aux_label"),
+        voice_mb: json_find_num(&j, "voice_mb").unwrap_or(0.0),
+        asr_mb: json_find_num(&j, "asr_mb").unwrap_or(0.0),
+        tts_mb: json_find_num(&j, "tts_mb").unwrap_or(0.0),
+        free_mb: json_find_num(&j, "free_mb").unwrap_or(0.0),
+    })
 }

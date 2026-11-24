@@ -1,11 +1,13 @@
-//! 1990s Demoscene Visual & Audio FX Engine (`Second Reality` / `Amiga AGA` / `Impulse Tracker` / `ACiD`).
+//! Informative 1990s Demoscene × Charm (`Lip Gloss`) Telemetry HUD, Palettes, Audio Spectrum,
+//! Slash-Command Palette, and Opt-In `/demo` Easter-Egg Showcase.
 //!
-//! Zero external crates, 100% deterministic math:
-//! - Half-block (`▀`) `2x` vertical subpixel TrueColor rasterizer (` plasma`, `copperbars`, `3D starfield`,
-//!   `3D vector polyhedra`, `demoscene palette fire`, `Kefrens bars`, `3D horizon grid`, `DYCP sine scroller`)
-//! - Real-time 16-band Hann-Goertzel spectrum analyzer with gravity-falling peak-hold caps + oscilloscope
-//! - Optional 4-channel `24 kHz` procedural Amiga/SID tracker chiptune synthesizer (`/mod` / `M` in `/demo`)
-//! - 4 authentic 1990s scene palettes (`SecondReality`, `AmigaCopper`, `ImpulseTracker`, `AcidAnsi`)
+//! Design Principle: **Informative, Never Performative.**
+//! - `0` gratuitous idle animations (`0.0%` CPU when GPU & audio are idle).
+//! - Every gradient, bar, and sparkline encodes real hardware or session state:
+//!   1. Segmented GDDR6X VRAM copper bar (`Thinker`, `Spec/LoRA`, `Voice Arena`, `Free`).
+//!   2. Real `tok/s` & `% of 760.3 GB/s GDDR6X roofline` sparkline across turns.
+//!   3. Real 16-band Hann-Goertzel audio spectrum active *only* during live mic/TTS/synth PCM.
+//!   4. Interactive `/` command palette & toggleable right-side Telemetry Inspector (`Ctrl+B`).
 
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,75 +15,50 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::terminal::{Rgb, ScreenBuf, Style};
+use super::telemetry::HwTelemetry;
+use super::terminal::{Rgb, ScreenBuf, Style, FG_AMBER, FG_CORAL, FG_CYAN, FG_GREEN};
 use crate::voice::audio::{CoreAudioPlayer, TTS_SAMPLE_RATE};
 
-const NUM_STARS: usize = 180;
+const NUM_STARS: usize = 160;
 const NUM_BANDS: usize = 16;
+const GDDR6X_PEAK_GBS: f64 = 760.3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DemoTheme {
+    CharmCopper,
     SecondReality,
-    AmigaCopper,
     ImpulseTracker,
-    AcidAnsi,
+    AmigaDusk,
 }
 
 impl DemoTheme {
     pub(super) fn next(self) -> Self {
         match self {
-            Self::SecondReality => Self::AmigaCopper,
-            Self::AmigaCopper => Self::ImpulseTracker,
-            Self::ImpulseTracker => Self::AcidAnsi,
-            Self::AcidAnsi => Self::SecondReality,
+            Self::CharmCopper => Self::SecondReality,
+            Self::SecondReality => Self::ImpulseTracker,
+            Self::ImpulseTracker => Self::AmigaDusk,
+            Self::AmigaDusk => Self::CharmCopper,
         }
     }
 
     pub(super) fn from_arg(arg: &str) -> Option<Self> {
         match arg.trim().to_ascii_lowercase().as_str() {
-            "1" | "sr" | "second_reality" | "secondreality" | "fc" | "futurecrew" => {
-                Some(Self::SecondReality)
-            }
-            "2" | "amiga" | "copper" | "amiga_copper" | "aga" => Some(Self::AmigaCopper),
+            "1" | "charm" | "crush" | "charm_copper" | "default" => Some(Self::CharmCopper),
+            "2" | "sr" | "second_reality" | "secondreality" | "fc" => Some(Self::SecondReality),
             "3" | "it" | "ft2" | "tracker" | "impulse" | "impulse_tracker" => {
                 Some(Self::ImpulseTracker)
             }
-            "4" | "acid" | "ansi" | "bbs" | "vga" | "acid_ansi" => Some(Self::AcidAnsi),
+            "4" | "amiga" | "copper" | "dusk" | "amiga_dusk" | "aga" => Some(Self::AmigaDusk),
             _ => None,
         }
     }
 
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::SecondReality => "SECOND REALITY '93",
-            Self::AmigaCopper => "AMIGA AGA COPPER '92",
-            Self::ImpulseTracker => "IMPULSE TRACKER '95",
-            Self::AcidAnsi => "ACiD VGA ANSI '94",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum FxLevel {
-    Full,
-    Minimal,
-    Off,
-}
-
-impl FxLevel {
-    pub(super) fn cycle(self) -> Self {
-        match self {
-            Self::Full => Self::Minimal,
-            Self::Minimal => Self::Off,
-            Self::Off => Self::Full,
-        }
-    }
-
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::Full => "FULL 60FPS",
-            Self::Minimal => "MINIMAL",
-            Self::Off => "STATIC",
+            Self::CharmCopper => "Charm Copper",
+            Self::SecondReality => "Second Reality",
+            Self::ImpulseTracker => "Impulse Tracker",
+            Self::AmigaDusk => "Amiga Dusk",
         }
     }
 }
@@ -90,90 +67,96 @@ impl FxLevel {
 pub(super) struct Palette {
     pub bg_void: Rgb,
     pub bg_header: Rgb,
+    pub bg_surface: Rgb,
     pub bg_deck: Rgb,
     pub bg_footer: Rgb,
-    pub bevel_hi: Rgb,
-    pub bevel_mid: Rgb,
-    pub bevel_dim: Rgb,
-    pub copper_a: Rgb,
-    pub copper_b: Rgb,
-    pub copper_c: Rgb,
+    pub border_dim: Rgb,
+    pub border_mid: Rgb,
+    pub border_hi: Rgb,
+    pub grad_a: Rgb,
+    pub grad_b: Rgb,
+    pub grad_c: Rgb,
     pub text_hi: Rgb,
     pub text_muted: Rgb,
     pub text_dim: Rgb,
-    pub badge_user: Rgb,
-    pub badge_bot: Rgb,
+    pub accent_user: Rgb,
+    pub accent_bot: Rgb,
 }
 
 pub(super) fn theme_palette(theme: DemoTheme) -> Palette {
     match theme {
-        DemoTheme::SecondReality => Palette {
-            bg_void: Rgb(7, 9, 18),
-            bg_header: Rgb(13, 18, 34),
-            bg_deck: Rgb(10, 15, 28),
-            bg_footer: Rgb(12, 16, 30),
-            bevel_hi: Rgb(76, 224, 255),
-            bevel_mid: Rgb(46, 98, 164),
-            bevel_dim: Rgb(26, 48, 86),
-            copper_a: Rgb(0, 232, 255),
-            copper_b: Rgb(245, 52, 188),
-            copper_c: Rgb(255, 206, 56),
-            text_hi: Rgb(234, 242, 255),
-            text_muted: Rgb(128, 154, 192),
-            text_dim: Rgb(74, 94, 128),
-            badge_user: Rgb(20, 74, 126),
-            badge_bot: Rgb(18, 92, 86),
+        // Inspired by charm.land (Crush / Lip Gloss): soft obsidian surfaces + indigo -> cyan -> warm copper
+        DemoTheme::CharmCopper => Palette {
+            bg_void: Rgb(11, 13, 20),
+            bg_header: Rgb(16, 19, 30),
+            bg_surface: Rgb(18, 22, 35),
+            bg_deck: Rgb(15, 18, 28),
+            bg_footer: Rgb(14, 17, 26),
+            border_dim: Rgb(36, 44, 66),
+            border_mid: Rgb(62, 76, 114),
+            border_hi: Rgb(134, 120, 246),
+            grad_a: Rgb(134, 116, 249), // Charm Violet-Indigo
+            grad_b: Rgb(76, 214, 248),  // Lip-Gloss Cyan
+            grad_c: Rgb(252, 162, 108), // Amiga Warm Copper
+            text_hi: Rgb(232, 238, 248),
+            text_muted: Rgb(138, 152, 182),
+            text_dim: Rgb(82, 94, 122),
+            accent_user: Rgb(76, 214, 248),
+            accent_bot: Rgb(252, 162, 108),
         },
-        DemoTheme::AmigaCopper => Palette {
-            bg_void: Rgb(10, 7, 24),
-            bg_header: Rgb(22, 15, 44),
-            bg_deck: Rgb(16, 11, 34),
-            bg_footer: Rgb(19, 13, 38),
-            bevel_hi: Rgb(255, 174, 68),
-            bevel_mid: Rgb(148, 78, 162),
-            bevel_dim: Rgb(68, 38, 92),
-            copper_a: Rgb(255, 116, 28),
-            copper_b: Rgb(255, 234, 142),
-            copper_c: Rgb(162, 68, 255),
-            text_hi: Rgb(248, 238, 228),
-            text_muted: Rgb(176, 144, 192),
-            text_dim: Rgb(104, 82, 126),
-            badge_user: Rgb(118, 48, 32),
-            badge_bot: Rgb(76, 38, 118),
+        DemoTheme::SecondReality => Palette {
+            bg_void: Rgb(8, 11, 20),
+            bg_header: Rgb(13, 18, 34),
+            bg_surface: Rgb(15, 22, 40),
+            bg_deck: Rgb(11, 16, 30),
+            bg_footer: Rgb(12, 17, 31),
+            border_dim: Rgb(28, 48, 84),
+            border_mid: Rgb(52, 96, 158),
+            border_hi: Rgb(72, 220, 255),
+            grad_a: Rgb(0, 224, 255),
+            grad_b: Rgb(238, 72, 188),
+            grad_c: Rgb(255, 206, 68),
+            text_hi: Rgb(234, 242, 255),
+            text_muted: Rgb(130, 156, 194),
+            text_dim: Rgb(74, 96, 130),
+            accent_user: Rgb(72, 220, 255),
+            accent_bot: Rgb(255, 206, 68),
         },
         DemoTheme::ImpulseTracker => Palette {
-            bg_void: Rgb(10, 14, 19),
-            bg_header: Rgb(20, 28, 38),
-            bg_deck: Rgb(14, 20, 28),
-            bg_footer: Rgb(18, 25, 34),
-            bevel_hi: Rgb(255, 214, 92),
-            bevel_mid: Rgb(68, 122, 138),
-            bevel_dim: Rgb(36, 62, 76),
-            copper_a: Rgb(68, 238, 128),
-            copper_b: Rgb(255, 210, 74),
-            copper_c: Rgb(68, 198, 234),
-            text_hi: Rgb(232, 240, 232),
-            text_muted: Rgb(134, 164, 160),
-            text_dim: Rgb(78, 102, 102),
-            badge_user: Rgb(32, 78, 96),
-            badge_bot: Rgb(28, 86, 56),
+            bg_void: Rgb(11, 14, 18),
+            bg_header: Rgb(18, 24, 31),
+            bg_surface: Rgb(20, 27, 35),
+            bg_deck: Rgb(15, 20, 26),
+            bg_footer: Rgb(16, 22, 28),
+            border_dim: Rgb(38, 54, 64),
+            border_mid: Rgb(68, 98, 112),
+            border_hi: Rgb(244, 204, 92),
+            grad_a: Rgb(78, 228, 136),
+            grad_b: Rgb(244, 204, 92),
+            grad_c: Rgb(82, 196, 228),
+            text_hi: Rgb(230, 238, 232),
+            text_muted: Rgb(138, 162, 158),
+            text_dim: Rgb(82, 102, 100),
+            accent_user: Rgb(82, 196, 228),
+            accent_bot: Rgb(78, 228, 136),
         },
-        DemoTheme::AcidAnsi => Palette {
-            bg_void: Rgb(4, 4, 22),
-            bg_header: Rgb(0, 22, 58),
-            bg_deck: Rgb(6, 10, 36),
-            bg_footer: Rgb(0, 18, 46),
-            bevel_hi: Rgb(85, 255, 255),
-            bevel_mid: Rgb(170, 42, 185),
-            bevel_dim: Rgb(24, 76, 148),
-            copper_a: Rgb(85, 255, 255),
-            copper_b: Rgb(255, 85, 255),
-            copper_c: Rgb(255, 255, 85),
-            text_hi: Rgb(255, 255, 255),
-            text_muted: Rgb(170, 196, 228),
-            text_dim: Rgb(85, 112, 158),
-            badge_user: Rgb(0, 85, 170),
-            badge_bot: Rgb(128, 0, 128),
+        DemoTheme::AmigaDusk => Palette {
+            bg_void: Rgb(13, 10, 22),
+            bg_header: Rgb(21, 16, 36),
+            bg_surface: Rgb(24, 18, 42),
+            bg_deck: Rgb(17, 13, 30),
+            bg_footer: Rgb(18, 14, 32),
+            border_dim: Rgb(54, 38, 76),
+            border_mid: Rgb(106, 68, 132),
+            border_hi: Rgb(250, 166, 82),
+            grad_a: Rgb(250, 128, 56),
+            grad_b: Rgb(255, 222, 138),
+            grad_c: Rgb(176, 98, 250),
+            text_hi: Rgb(244, 236, 230),
+            text_muted: Rgb(168, 146, 184),
+            text_dim: Rgb(98, 82, 118),
+            accent_user: Rgb(255, 214, 128),
+            accent_bot: Rgb(250, 142, 72),
         },
     }
 }
@@ -200,19 +183,23 @@ fn scale_rgb(c: Rgb, k: f32) -> Rgb {
     )
 }
 
-#[inline]
-fn add_rgb(a: Rgb, b: Rgb) -> Rgb {
-    Rgb(a.0.saturating_add(b.0), a.1.saturating_add(b.1), a.2.saturating_add(b.2))
-}
-
 pub(super) fn copper_gradient(pal: &Palette, phase: f32) -> Rgb {
     let u = phase.rem_euclid(1.0);
-    if u < 0.333 {
-        lerp_rgb(pal.copper_a, pal.copper_b, u * 3.0)
-    } else if u < 0.666 {
-        lerp_rgb(pal.copper_b, pal.copper_c, (u - 0.333) * 3.0)
+    if u < 0.5 {
+        lerp_rgb(pal.grad_a, pal.grad_b, u * 2.0)
     } else {
-        lerp_rgb(pal.copper_c, pal.copper_a, (u - 0.666) * 3.0)
+        lerp_rgb(pal.grad_b, pal.grad_c, (u - 0.5) * 2.0)
+    }
+}
+
+fn copper_loop(pal: &Palette, phase: f32) -> Rgb {
+    let u = phase.rem_euclid(1.0);
+    if u < 0.333 {
+        lerp_rgb(pal.grad_a, pal.grad_b, u * 3.0)
+    } else if u < 0.666 {
+        lerp_rgb(pal.grad_b, pal.grad_c, (u - 0.333) * 3.0)
+    } else {
+        lerp_rgb(pal.grad_c, pal.grad_a, (u - 0.666) * 3.0)
     }
 }
 
@@ -223,16 +210,183 @@ struct Star3D {
     z: f32,
 }
 
-pub(super) struct BannerInfo<'a> {
+pub(super) struct TelemetrySnapshot<'a> {
     pub model_name: &'a str,
     pub is_inkling: bool,
     pub gguf_size_gb: f64,
+    pub active_gb_per_tok: f64,
     pub active_sms: u32,
     pub ping_ms: f64,
+    pub daemon_online: bool,
     pub effort: &'a str,
     pub spec_on: bool,
     pub gamma: usize,
-    pub last_tps: f64,
+    pub temp: f32,
+    pub max_tokens: usize,
+    pub ctx_used: usize,
+    pub max_ctx: usize,
+    pub cached_prefix: usize,
+    pub active_tps: f64,
+    pub last_ttft_ms: f64,
+    pub last_prefill_tps: f64,
+    pub last_launches: usize,
+    pub last_spec_extra: usize,
+    pub think_words: usize,
+    pub answer_words: usize,
+    pub expand_thinking: bool,
+    pub voice_enabled: bool,
+    pub hands_free: bool,
+    pub voice_speaker: &'a str,
+    pub voice_model_ref: &'a str,
+    pub last_asr_ms: f64,
+    pub last_ttfa_ms: f64,
+    pub is_recording: bool,
+    pub is_transcribing: bool,
+    pub is_speaking: bool,
+    pub is_streaming: bool,
+    pub hw: Option<&'a HwTelemetry>,
+}
+
+pub(super) struct SlashItem {
+    pub cmd: &'static str,
+    pub args: &'static str,
+    pub desc: &'static str,
+    pub current: String,
+}
+
+pub(super) fn filter_slash_commands(
+    prefix: &str,
+    snap: &TelemetrySnapshot<'_>,
+    theme_name: &str,
+    sidebar_on: bool,
+) -> Vec<SlashItem> {
+    let q = prefix.trim().to_ascii_lowercase();
+    if !q.starts_with('/') || q.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+
+    let mut all = Vec::with_capacity(18);
+    if snap.is_inkling {
+        all.push(SlashItem {
+            cmd: "/effort",
+            args: "<0|0.1|0.2|0.7|0.9>",
+            desc: "Thinking depth (0 = instant ~122 tok/s)",
+            current: format!("now: {}", snap.effort),
+        });
+    }
+    all.push(SlashItem {
+        cmd: "/fold",
+        args: "",
+        desc: "Expand or collapse <think> traces (Ctrl+O)",
+        current: if snap.expand_thinking { "expanded".into() } else { "collapsed".into() },
+    });
+    all.push(SlashItem {
+        cmd: "/inspector",
+        args: "[on|off|auto]",
+        desc: "Toggle right-side VRAM & Roofline sidebar (Ctrl+B)",
+        current: if sidebar_on { "shown".into() } else { "hidden".into() },
+    });
+    all.push(SlashItem {
+        cmd: "/listen",
+        args: "",
+        desc: "Capture Mac mic -> RTX 3080 STT -> Voice reply (Ctrl+R)",
+        current: format!("ASR-{}", snap.voice_model_ref),
+    });
+    all.push(SlashItem {
+        cmd: "/talk",
+        args: "[on|off]",
+        desc: "Hands-free continuous voice conversation",
+        current: if snap.hands_free { "ON".into() } else { "OFF".into() },
+    });
+    all.push(SlashItem {
+        cmd: "/speak",
+        args: "[on|off]",
+        desc: "Toggle automatic 24 kHz spoken replies",
+        current: if snap.voice_enabled { "ON".into() } else { "OFF".into() },
+    });
+    all.push(SlashItem {
+        cmd: "/voice",
+        args: "<speaker>",
+        desc: "Select TTS voice (ryan, serena, vivian, aiden...)",
+        current: snap.voice_speaker.to_string(),
+    });
+    all.push(SlashItem {
+        cmd: "/spec",
+        args: "[on|off]",
+        desc: "Toggle lossless speculative verification (Ctrl+S)",
+        current: if snap.spec_on { "ON".into() } else { "OFF".into() },
+    });
+    if snap.is_inkling {
+        all.push(SlashItem {
+            cmd: "/gamma",
+            args: "<1..7>",
+            desc: "Set DSpark block-8 draft length",
+            current: format!("γ={}", snap.gamma),
+        });
+    } else {
+        all.push(SlashItem {
+            cmd: "/rag",
+            args: "[wiki|<qvec>|off]",
+            desc: "Same-backbone GPU VectorDB retrieval",
+            current: String::new(),
+        });
+        all.push(SlashItem {
+            cmd: "/topic",
+            args: "[wiki|list|off]",
+            desc: "Sharded Topic Parametric LoRA router",
+            current: String::new(),
+        });
+        all.push(SlashItem {
+            cmd: "/lora",
+            args: "<path|off>",
+            desc: "Hot-swap Rank-r PEFT LoRA adapter (<1 ms)",
+            current: String::new(),
+        });
+    }
+    all.push(SlashItem {
+        cmd: "/theme",
+        args: "[charm|sr|it|amiga]",
+        desc: "Switch TUI palette (Ctrl+T)",
+        current: theme_name.to_string(),
+    });
+    all.push(SlashItem {
+        cmd: "/bench",
+        args: if snap.is_inkling { "[spec]" } else { "[t1]" },
+        desc: "Run live RTX 3080 throughput benchmark",
+        current: if snap.active_tps > 0.0 { format!("{:.1} tok/s", snap.active_tps) } else { String::new() },
+    });
+    all.push(SlashItem {
+        cmd: "/verify",
+        args: "",
+        desc: "Inspect loaded GGUF file, size, & architecture",
+        current: format!("{:.2} GB", snap.gguf_size_gb),
+    });
+    all.push(SlashItem {
+        cmd: "/copy",
+        args: "[code]",
+        desc: "Copy last reply or code block to clipboard (Ctrl+Y)",
+        current: String::new(),
+    });
+    all.push(SlashItem {
+        cmd: "/clear",
+        args: "",
+        desc: "Clear chat & reset VRAM KV+ShortConv cache (Ctrl+L)",
+        current: String::new(),
+    });
+    all.push(SlashItem {
+        cmd: "/demo",
+        args: "[1..4]",
+        desc: "Launch opt-in 1990s 60 FPS Megademo Easter egg",
+        current: String::new(),
+    });
+    all.push(SlashItem {
+        cmd: "/quit",
+        args: "",
+        desc: "Exit TUI keeping GPU daemon warm (Ctrl+Q)",
+        current: String::new(),
+    });
+
+    all.into_iter().filter(|it| it.cmd.starts_with(&q)).collect()
 }
 
 pub(super) struct DemosceneEngine {
@@ -240,7 +394,8 @@ pub(super) struct DemosceneEngine {
     last_step: Instant,
     time_s: f32,
     theme: DemoTheme,
-    fx: FxLevel,
+    sidebar_pref: Option<bool>, // None = auto (>= 124 cols), Some(b) = user-pinned
+
     showcase_open: bool,
     showcase_scene: usize,
     showcase_auto: bool,
@@ -252,18 +407,17 @@ pub(super) struct DemosceneEngine {
     bands: [f32; NUM_BANDS],
     peaks: [f32; NUM_BANDS],
     peak_vel: [f32; NUM_BANDS],
-    scope: [f32; 64],
-    bus_energy: f32,
+    audio_active: bool,
+
+    tps_history: Vec<f64>,
 
     fire_w: usize,
     fire_h: usize,
     fire_buf: Vec<u8>,
-
     pix_w: usize,
     pix_h: usize,
     pixels: Vec<Rgb>,
 
-    scroller_pos: f32,
     mod_playing: Arc<AtomicBool>,
     mod_cancel: Option<Arc<AtomicBool>>,
 }
@@ -275,8 +429,8 @@ impl DemosceneEngine {
             t0: now,
             last_step: now,
             time_s: 0.0,
-            theme: DemoTheme::SecondReality,
-            fx: FxLevel::Full,
+            theme: DemoTheme::CharmCopper,
+            sidebar_pref: None,
             showcase_open: false,
             showcase_scene: 0,
             showcase_auto: true,
@@ -286,15 +440,14 @@ impl DemosceneEngine {
             bands: [0.0; NUM_BANDS],
             peaks: [0.0; NUM_BANDS],
             peak_vel: [0.0; NUM_BANDS],
-            scope: [0.0; 64],
-            bus_energy: 0.0,
+            audio_active: false,
+            tps_history: Vec::with_capacity(32),
             fire_w: 0,
             fire_h: 0,
             fire_buf: Vec::new(),
             pix_w: 0,
             pix_h: 0,
             pixels: Vec::new(),
-            scroller_pos: 0.0,
             mod_playing: Arc::new(AtomicBool::new(false)),
             mod_cancel: None,
         };
@@ -328,20 +481,41 @@ impl DemosceneEngine {
         theme_palette(self.theme)
     }
 
-    pub(super) fn status_tags(&self) -> (&'static str, &'static str, bool, bool) {
+    pub(super) fn sidebar_visible(&self, term_w: usize) -> bool {
+        if term_w < 100 {
+            return false;
+        }
+        self.sidebar_pref.unwrap_or(term_w >= 124)
+    }
+
+    pub(super) fn state_flags(&self) -> (&'static str, bool, bool) {
         (
             self.theme.label(),
-            self.fx.label(),
             self.showcase_open,
             self.mod_playing.load(Ordering::Relaxed),
         )
     }
 
-    pub(super) fn configure(&mut self, cmd: &str, arg: &str, viz_pcm: &Arc<Mutex<Vec<f32>>>) -> String {
+    pub(super) fn record_turn_tps(&mut self, tps: f64) {
+        if tps > 0.5 {
+            if self.tps_history.len() >= 24 {
+                self.tps_history.remove(0);
+            }
+            self.tps_history.push(tps);
+        }
+    }
+
+    pub(super) fn configure(
+        &mut self,
+        cmd: &str,
+        arg: &str,
+        term_w: usize,
+        viz_pcm: &Arc<Mutex<Vec<f32>>>,
+    ) -> String {
         match cmd {
             "theme_cycle" => {
                 self.theme = self.theme.next();
-                format!("♦ Palette switched to [{}]", self.theme.label())
+                format!("Palette: {}", self.theme.label())
             }
             "theme" => {
                 if arg.is_empty() {
@@ -349,18 +523,27 @@ impl DemosceneEngine {
                 } else if let Some(t) = DemoTheme::from_arg(arg) {
                     self.theme = t;
                 } else {
-                    return "Themes: second_reality (sr), amiga_copper (aga), impulse_tracker (it), acid_ansi (ansi)".into();
+                    return "Themes: charm (default), sr (Second Reality), it (Impulse Tracker), amiga (Amiga Dusk)".into();
                 }
-                format!("♦ Demoscene palette -> [{}]", self.theme.label())
+                format!("Palette: {}", self.theme.label())
             }
-            "fx" => {
-                self.fx = match arg.trim().to_ascii_lowercase().as_str() {
-                    "full" | "on" | "60" => FxLevel::Full,
-                    "min" | "minimal" | "low" => FxLevel::Minimal,
-                    "off" | "static" | "0" => FxLevel::Off,
-                    _ => self.fx.cycle(),
+            "sidebar" => {
+                let cur = self.sidebar_visible(term_w);
+                let next = match arg.trim().to_ascii_lowercase().as_str() {
+                    "on" | "1" | "show" => true,
+                    "off" | "0" | "hide" => false,
+                    "auto" => {
+                        self.sidebar_pref = None;
+                        return "Telemetry sidebar set to auto (>= 124 cols)".into();
+                    }
+                    _ => !cur,
                 };
-                format!("♦ Demoscene FX mode -> [{}]", self.fx.label())
+                self.sidebar_pref = Some(next);
+                if next {
+                    "Telemetry Inspector: shown (Ctrl+B to hide)".into()
+                } else {
+                    "Telemetry Inspector: hidden (Ctrl+B to show)".into()
+                }
             }
             "demo_open" => {
                 self.showcase_open = !self.showcase_open;
@@ -375,9 +558,9 @@ impl DemosceneEngine {
                     self.showcase_open = false;
                 }
                 if self.showcase_open {
-                    "♦ Entered 60 FPS MEGADEMO (1-4/Space: Scene • T: Palette • M: Chiptune • Esc: Return)".into()
+                    "Entered 90s Megademo (1-4/Space: scene · T: palette · M: synth · Esc: back to chat)".into()
                 } else {
-                    "♦ Returned to RTX Chat TUI".into()
+                    "Returned to chat".into()
                 }
             }
             "demo_scene" => {
@@ -402,12 +585,12 @@ impl DemosceneEngine {
                 };
                 if want_on && !is_on {
                     self.start_mod_synth(Arc::clone(viz_pcm));
-                    "♫ Playing 'GA102 OVERDRIVE.MOD' (4-ch 24kHz Amiga/SID Tracker Synth • /mod off or Esc stops)".into()
+                    "Playing 4-ch Amiga tracker synth (/mod off or Esc stops)".into()
                 } else if !want_on && is_on {
                     self.stop_mod_synth();
-                    "♫ Stopped tracker chiptune synth".into()
+                    "Stopped tracker synth".into()
                 } else {
-                    "♫ Tracker chiptune already active".into()
+                    "Tracker synth already active".into()
                 }
             }
             "stop_all" => {
@@ -445,123 +628,83 @@ impl DemosceneEngine {
         self.mod_playing.store(false, Ordering::Relaxed);
     }
 
-    pub(super) fn pulse_token(&mut self, tok_id: i32, live_tps: f64) {
-        let boost = ((live_tps / 140.0) as f32).clamp(0.25, 1.0);
-        self.bus_energy = (self.bus_energy * 0.55 + boost * 0.65).clamp(0.0, 1.0);
-        let h = (tok_id as u32).wrapping_mul(2654435761);
-        let b0 = (h as usize) % NUM_BANDS;
-        let b1 = ((h >> 8) as usize) % NUM_BANDS;
-        let b2 = ((h >> 16) as usize) % NUM_BANDS;
-        for &(bi, k) in &[(b0, 0.92f32), (b1, 0.74f32), (b2, 0.58f32)] {
-            let v = (boost * k).clamp(0.15, 1.0);
-            if v > self.bands[bi] {
-                self.bands[bi] = v;
-            }
-            if v > self.peaks[bi] {
-                self.peaks[bi] = v;
-                self.peak_vel[bi] = 0.0;
-            }
-        }
-    }
-
+    /// Advances active animations ONLY when real work or audio is occurring (`0.0%` idle CPU!).
     pub(super) fn step(
         &mut self,
         pcm_window: Option<(&[f32], u32)>,
-        is_streaming: bool,
-        chat_empty: bool,
+        gpu_busy: bool,
     ) -> bool {
         let now = Instant::now();
         let dt = now.duration_since(self.last_step).as_secs_f32().clamp(0.001, 0.10);
         self.last_step = now;
 
         let mod_on = self.mod_playing.load(Ordering::Relaxed);
-        let has_audio = pcm_window.map_or(false, |(s, _)| s.len() >= 64);
-        let active_anim = self.showcase_open
-            || mod_on
-            || has_audio
-            || is_streaming
-            || self.fx == FxLevel::Full;
+        let has_pcm = pcm_window.map_or(false, |(s, _)| s.len() >= 64);
 
-        if !active_anim && self.fx == FxLevel::Off {
+        if has_pcm {
+            let (samples, sr) = pcm_window.unwrap();
+            self.update_spectrum_from_pcm(samples, sr);
+            self.audio_active = true;
+        } else if self.audio_active {
+            // Smoothly decay audio spectrum bars back to calm zero once speech ends
+            let mut any_left = false;
+            for i in 0..NUM_BANDS {
+                self.bands[i] *= 0.72;
+                self.peak_vel[i] += dt * 0.9;
+                self.peaks[i] = (self.peaks[i] - self.peak_vel[i] * dt * 3.0).max(self.bands[i]);
+                if self.bands[i] > 0.015 || self.peaks[i] > 0.02 {
+                    any_left = true;
+                } else {
+                    self.bands[i] = 0.0;
+                    self.peaks[i] = 0.0;
+                    self.peak_vel[i] = 0.0;
+                }
+            }
+            if !any_left {
+                self.audio_active = false;
+            }
+        }
+
+        let need_anim = self.showcase_open || mod_on || gpu_busy || has_pcm || self.audio_active;
+        if !need_anim {
             return false;
         }
 
         self.time_s = self.t0.elapsed().as_secs_f32();
-        let warp = if is_streaming { 2.4 } else if mod_on || has_audio { 1.6 } else { 1.0 };
 
-        // Advance 3D warp starfield when showcase or attract banner is visible
-        if self.showcase_open || (chat_empty && self.fx != FxLevel::Off) {
+        if self.showcase_open {
             for i in 0..NUM_STARS {
-                self.stars[i].z -= dt * 0.72 * warp;
+                self.stars[i].z -= dt * 0.85;
                 if self.stars[i].z <= 0.06 {
                     self.stars[i] = self.spawn_star(false);
                 }
             }
-        }
-
-        // Auto-advance megademo scene every 11s unless manually pinned
-        if self.showcase_open && self.showcase_auto && self.showcase_scene_t0.elapsed() > Duration::from_secs(11) {
-            self.showcase_scene = (self.showcase_scene + 1) % 4;
-            self.showcase_scene_t0 = now;
-        }
-
-        // Advance smooth marquee scroller
-        if self.fx == FxLevel::Full || self.showcase_open || is_streaming || mod_on {
-            self.scroller_pos += dt * 16.0;
-        }
-
-        // Update 16-band Goertzel spectrum + oscilloscope
-        if let Some((samples, sr)) = pcm_window.filter(|(s, _)| s.len() >= 64) {
-            self.update_spectrum_from_pcm(samples, sr);
-        } else {
-            self.bus_energy *= 0.88;
-            for i in 0..NUM_BANDS {
-                let idle_wave = if self.fx == FxLevel::Full || self.showcase_open {
-                    let s = (self.time_s * 2.3 + (i as f32) * 0.48).sin() * 0.5 + 0.5;
-                    0.04 + 0.09 * s
-                } else {
-                    0.0
-                };
-                self.bands[i] = (self.bands[i] * 0.80).max(idle_wave + self.bus_energy * 0.25);
-                self.peak_vel[i] += dt * 0.55;
-                self.peaks[i] = (self.peaks[i] - self.peak_vel[i] * dt * 2.2).max(self.bands[i]);
-                if self.peaks[i] <= self.bands[i] + 0.001 {
-                    self.peak_vel[i] = 0.0;
-                }
-            }
-            for (k, v) in self.scope.iter_mut().enumerate() {
-                let ph = self.time_s * 5.0 + (k as f32) * 0.22;
-                *v = (ph.sin() * 0.5 + (ph * 2.1).cos() * 0.3) * self.bus_energy;
+            if self.showcase_auto && self.showcase_scene_t0.elapsed() > Duration::from_secs(11) {
+                self.showcase_scene = (self.showcase_scene + 1) % 4;
+                self.showcase_scene_t0 = now;
             }
         }
 
-        active_anim
+        true
     }
 
     fn update_spectrum_from_pcm(&mut self, samples: &[f32], sample_rate: u32) {
         let win_len = samples.len().min(256);
         let tail = &samples[samples.len() - win_len..];
         let sr = (sample_rate.max(8_000)) as f32;
+        let n_inv = 1.0 / (win_len as f32);
 
-        // Capture 64-point decimated oscilloscope trace
-        for i in 0..64 {
-            let idx = (i * win_len / 64).min(win_len - 1);
-            self.scope[i] = (tail[idx] * 2.4).clamp(-1.0, 1.0);
-        }
-
-        // 16 log-spaced Goertzel resonators (75 Hz .. 6,600 Hz)
         for b in 0..NUM_BANDS {
             let frac = (b as f32) / ((NUM_BANDS - 1) as f32);
-            let freq = 75.0 * (6600.0f32 / 75.0).powf(frac);
+            let freq = 85.0 * (6400.0f32 / 85.0).powf(frac);
             if freq >= sr * 0.47 {
-                self.bands[b] *= 0.82;
+                self.bands[b] *= 0.80;
                 continue;
             }
             let omega = TAU * freq / sr;
             let coeff = 2.0 * omega.cos();
             let mut s1 = 0.0f32;
             let mut s2 = 0.0f32;
-            let n_inv = 1.0 / (win_len as f32);
             for (n, &smp) in tail.iter().enumerate() {
                 let hann = 0.5 - 0.5 * (TAU * (n as f32) * n_inv).cos();
                 let s0 = smp * hann + coeff * s1 - s2;
@@ -569,12 +712,12 @@ impl DemosceneEngine {
                 s1 = s0;
             }
             let power = (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0);
-            let mag = (power.sqrt() * n_inv * (6.5 + frac * 11.0)).sqrt();
+            let mag = (power.sqrt() * n_inv * (6.2 + frac * 10.5)).sqrt();
             let level = mag.clamp(0.0, 1.0);
             if level >= self.bands[b] {
-                self.bands[b] = self.bands[b] * 0.32 + level * 0.68;
+                self.bands[b] = self.bands[b] * 0.30 + level * 0.70;
             } else {
-                self.bands[b] = self.bands[b] * 0.78 + level * 0.22;
+                self.bands[b] = self.bands[b] * 0.76 + level * 0.24;
             }
             if self.bands[b] >= self.peaks[b] {
                 self.peaks[b] = self.bands[b];
@@ -587,153 +730,663 @@ impl DemosceneEngine {
     }
 
     // =========================================================================
-    // Chrome Helpers: Copper Bevel Bars, Inline Spectrum, Marquee, Attract & Demo
+    // Informative 1990s × Charm UI Components
     // =========================================================================
 
-    pub(super) fn draw_chrome_bars(
-        &self,
-        scr: &mut ScreenBuf,
-        w: usize,
-        divider_y: usize,
-        footer_y: usize,
-        marquee_msg: &str,
-    ) {
+    /// Draws the 1-row Lip-Gloss / Amiga Copper hairline divider (`Row 2`).
+    /// Calm static gradient when idle; smooth pulse sweep ONLY while GPU is busy!
+    pub(super) fn draw_copper_rule(&self, scr: &mut ScreenBuf, w: usize, y: usize, gpu_busy: bool) {
         let pal = self.palette();
-
-        // Row `divider_y`: Animated Amiga Copperbar Bevel Divider (`╠═══...═══╣`)
-        if divider_y < scr.dims().1 && w >= 8 {
-            scr.put_char(0, divider_y, '╠', Style::new(pal.bevel_hi, pal.bg_void).bold());
-            for x in 1..w.saturating_sub(1) {
-                let u = (x as f32) / (w.max(1) as f32);
-                let wave = (u * 3.5 - self.time_s * 0.85).sin() * 0.5 + 0.5;
-                let col = if self.fx == FxLevel::Off {
-                    pal.bevel_mid
-                } else {
-                    let c = copper_gradient(&pal, u * 1.4 - self.time_s * 0.28);
-                    lerp_rgb(pal.bevel_dim, c, 0.35 + 0.55 * wave)
-                };
-                let ch = if wave > 0.86 && self.fx != FxLevel::Off { '═' } else { '═' };
-                scr.put_char(x, divider_y, ch, Style::new(col, pal.bg_void));
-            }
-            scr.put_char(
-                w.saturating_sub(1),
-                divider_y,
-                '╣',
-                Style::new(pal.bevel_hi, pal.bg_void).bold(),
-            );
+        if y >= scr.dims().1 {
+            return;
         }
-
-        // Row `footer_y`: Smooth 1990s Demoscene Copper Scroller (`░▒▓ ... ▓▒░`)
-        if !marquee_msg.is_empty() && footer_y < scr.dims().1 && w >= 16 {
-            scr.fill_row(footer_y, pal.bg_footer);
-            scr.put_str(0, footer_y, w, "░▒▓", Style::new(pal.copper_a, pal.bg_footer));
-            scr.put_str(
-                w.saturating_sub(3),
-                footer_y,
-                w,
-                "▓▒░",
-                Style::new(pal.copper_b, pal.bg_footer),
-            );
-            let inner_w = w.saturating_sub(8);
-            let chars: Vec<char> = marquee_msg.chars().collect();
-            if !chars.is_empty() && inner_w > 4 {
-                let base = if self.fx == FxLevel::Off {
-                    0usize
-                } else {
-                    (self.scroller_pos as usize) % chars.len()
-                };
-                for i in 0..inner_w {
-                    let ch = chars[(base + i) % chars.len()];
-                    let edge_fade = (i.min(inner_w - 1 - i) as f32 / 6.0).clamp(0.25, 1.0);
-                    let c_base = copper_gradient(&pal, (i as f32) / 48.0 - self.time_s * 0.22);
-                    let fg = scale_rgb(lerp_rgb(pal.text_hi, c_base, 0.45), edge_fade);
-                    scr.put_char(4 + i, footer_y, ch, Style::new(fg, pal.bg_footer));
-                }
-            }
+        let phase_shift = if gpu_busy { -self.time_s * 0.85 } else { 0.0 };
+        for x in 0..w {
+            let u = (x as f32) / (w.max(1) as f32);
+            let col = if gpu_busy {
+                let wave = ((u * 2.5 + phase_shift * 2.2).sin() * 0.5 + 0.5).powi(2);
+                let base = copper_loop(&pal, u + phase_shift);
+                lerp_rgb(pal.border_dim, base, 0.45 + 0.55 * wave)
+            } else {
+                let base = copper_gradient(&pal, u);
+                lerp_rgb(pal.border_dim, base, 0.52)
+            };
+            scr.put_char(x, y, '─', Style::new(col, pal.bg_void));
         }
     }
 
-    pub(super) fn draw_spectrum_strip(
+    /// Segmented GDDR6X VRAM bar (`█` Thinker, `▓` Aux/Spec/LoRA, `▒` Voice, `░` Free).
+    pub(super) fn draw_vram_bar(
+        &self,
+        scr: &mut ScreenBuf,
+        x: usize,
+        y: usize,
+        cells: usize,
+        bg: Rgb,
+        snap: &TelemetrySnapshot<'_>,
+    ) -> usize {
+        let pal = self.palette();
+        let (tot_mb, th_mb, aux_mb, vc_mb) = if let Some(hw) = snap.hw {
+            (hw.total_mb.max(1.0), hw.thinker_mb, hw.aux_mb, hw.voice_mb)
+        } else {
+            let est_th = snap.gguf_size_gb * 1024.0 + 400.0;
+            let est_aux = if snap.is_inkling && snap.spec_on { 447.0 } else { 0.0 };
+            (10_240.0, est_th, est_aux, 0.0)
+        };
+        let n = cells.max(6);
+        let c_th = ((th_mb / tot_mb) * (n as f64)).round() as usize;
+        let c_aux = if aux_mb > 20.0 {
+            (((aux_mb / tot_mb) * (n as f64)).round() as usize).max(1)
+        } else {
+            0
+        };
+        let c_vc = if vc_mb > 20.0 {
+            (((vc_mb / tot_mb) * (n as f64)).round() as usize).max(1)
+        } else {
+            0
+        };
+
+        let mut cx = x;
+        for i in 0..n {
+            let (ch, fg) = if i < c_th {
+                ('█', pal.grad_a)
+            } else if i < c_th + c_aux {
+                ('▓', pal.grad_b)
+            } else if i < c_th + c_aux + c_vc {
+                ('▒', pal.grad_c)
+            } else {
+                ('░', pal.border_dim)
+            };
+            cx += scr.put_char(cx, y, ch, Style::new(fg, bg));
+        }
+        cx
+    }
+
+    /// Real measured `tok/s` sparkline across session turns (`0` fake noise!).
+    pub(super) fn draw_tps_sparkline(
+        &self,
+        scr: &mut ScreenBuf,
+        x: usize,
+        y: usize,
+        max_pts: usize,
+        bg: Rgb,
+        live_tps: f64,
+    ) -> usize {
+        const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let pal = self.palette();
+        let mut vals: Vec<f64> = self.tps_history.clone();
+        if live_tps > 0.5 && (vals.is_empty() || (vals.last().copied().unwrap_or(0.0) - live_tps).abs() > 0.2) {
+            vals.push(live_tps);
+        }
+        if vals.is_empty() {
+            return x;
+        }
+        let start = vals.len().saturating_sub(max_pts);
+        let slice = &vals[start..];
+        let peak = slice.iter().copied().fold(140.0f64, f64::max);
+        let mut cx = x;
+        for &v in slice {
+            let norm = (v / peak).clamp(0.08, 1.0);
+            let idx = ((norm * 7.0).round() as usize).min(7);
+            let col = copper_gradient(&pal, norm as f32);
+            cx += scr.put_char(cx, y, SPARK[idx], Style::new(col, bg));
+        }
+        cx
+    }
+
+    /// Live 16-band Hann-Goertzel voice spectrum (`[····]` flat baseline when silent).
+    pub(super) fn draw_voice_spectrum(
         &self,
         scr: &mut ScreenBuf,
         x: usize,
         y: usize,
         max_x: usize,
-        compact: bool,
+        bg: Rgb,
     ) -> usize {
         const BARS: [char; 9] = ['·', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
         let pal = self.palette();
-        let bg = if compact { pal.bg_header } else { pal.bg_deck };
-        let n = if compact { 12usize } else { NUM_BANDS };
-        if x + n + 2 >= max_x {
+        if x + NUM_BANDS + 2 >= max_x {
             return x;
         }
-        let mut cx = scr.put_char(x, y, '[', Style::new(pal.bevel_mid, bg));
-        for i in 0..n {
-            let bi = i * NUM_BANDS / n;
-            let lvl = self.bands[bi].clamp(0.0, 1.0);
-            let pk = self.peaks[bi].clamp(0.0, 1.0);
+        let mut cx = scr.put_char(x, y, '[', Style::new(pal.border_mid, bg));
+        for b in 0..NUM_BANDS {
+            let lvl = self.bands[b].clamp(0.0, 1.0);
+            let pk = self.peaks[b].clamp(0.0, 1.0);
             let idx = ((lvl * 8.0).round() as usize).min(8);
-            let ch = if idx == 0 && pk > 0.18 { '˙' } else { BARS[idx] };
-            let fg = if lvl > 0.80 {
-                Rgb(255, 78, 92)
-            } else if lvl > 0.52 {
-                Rgb(255, 214, 68)
-            } else if lvl > 0.14 {
-                Rgb(72, 242, 136)
+            let ch = if idx == 0 && pk > 0.16 { '˙' } else { BARS[idx] };
+            let fg = if !self.audio_active && idx == 0 {
+                pal.border_dim
+            } else if lvl > 0.78 {
+                FG_CORAL
+            } else if lvl > 0.48 {
+                FG_AMBER
+            } else if lvl > 0.08 {
+                FG_GREEN
             } else {
-                pal.bevel_mid
+                pal.border_mid
             };
-            cx += scr.put_char(cx, y, ch, Style::new(fg, bg).bold());
+            cx += scr.put_char(cx, y, ch, Style::new(fg, bg));
         }
-        cx += scr.put_char(cx, y, ']', Style::new(pal.bevel_mid, bg));
-
-        // Optional mini oscilloscope trace when wide enough in non-compact deck
-        if !compact && cx + 20 < max_x {
-            cx += scr.put_str(cx, y, max_x, " ~", Style::new(pal.bevel_dim, bg));
-            for k in 0..16 {
-                let s = self.scope[k * 4];
-                let ch = if s > 0.45 {
-                    '▀'
-                } else if s > 0.12 {
-                    '─'
-                } else if s > -0.20 {
-                    '·'
-                } else {
-                    '▄'
-                };
-                cx += scr.put_char(cx, y, ch, Style::new(pal.copper_a, bg));
-            }
-        }
+        cx += scr.put_char(cx, y, ']', Style::new(pal.border_mid, bg));
         cx
     }
 
-    pub(super) fn draw_attract_or_showcase(
-        &mut self,
+    /// Calm, high-signal Empty-Chat Session Brief (Charm × 1990s Copper Wordmark + Live Hardware Readiness).
+    pub(super) fn draw_session_brief(
+        &self,
         scr: &mut ScreenBuf,
         x0: usize,
         y0: usize,
         w: usize,
         h: usize,
-        info: &BannerInfo<'_>,
+        snap: &TelemetrySnapshot<'_>,
     ) {
-        if self.showcase_open {
-            let (sw, sh) = scr.dims();
-            self.render_megademo_fullscreen(scr, sw, sh, info);
+        let pal = self.palette();
+        if w < 44 || h < 7 {
+            return;
+        }
+
+        let card_w = w.saturating_sub(6).min(86);
+        let cx0 = x0 + (w.saturating_sub(card_w)) / 2;
+        let card_h = 15usize.min(h.saturating_sub(1));
+        let cy0 = y0 + (h.saturating_sub(card_h)) / 3;
+
+        // Subtle 1990s × Charm Copper-Gradient Wordmark above/inside the session card
+        const LOGO: [&str; 3] = [
+            "█▀█ ▀█▀ ▀▄▀   ╱╱   █▀▀ ▄▀█ ▄█ █▀█ ▀█",
+            "█▀▄  █  █ █  ╱╱    █▄█ █▀█  █ █▄█ █▄",
+            "▀▀▀  ▀  ▀ ▀        ▀▀▀ ▀ ▀  ▀ ▀▀▀ ▀▀",
+        ];
+        let mut row = cy0;
+        if card_h >= 13 {
+            for (li, ln) in LOGO.iter().enumerate() {
+                if row >= y0 + h {
+                    break;
+                }
+                for (ci, ch) in ln.chars().enumerate() {
+                    let u = (ci as f32) / (ln.chars().count().max(1) as f32) + (li as f32) * 0.12;
+                    let col = copper_gradient(&pal, u);
+                    scr.put_char(cx0 + 2 + ci, row, ch, Style::new(col, pal.bg_void).bold());
+                }
+                row += 1;
+            }
+            if row < y0 + h {
+                scr.put_str(
+                    cx0 + 2,
+                    row,
+                    cx0 + card_w,
+                    "Native macOS ARM64 Rust · 100% NVIDIA RTX 3080 (sm_86) · Zero Docker · Zero Crates",
+                    Style::new(pal.text_muted, pal.bg_void),
+                );
+                row += 2;
+            }
+        }
+
+        // Rounded Telemetry Readiness Card (`╭─ SESSION READY ─╮`)
+        if row + 4 >= y0 + h {
+            return;
+        }
+        let inner_w = card_w.saturating_sub(2);
+        scr.fill_row_range_help(cx0, row, card_w, pal.bg_surface);
+        scr.put_char(cx0, row, '╭', Style::new(pal.border_mid, pal.bg_surface));
+        let hdr = "─ SYSTEM & MODEL TELEMETRY ";
+        let mut tx = scr.put_str(cx0 + 1, row, cx0 + card_w - 1, hdr, Style::new(pal.grad_b, pal.bg_surface).bold());
+        while tx < cx0 + card_w - 1 {
+            tx += scr.put_char(tx, row, '─', Style::new(pal.border_dim, pal.bg_surface));
+        }
+        scr.put_char(cx0 + card_w - 1, row, '╮', Style::new(pal.border_mid, pal.bg_surface));
+        row += 1;
+
+        let (used_gib, free_gib, aux_desc) = if let Some(hw) = snap.hw {
+            (
+                (hw.thinker_mb + hw.aux_mb + hw.voice_mb) / 1024.0,
+                hw.free_mb / 1024.0,
+                hw.aux_label.as_str(),
+            )
         } else {
-            self.render_attract_home(scr, x0, y0, w, h, info);
+            (snap.gguf_size_gb, (10.0 - snap.gguf_size_gb - 0.5).max(0.0), "ready")
+        };
+
+        let arch_summary = if snap.is_inkling {
+            format!(
+                "{} · 24→48L 128×8 Sparse MoE ({:.2} GB/tok active)",
+                snap.model_name, snap.active_gb_per_tok
+            )
+        } else {
+            format!("{} · {:.2} GB GGUF (read-only mmap)", snap.model_name, snap.gguf_size_gb)
+        };
+        let mode_summary = if snap.is_inkling {
+            if snap.spec_on {
+                format!("DSpark Block-8 Speculative (γ={}) · Effort {}", snap.gamma, snap.effort)
+            } else {
+                format!("48L Persistent B=1 Megakernel (~122 tok/s) · Effort {}", snap.effort)
+            }
+        } else if snap.spec_on {
+            "BM=4 Lossless Speculative Megakernel".to_string()
+        } else {
+            "68-SM Persistent T=1 Megakernel".to_string()
+        };
+        let link_str = if snap.daemon_online {
+            format!("{} SMs · {} · {:.1}ms IPC", snap.active_sms, aux_desc, snap.ping_ms)
+        } else {
+            "daemon offline".to_string()
+        };
+        let vram_summary = format!(
+            "{:.2} GiB allocated · {:.2} GiB free high VRAM ({})",
+            used_gib, free_gib, link_str
+        );
+        let voice_summary = format!(
+            "Qwen3-ASR-{} + Qwen3-TTS-{} ({} · 24 kHz Code2Wav)",
+            snap.voice_model_ref.to_uppercase(),
+            snap.voice_model_ref.to_uppercase(),
+            snap.voice_speaker
+        );
+
+        let rows: [(&str, String, Rgb); 4] = [
+            ("Backbone ", arch_summary, pal.text_hi),
+            ("Compute  ", mode_summary, pal.grad_c),
+            ("VRAM     ", vram_summary, pal.grad_b),
+            ("Voice    ", voice_summary, pal.text_muted),
+        ];
+
+        for (lbl, val, col) in &rows {
+            if row + 1 >= y0 + h {
+                break;
+            }
+            scr.fill_row_range_help(cx0, row, card_w, pal.bg_surface);
+            scr.put_char(cx0, row, '│', Style::new(pal.border_dim, pal.bg_surface));
+            let lx = scr.put_str(cx0 + 2, row, cx0 + inner_w, lbl, Style::new(pal.text_dim, pal.bg_surface));
+            scr.put_str(lx + 1, row, cx0 + card_w - 2, val, Style::new(*col, pal.bg_surface));
+            scr.put_char(cx0 + card_w - 1, row, '│', Style::new(pal.border_dim, pal.bg_surface));
+            row += 1;
+        }
+
+        if row < y0 + h {
+            scr.fill_row_range_help(cx0, row, card_w, pal.bg_surface);
+            scr.put_char(cx0, row, '╰', Style::new(pal.border_mid, pal.bg_surface));
+            for x in (cx0 + 1)..(cx0 + card_w - 1) {
+                scr.put_char(x, row, '─', Style::new(pal.border_dim, pal.bg_surface));
+            }
+            scr.put_char(cx0 + card_w - 1, row, '╯', Style::new(pal.border_mid, pal.bg_surface));
+            row += 2;
+        }
+
+        if row < y0 + h {
+            let hints = "  / commands · Ctrl+R speak · /talk hands-free · Ctrl+O toggle <think> · Ctrl+B sidebar · Ctrl+T theme";
+            scr.put_str(cx0, row, cx0 + card_w + 4, hints, Style::new(pal.text_dim, pal.bg_void));
         }
     }
 
+    /// Right-Side Hardware & Session Telemetry Inspector (`34` columns, `Ctrl+B` or `/inspector`).
+    pub(super) fn draw_inspector_sidebar(
+        &self,
+        scr: &mut ScreenBuf,
+        x0: usize,
+        y0: usize,
+        w: usize,
+        h: usize,
+        snap: &TelemetrySnapshot<'_>,
+    ) {
+        let pal = self.palette();
+        if w < 26 || h < 8 {
+            return;
+        }
+        let max_x = x0 + w - 1;
+        for r in 0..h {
+            let y = y0 + r;
+            scr.fill_row_range_help(x0, y, w, pal.bg_header);
+            scr.put_char(x0, y, '│', Style::new(pal.border_dim, pal.bg_header));
+        }
+
+        let lx = x0 + 2;
+        let bar_w = w.saturating_sub(4).min(26);
+        let mut y = y0;
+
+        let put_sec = |scr: &mut ScreenBuf, y: usize, title: &str| {
+            let sx = scr.put_str(lx, y, max_x, title, Style::new(pal.grad_b, pal.bg_header).bold());
+            for x in (sx + 1)..max_x {
+                scr.put_char(x, y, '─', Style::new(pal.border_dim, pal.bg_header));
+            }
+        };
+
+        // 1. GDDR6X VRAM Allocation Map
+        put_sec(scr, y, "VRAM MAP");
+        y += 1;
+        if y < y0 + h {
+            self.draw_vram_bar(scr, lx, y, bar_w, pal.bg_header, snap);
+            y += 1;
+        }
+        let (th_g, aux_g, aux_lbl, vc_g, free_g) = if let Some(hw) = snap.hw {
+            (
+                hw.thinker_mb / 1024.0,
+                hw.aux_mb / 1024.0,
+                hw.aux_label.as_str(),
+                hw.voice_mb / 1024.0,
+                hw.free_mb / 1024.0,
+            )
+        } else {
+            (
+                snap.gguf_size_gb,
+                if snap.is_inkling && snap.spec_on { 0.44 } else { 0.0 },
+                if snap.is_inkling && snap.spec_on { "DSpark" } else { "standby" },
+                0.0,
+                (10.0 - snap.gguf_size_gb - 0.5).max(0.0),
+            )
+        };
+        let vram_rows: [(char, Rgb, &str, String); 4] = [
+            ('█', pal.grad_a, "Thinker+KV", format!("{:>5.2}G", th_g)),
+            ('▓', pal.grad_b, aux_lbl, format!("{:>5.2}G", aux_g)),
+            ('▒', pal.grad_c, "Voice Arena", format!("{:>5.2}G", vc_g)),
+            ('░', pal.text_dim, "Free High", format!("{:>5.2}G", free_g)),
+        ];
+        for (dot, col, name, val) in &vram_rows {
+            if y >= y0 + h {
+                return;
+            }
+            scr.put_char(lx, y, *dot, Style::new(*col, pal.bg_header));
+            scr.put_str(lx + 2, y, max_x - 7, name, Style::new(pal.text_muted, pal.bg_header));
+            scr.put_str(max_x.saturating_sub(6), y, max_x, val, Style::new(pal.text_hi, pal.bg_header));
+            y += 1;
+        }
+
+        // 2. Compute Roofline & Sparkline
+        y += 1;
+        if y + 3 >= y0 + h {
+            return;
+        }
+        put_sec(scr, y, "ROOFLINE");
+        y += 1;
+        let eff_bw = snap.active_tps * snap.active_gb_per_tok;
+        let roof_pct = ((eff_bw / GDDR6X_PEAK_GBS) * 100.0).clamp(0.0, 100.0);
+        let ms_tok = if snap.active_tps > 0.1 { 1000.0 / snap.active_tps } else { 0.0 };
+        let r_rows: [(&str, String, Rgb); 4] = [
+            (
+                "Decode",
+                if snap.active_tps > 0.0 {
+                    format!("{:.1} tok/s ({:.1}ms)", snap.active_tps, ms_tok)
+                } else if snap.is_streaming {
+                    "Prefilling...".into()
+                } else {
+                    "—".into()
+                },
+                pal.grad_c,
+            ),
+            (
+                "Bus BW",
+                if eff_bw > 0.0 {
+                    format!("{:.0} GB/s ({:.0}%)", eff_bw, roof_pct)
+                } else {
+                    format!("0 / {:.0} GB/s", GDDR6X_PEAK_GBS)
+                },
+                pal.grad_b,
+            ),
+            (
+                "Prefill",
+                if snap.last_ttft_ms > 0.0 {
+                    if snap.last_prefill_tps > 1.0 {
+                        format!("{:.0} tok/s · {:.0}ms", snap.last_prefill_tps, snap.last_ttft_ms)
+                    } else {
+                        format!("TTFT {:.0}ms · {} QMD", snap.last_ttft_ms, snap.last_launches.max(1))
+                    }
+                } else {
+                    "—".into()
+                },
+                pal.text_hi,
+            ),
+            (
+                "Mode",
+                if snap.is_inkling {
+                    if snap.spec_on {
+                        format!("DSpark γ={} (+{})", snap.gamma, snap.last_spec_extra)
+                    } else {
+                        format!("48L B=1 · {} QMD", snap.last_launches.max(2))
+                    }
+                } else if snap.spec_on {
+                    format!("Spec BM=4 (+{})", snap.last_spec_extra)
+                } else {
+                    format!("T=1 · {} QMD", snap.last_launches.max(2))
+                },
+                pal.text_muted,
+            ),
+        ];
+        for (k, v, c) in &r_rows {
+            if y >= y0 + h {
+                return;
+            }
+            scr.put_str(lx, y, lx + 9, k, Style::new(pal.text_dim, pal.bg_header));
+            scr.put_str(lx + 9, y, max_x, v, Style::new(*c, pal.bg_header));
+            y += 1;
+        }
+        if y < y0 + h && (!self.tps_history.is_empty() || snap.active_tps > 0.5) {
+            scr.put_str(lx, y, lx + 9, "Trend", Style::new(pal.text_dim, pal.bg_header));
+            self.draw_tps_sparkline(scr, lx + 9, y, bar_w.saturating_sub(9), pal.bg_header, snap.active_tps);
+            y += 1;
+        }
+
+        // 3. Context & Prefix Cache
+        y += 1;
+        if y + 3 >= y0 + h {
+            return;
+        }
+        put_sec(scr, y, "CONTEXT & THINK");
+        y += 1;
+        let ctx_pct = ((snap.ctx_used as f64 / snap.max_ctx.max(1) as f64) * 100.0).min(100.0);
+        let hit_pct = if snap.ctx_used > 0 {
+            ((snap.cached_prefix as f64 / snap.ctx_used as f64) * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        let c_rows: [(&str, String); 4] = [
+            ("Window", format!("{}/{} ({:.0}%)", snap.ctx_used, snap.max_ctx, ctx_pct)),
+            ("Cache", format!("{} hit ({:.0}%)", snap.cached_prefix, hit_pct)),
+            (
+                "Output",
+                format!(
+                    "{}w think · {}w ans",
+                    snap.think_words, snap.answer_words
+                ),
+            ),
+            ("Sample", format!("T={:.2} · max {}", snap.temp, snap.max_tokens)),
+        ];
+        for (k, v) in &c_rows {
+            if y >= y0 + h {
+                return;
+            }
+            scr.put_str(lx, y, lx + 9, k, Style::new(pal.text_dim, pal.bg_header));
+            scr.put_str(lx + 9, y, max_x, v, Style::new(pal.text_hi, pal.bg_header));
+            y += 1;
+        }
+
+        // 4. Co-Resident Voice & Live Audio Spectrum
+        y += 1;
+        if y + 3 >= y0 + h {
+            return;
+        }
+        put_sec(scr, y, "VOICE I/O");
+        y += 1;
+        let asr_mb = snap.hw.map(|h| h.asr_mb).unwrap_or(0.0);
+        let tts_mb = snap.hw.map(|h| h.tts_mb).unwrap_or(0.0);
+        let stt_val = if snap.is_recording {
+            "Recording 16kHz...".to_string()
+        } else if snap.is_transcribing {
+            "GPU AuT+Decode...".to_string()
+        } else if snap.last_asr_ms > 0.0 {
+            format!("ASR-{} ({:.0}ms)", snap.voice_model_ref, snap.last_asr_ms)
+        } else if asr_mb > 1.0 {
+            format!("ASR-{} ({:.0}M warm)", snap.voice_model_ref, asr_mb)
+        } else {
+            format!("ASR-{} standby", snap.voice_model_ref)
+        };
+        let tts_val = if snap.is_speaking {
+            format!("Speaking ({} · {:.0}ms)", snap.voice_speaker, snap.last_ttfa_ms)
+        } else if tts_mb > 1.0 {
+            format!("{} ({:.0}M warm)", snap.voice_speaker, tts_mb)
+        } else if snap.voice_enabled || snap.hands_free {
+            format!("{} (ON)", snap.voice_speaker)
+        } else {
+            format!("{} (Ctrl+R)", snap.voice_speaker)
+        };
+        scr.put_str(lx, y, lx + 9, "STT", Style::new(pal.text_dim, pal.bg_header));
+        scr.put_str(
+            lx + 9,
+            y,
+            max_x,
+            &stt_val,
+            Style::new(if snap.is_recording { FG_GREEN } else { pal.text_hi }, pal.bg_header),
+        );
+        y += 1;
+        if y < y0 + h {
+            scr.put_str(lx, y, lx + 9, "TTS", Style::new(pal.text_dim, pal.bg_header));
+            scr.put_str(
+                lx + 9,
+                y,
+                max_x,
+                &tts_val,
+                Style::new(if snap.is_speaking { FG_AMBER } else { pal.text_muted }, pal.bg_header),
+            );
+            y += 1;
+        }
+        if y < y0 + h {
+            self.draw_voice_spectrum(scr, lx, y, max_x, pal.bg_header);
+        }
+    }
+
+    /// Floating Slash-Command Autocomplete Palette above the composer (Hermes / Claude / Pi style).
+    pub(super) fn draw_slash_palette(
+        &self,
+        scr: &mut ScreenBuf,
+        x0: usize,
+        comp_top_y: usize,
+        w: usize,
+        items: &[SlashItem],
+        selected: usize,
+    ) {
+        if items.is_empty() || comp_top_y < 4 || w < 36 {
+            return;
+        }
+        let pal = self.palette();
+        let max_vis = items.len().min(6).min(comp_top_y.saturating_sub(3));
+        if max_vis == 0 {
+            return;
+        }
+        let start = if selected >= max_vis {
+            selected + 1 - max_vis
+        } else {
+            0
+        };
+        let box_h = max_vis + 2;
+        let top_y = comp_top_y - box_h;
+        let box_w = w.min(82);
+
+        scr.fill_row_range_help(x0, top_y, box_w, pal.bg_surface);
+        scr.put_char(x0, top_y, '╭', Style::new(pal.border_hi, pal.bg_surface));
+        let hdr = "─ Commands (↑↓ select · Tab complete · Enter run) ";
+        let mut hx = scr.put_str(x0 + 1, top_y, x0 + box_w - 1, hdr, Style::new(pal.grad_b, pal.bg_surface).bold());
+        while hx < x0 + box_w - 1 {
+            hx += scr.put_char(hx, top_y, '─', Style::new(pal.border_dim, pal.bg_surface));
+        }
+        scr.put_char(x0 + box_w - 1, top_y, '╮', Style::new(pal.border_hi, pal.bg_surface));
+
+        for i in 0..max_vis {
+            let idx = start + i;
+            let it = &items[idx];
+            let ry = top_y + 1 + i;
+            let is_sel = idx == selected;
+            let row_bg = if is_sel { pal.bg_header } else { pal.bg_surface };
+            scr.fill_row_range_help(x0, ry, box_w, row_bg);
+            scr.put_char(x0, ry, '│', Style::new(pal.border_hi, row_bg));
+            let marker = if is_sel { "▸ " } else { "  " };
+            let cmd_fg = if is_sel { pal.grad_c } else { pal.grad_b };
+            let mut cx = scr.put_str(x0 + 1, ry, x0 + box_w - 2, marker, Style::new(pal.grad_c, row_bg).bold());
+            cx = scr.put_str(cx, ry, x0 + 26, it.cmd, Style::new(cmd_fg, row_bg).bold());
+            if !it.args.is_empty() {
+                cx = scr.put_str(cx + 1, ry, x0 + 29, it.args, Style::new(pal.text_dim, row_bg));
+            }
+            let desc_x = (x0 + 28).max(cx + 2);
+            let cur_tag = if it.current.is_empty() {
+                String::new()
+            } else {
+                format!("[{}]", it.current)
+            };
+            let right_limit = (x0 + box_w - 2).saturating_sub(cur_tag.chars().count() + 1);
+            scr.put_str(desc_x, ry, right_limit, it.desc, Style::new(pal.text_muted, row_bg));
+            if !cur_tag.is_empty() {
+                scr.put_str(right_limit + 1, ry, x0 + box_w - 1, &cur_tag, Style::new(FG_CYAN, row_bg));
+            }
+            scr.put_char(x0 + box_w - 1, ry, '│', Style::new(pal.border_hi, row_bg));
+        }
+
+        let bot_y = top_y + box_h - 1;
+        scr.fill_row_range_help(x0, bot_y, box_w, pal.bg_surface);
+        scr.put_char(x0, bot_y, '╰', Style::new(pal.border_hi, pal.bg_surface));
+        for x in (x0 + 1)..(x0 + box_w - 1) {
+            scr.put_char(x, bot_y, '─', Style::new(pal.border_dim, pal.bg_surface));
+        }
+        scr.put_char(x0 + box_w - 1, bot_y, '╯', Style::new(pal.border_hi, pal.bg_surface));
+    }
+
     // =========================================================================
-    // Subpixel (`▀`) Canvas Helpers
+    // Opt-In `/demo` Fullscreen 60 FPS 1990s Megademo Showcase
     // =========================================================================
 
-    fn ensure_canvas(&mut self, pw: usize, ph: usize, clear: Rgb) {
+    pub(super) fn draw_megademo(&mut self, scr: &mut ScreenBuf, w: usize, h: usize, model_name: &str, active_sms: u32) {
+        let pal = self.palette();
+        scr.resize_and_clear(w, h, pal.bg_void);
+        if w < 24 || h < 10 {
+            return;
+        }
+        let scene_names = [
+            "1/4 · PLASMA & AMIGA COPPERBARS",
+            "2/4 · 3D GLENZ VECTOR & STARFIELD",
+            "3/4 · DOOM FIRE & KEFRENS RASTERS",
+            "4/4 · DYCP SINE SCROLLER & HORIZON",
+        ];
+        scr.fill_row(0, pal.bg_header);
+        let mut x = scr.put_str(
+            0,
+            0,
+            w,
+            &format!(" RTX DEMO // {} ", scene_names[self.showcase_scene % 4]),
+            Style::new(pal.bg_void, pal.grad_b).bold(),
+        );
+        let mod_lbl = if self.mod_playing.load(Ordering::Relaxed) {
+            " ♫ MOD:ON "
+        } else {
+            " M:Synth "
+        };
+        x = scr.put_str(x + 1, 0, w, mod_lbl, Style::new(pal.grad_c, pal.bg_header).bold());
+        let rhs = "1-4/Space:Scene · T:Theme · M:Chiptune · Esc:Return ";
+        let rx = w.saturating_sub(rhs.chars().count());
+        if rx > x + 1 {
+            scr.put_str(rx, 0, w, rhs, Style::new(pal.text_muted, pal.bg_header));
+        }
+
+        let canvas_rows = h.saturating_sub(1);
+        let pw = w;
+        let ph = canvas_rows * 2;
         self.pix_w = pw;
         self.pix_h = ph;
         self.pixels.clear();
-        self.pixels.resize(pw * ph, clear);
+        self.pixels.resize(pw * ph, pal.bg_void);
+
+        match self.showcase_scene % 4 {
+            0 => self.scene_plasma(&pal),
+            1 => self.scene_vector_stars(&pal),
+            2 => self.scene_fire_kefrens(&pal),
+            _ => self.scene_dycp_horizon(&pal, model_name, active_sms),
+        }
+
+        for r in 0..canvas_rows {
+            for c in 0..w {
+                let top = self.pixels[(r * 2) * pw + c];
+                let bot = self.pixels[(r * 2 + 1) * pw + c];
+                if top == bot {
+                    scr.put_char(c, 1 + r, ' ', Style::new(top, top));
+                } else {
+                    scr.put_char(c, 1 + r, '▀', Style::new(top, bot));
+                }
+            }
+        }
     }
 
     #[inline]
@@ -749,13 +1402,11 @@ impl DemosceneEngine {
         let dy = -(y1 - y0).abs();
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
-        let mut guard = 0usize;
-        loop {
+        for _ in 0..1024 {
             self.put_px(x0, y0, col);
-            if x0 == x1 && y0 == y1 || guard > 1024 {
+            if x0 == x1 && y0 == y1 {
                 break;
             }
-            guard += 1;
             let e2 = 2 * err;
             if e2 >= dy {
                 err += dy;
@@ -768,524 +1419,101 @@ impl DemosceneEngine {
         }
     }
 
-    fn blit_subpixels(&self, scr: &mut ScreenBuf, x0: usize, y0: usize, cols: usize, rows: usize) {
-        for r in 0..rows {
-            let py_top = r * 2;
-            let py_bot = py_top + 1;
-            for c in 0..cols {
-                let top = if py_top < self.pix_h && c < self.pix_w {
-                    self.pixels[py_top * self.pix_w + c]
-                } else {
-                    Rgb(0, 0, 0)
-                };
-                let bot = if py_bot < self.pix_h && c < self.pix_w {
-                    self.pixels[py_bot * self.pix_w + c]
-                } else {
-                    top
-                };
-                if top == bot {
-                    scr.put_char(x0 + c, y0 + r, ' ', Style::new(top, top));
-                } else {
-                    scr.put_char(x0 + c, y0 + r, '▀', Style::new(top, bot));
-                }
-            }
-        }
-    }
-
     fn render_starfield_px(&mut self, pal: &Palette) {
-        let pw = self.pix_w as f32;
-        let ph = self.pix_h as f32;
-        let cx = pw * 0.5;
-        let cy = ph * 0.5;
+        let (pw, ph) = (self.pix_w as f32, self.pix_h as f32);
+        let (cx, cy) = (pw * 0.5, ph * 0.5);
         for i in 0..NUM_STARS {
             let st = self.stars[i];
             let inv_z = 1.0 / st.z.max(0.06);
             let sx = (cx + st.x * inv_z * (pw * 0.36)) as isize;
             let sy = (cy + st.y * inv_z * (ph * 0.42)) as isize;
             let bright = ((2.1 - st.z) / 2.0).clamp(0.15, 1.0);
-            let col = lerp_rgb(pal.bevel_dim, Rgb(245, 250, 255), bright);
-            self.put_px(sx, sy, col);
-            if st.z < 0.55 {
-                self.put_px(sx + 1, sy, scale_rgb(col, 0.65));
-            }
+            self.put_px(sx, sy, lerp_rgb(pal.border_dim, Rgb(245, 250, 255), bright));
         }
     }
 
-    fn render_3d_polyhedron_px(&mut self, cx: f32, cy: f32, scale: f32, pal: &Palette) {
-        // Rotating 3D Stellated Cube / Octahedron ("Future Crew Glenz Vector")
-        const VERTS: [(f32, f32, f32); 14] = [
-            // Inner cube
-            (-1.0, -1.0, -1.0),
-            (1.0, -1.0, -1.0),
-            (1.0, 1.0, -1.0),
-            (-1.0, 1.0, -1.0),
-            (-1.0, -1.0, 1.0),
-            (1.0, -1.0, 1.0),
-            (1.0, 1.0, 1.0),
-            (-1.0, 1.0, 1.0),
-            // 6 octahedron apexes
-            (0.0, 0.0, -1.75),
-            (0.0, 0.0, 1.75),
-            (-1.75, 0.0, 0.0),
-            (1.75, 0.0, 0.0),
-            (0.0, -1.75, 0.0),
-            (0.0, 1.75, 0.0),
-        ];
-        const EDGES: [(usize, usize); 24] = [
-            (0, 1), (1, 2), (2, 3), (3, 0),
-            (4, 5), (5, 6), (6, 7), (7, 4),
-            (0, 4), (1, 5), (2, 6), (3, 7),
-            (8, 0), (8, 1), (8, 2), (8, 3),
-            (9, 4), (9, 5), (9, 6), (9, 7),
-            (10, 11), (12, 13), (8, 13), (9, 12),
-        ];
-
-        let t = self.time_s;
-        let (ax, ay, az) = (t * 0.92, t * 1.27, t * 0.61);
-        let (sx, cx_r) = ax.sin_cos();
-        let (sy, cy_r) = ay.sin_cos();
-        let (sz, cz_r) = az.sin_cos();
-
-        let mut proj = [(0isize, 0isize, 0.0f32); 14];
-        for (i, &(vx, vy, vz)) in VERTS.iter().enumerate() {
-            // Rotate X
-            let y1 = vy * cx_r - vz * sx;
-            let z1 = vy * sx + vz * cx_r;
-            // Rotate Y
-            let x2 = vx * cy_r + z1 * sy;
-            let z2 = -vx * sy + z1 * cy_r;
-            // Rotate Z
-            let x3 = x2 * cz_r - y1 * sz;
-            let y3 = x2 * sz + y1 * cz_r;
-
-            let dist = 4.2 + z2;
-            let p = scale / dist.max(1.2);
-            // Terminal cells are ~2x taller than wide, and subpixels are ~1:1 square!
-            let px = (cx + x3 * p * 1.15).round() as isize;
-            let py = (cy + y3 * p).round() as isize;
-            proj[i] = (px, py, z2);
-        }
-
-        // Draw back-to-front depth-cued wireframe edges
-        for (ei, &(a, b)) in EDGES.iter().enumerate() {
-            let (x0, y0, za) = proj[a];
-            let (x1, y1, zb) = proj[b];
-            let depth = ((2.0 - (za + zb) * 0.5) / 3.6).clamp(0.20, 1.0);
-            let base_c = if ei >= 12 { pal.copper_b } else { pal.copper_a };
-            let col = lerp_rgb(pal.bevel_dim, base_c, depth);
-            self.draw_line_px(x0, y0, x1, y1, col);
-        }
-        // Bright vertex glints
-        for &(px, py, z) in &proj[..8] {
-            if z < 0.8 {
-                self.put_px(px, py, Rgb(255, 255, 255));
-            }
-        }
-    }
-
-    fn draw_big_text_px(&mut self, text: &str, x0: isize, y0: isize, scale: isize, pal: &Palette, dycp_amp: f32) {
-        let mut pen_x = x0;
-        for (ci, ch) in text.chars().enumerate() {
-            let bits = glyph_5x5(ch);
-            for gx in 0..5isize {
-                let col_x = pen_x + gx * scale;
-                let wave_y = if dycp_amp > 0.0 {
-                    ((col_x as f32) * 0.085 + self.time_s * 4.4).sin() * dycp_amp
-                } else {
-                    0.0
-                } as isize;
-                for gy in 0..5isize {
-                    let bit = (bits >> ((4 - gy) * 5 + (4 - gx))) & 1;
-                    if bit != 0 {
-                        let c_phase = (ci as f32) * 0.11 + (gy as f32) * 0.14 - self.time_s * 0.55;
-                        let base = copper_gradient(pal, c_phase);
-                        // Chrome specular highlight across middle scanline (`gy == 2`)
-                        let col = if gy == 1 || gy == 2 {
-                            lerp_rgb(base, Rgb(255, 255, 255), 0.52)
-                        } else {
-                            base
-                        };
-                        for sy in 0..scale {
-                            for sx in 0..scale {
-                                self.put_px(col_x + sx, y0 + wave_y + gy * scale + sy, col);
-                            }
-                        }
-                        // Crisp 1px drop shadow for 90s bitmap logo pop
-                        self.put_px(col_x + scale, y0 + wave_y + gy * scale + scale, Rgb(4, 6, 14));
-                    }
-                }
-            }
-            pen_x += 6 * scale;
-        }
-    }
-
-    // =========================================================================
-    // Empty-Chat Attract Screen: Subpixel Intro Banner + Authentic `.NFO` Card
-    // =========================================================================
-
-    fn render_attract_home(
-        &mut self,
-        scr: &mut ScreenBuf,
-        x0: usize,
-        y0: usize,
-        w: usize,
-        h: usize,
-        info: &BannerInfo<'_>,
-    ) {
-        let pal = self.palette();
-        if w < 36 || h < 6 {
-            return;
-        }
-
-        let box_x = x0 + 1;
-        let box_w = w.saturating_sub(2);
-        let canvas_rows = if h >= 22 {
-            9usize
-        } else if h >= 16 {
-            6usize
-        } else {
-            4usize
-        }
-        .min(h.saturating_sub(2));
-
-        // Frame top border of the Demoscene Intro Window
-        scr.put_char(box_x, y0, '╔', Style::new(pal.bevel_hi, pal.bg_void).bold());
-        let hdr_lbl = format!(
-            "═[ ♦ OPTIMIZE-GPU CREW PRESENTS :: {} // {} ]",
-            if info.is_inkling { "INKLING-2 LOOPED MoE" } else { "QWEN3 MEGAKERNEL" },
-            self.theme.label()
-        );
-        let mut hx = scr.put_str(box_x + 1, y0, box_x + box_w - 1, &hdr_lbl, Style::new(pal.copper_c, pal.bg_void).bold());
-        while hx < box_x + box_w - 1 {
-            hx += scr.put_char(hx, y0, '═', Style::new(pal.bevel_mid, pal.bg_void));
-        }
-        scr.put_char(box_x + box_w - 1, y0, '╗', Style::new(pal.bevel_hi, pal.bg_void).bold());
-
-        // Subpixel canvas inside `[box_x + 1 .. box_x + box_w - 1, y0 + 1 .. y0 + 1 + canvas_rows]`
-        let cw = box_w.saturating_sub(2);
-        let pw = cw;
-        let ph = canvas_rows * 2;
-        self.ensure_canvas(pw, ph, pal.bg_void);
-
-        // 1. Subtle background Amiga raster plasma ribbons + 3D starfield
-        for py in 0..ph {
-            let yf = (py as f32) / (ph.max(1) as f32);
-            let bar1 = ((yf - (0.50 + 0.30 * (self.time_s * 1.7).sin())).abs() * 9.5).min(1.0);
-            let bar2 = ((yf - (0.50 + 0.28 * (self.time_s * 1.3 + 2.1).sin())).abs() * 10.5).min(1.0);
-            for px in 0..pw {
-                let xf = (px as f32) / (pw.max(1) as f32);
-                let pl = ((xf * 6.0 + self.time_s * 1.4).sin()
-                    + (yf * 5.0 - self.time_s * 1.1).cos())
-                    * 0.25
-                    + 0.5;
-                let mut col = lerp_rgb(pal.bg_void, scale_rgb(pal.bevel_dim, 0.55), pl * 0.55);
-                if bar1 < 1.0 {
-                    let k = (1.0 - bar1) * (1.0 - bar1) * 0.48;
-                    col = add_rgb(col, scale_rgb(pal.copper_a, k));
-                }
-                if bar2 < 1.0 {
-                    let k = (1.0 - bar2) * (1.0 - bar2) * 0.42;
-                    col = add_rgb(col, scale_rgb(pal.copper_b, k));
-                }
-                self.pixels[py * pw + px] = col;
-            }
-        }
-        self.render_starfield_px(&pal);
-
-        // 2. Left/Center Chrome Pixel Masthead (`RTX 3080`) + Right 3D Vector Glenz Polyhedron
-        let poly_cx = if pw >= 74 { (pw as f32) * 0.80 } else { (pw as f32) * 0.50 };
-        let poly_cy = (ph as f32) * 0.50;
-        let poly_scale = (ph as f32) * 1.25;
-        self.render_3d_polyhedron_px(poly_cx, poly_cy, poly_scale, &pal);
-
-        if pw >= 56 && ph >= 10 {
-            let logo_scale = if pw >= 96 && ph >= 16 { 2 } else { 1 };
-            let logo_txt = "RTX 3080";
-            let logo_y = ((ph as isize) - 5 * logo_scale) / 2;
-            self.draw_big_text_px(logo_txt, 4, logo_y.max(1), logo_scale, &pal, 1.4);
-        }
-
-        for r in 0..canvas_rows {
-            scr.put_char(box_x, y0 + 1 + r, '║', Style::new(pal.bevel_mid, pal.bg_void));
-            scr.put_char(
-                box_x + box_w - 1,
-                y0 + 1 + r,
-                '║',
-                Style::new(pal.bevel_mid, pal.bg_void),
-            );
-        }
-        self.blit_subpixels(scr, box_x + 1, y0 + 1, cw, canvas_rows);
-
-        let mid_y = y0 + 1 + canvas_rows;
-        if mid_y >= y0 + h {
-            return;
-        }
-
-        // `.NFO` Release Info Card directly integrated into the lower half of the frame!
-        let rem_rows = (y0 + h).saturating_sub(mid_y + 1);
-        if rem_rows < 3 {
-            scr.put_char(box_x, mid_y, '╚', Style::new(pal.bevel_hi, pal.bg_void).bold());
-            for x in (box_x + 1)..(box_x + box_w - 1) {
-                scr.put_char(x, mid_y, '═', Style::new(pal.bevel_mid, pal.bg_void));
-            }
-            scr.put_char(box_x + box_w - 1, mid_y, '╝', Style::new(pal.bevel_hi, pal.bg_void).bold());
-            return;
-        }
-
-        scr.put_char(box_x, mid_y, '╠', Style::new(pal.bevel_hi, pal.bg_void).bold());
-        let nfo_hdr = "═[ FILE_ID.DIZ & RELEASE.NFO // 100% GA102 SM_86 • ZERO DOCKER • ZERO CRATES ]";
-        let mut nx = scr.put_str(
-            box_x + 1,
-            mid_y,
-            box_x + box_w - 1,
-            nfo_hdr,
-            Style::new(pal.copper_a, pal.bg_void).bold(),
-        );
-        while nx < box_x + box_w - 1 {
-            nx += scr.put_char(nx, mid_y, '═', Style::new(pal.bevel_mid, pal.bg_void));
-        }
-        scr.put_char(box_x + box_w - 1, mid_y, '╣', Style::new(pal.bevel_hi, pal.bg_void).bold());
-
-        let mode_str = if info.is_inkling {
-            if info.spec_on {
-                format!("DSpark Block-8 Speculative (gamma={}, ~143 tok/s)", info.gamma)
-            } else {
-                format!("48-Layer Persistent B=1 Megakernel (~122 tok/s • Effort:{})", info.effort)
-            }
-        } else if info.spec_on {
-            "BM=4 Lossless Speculative Megakernel (~270 tok/s)".to_string()
-        } else {
-            "T=1 68-SM Persistent Megakernel (~173 tok/s)".to_string()
-        };
-        let voice_str = if info.is_inkling {
-            "Co-Resident Qwen3-ASR-0.6B + Inkling-2-Mini + Qwen3-TTS-0.6B (24kHz Code2Wav)"
-        } else {
-            "Co-Resident Qwen3-ASR-1.7B + Qwen3 + Qwen3-TTS-1.7B (24kHz Code2Wav)"
-        };
-
-        let tps_note = if info.last_tps > 0.0 {
-            format!(" • {:.1} tok/s", info.last_tps)
-        } else {
-            String::new()
-        };
-        let nfo_lines: [(Rgb, String); 8] = [
-            (
-                pal.text_hi,
-                format!(
-                    "  ► MODEL    : {} ({:.2} GB • {} SMs active • {:.1}ms IPC{})",
-                    info.model_name, info.gguf_size_gb, info.active_sms, info.ping_ms, tps_note
-                ),
-            ),
-            (pal.copper_c, format!("  ► KERNEL   : {}", mode_str)),
-            (pal.copper_a, format!("  ► AUDIO    : {}", voice_str)),
-            (pal.bevel_dim, "  ──────────────────────────────────────────────────────────────────────────────".into()),
-            (
-                pal.text_hi,
-                "  [Ctrl+R] /listen : Speak into Mac Mic -> RTX 3080 STT -> LLM -> 24kHz TTS".into(),
-            ),
-            (
-                pal.text_muted,
-                "  [/talk]          : Hands-free voice loop   │ [/effort 0|0.2|0.9] : Thinking depth".into(),
-            ),
-            (
-                pal.copper_b,
-                "  [Ctrl+D] /demo   : 60FPS Fullscreen Demo!  │ [/mod]              : 4-Ch Tracker Synth!".into(),
-            ),
-            (
-                pal.text_muted,
-                "  [Ctrl+T] /theme  : Cycle 1990s Palettes    │ [/bench] [/spec] [/fx] [/help]".into(),
-            ),
-        ];
-
-        let max_body = rem_rows.saturating_sub(1).min(nfo_lines.len());
-        for i in 0..max_body {
-            let ry = mid_y + 1 + i;
-            scr.fill_row(ry, pal.bg_void);
-            scr.put_char(box_x, ry, '║', Style::new(pal.bevel_mid, pal.bg_void));
-            let (fg, ref txt) = nfo_lines[i];
-            scr.put_str(box_x + 1, ry, box_x + box_w - 1, txt, Style::new(fg, pal.bg_void));
-            scr.put_char(box_x + box_w - 1, ry, '║', Style::new(pal.bevel_mid, pal.bg_void));
-        }
-
-        let bot_y = mid_y + 1 + max_body;
-        if bot_y < y0 + h {
-            scr.put_char(box_x, bot_y, '╚', Style::new(pal.bevel_hi, pal.bg_void).bold());
-            for x in (box_x + 1)..(box_x + box_w - 1) {
-                scr.put_char(x, bot_y, '═', Style::new(pal.bevel_mid, pal.bg_void));
-            }
-            scr.put_char(box_x + box_w - 1, bot_y, '╝', Style::new(pal.bevel_hi, pal.bg_void).bold());
-        }
-    }
-
-    // =========================================================================
-    // Fullscreen 60 FPS 4-Part 1990s Megademo (`/demo` / `Ctrl+D`)
-    // =========================================================================
-
-    fn render_megademo_fullscreen(&mut self, scr: &mut ScreenBuf, w: usize, h: usize, info: &BannerInfo<'_>) {
-        let pal = self.palette();
-        scr.resize_and_clear(w, h, pal.bg_void);
-        if w < 24 || h < 10 {
-            return;
-        }
-
-        let scene_names = [
-            "PART 1/4 :: TRIGONOMETRIC PLASMA & AMIGA COPPERBARS",
-            "PART 2/4 :: 3D GLENZ VECTOR & PARALLAX STARFIELD",
-            "PART 3/4 :: DOOM PALETTE FIRE & KEFRENS RASTERS",
-            "PART 4/4 :: DYCP SINE SCROLLER & 3D HORIZON GRID",
-        ];
-
-        // Top HUD bar (Row 0)
-        scr.fill_row(0, pal.bg_header);
-        let hud_l = format!(
-            " ♦ RTX MEGADEMO '93 // {} ",
-            scene_names[self.showcase_scene % 4]
-        );
-        let mut x = scr.put_str(0, 0, w, &hud_l, Style::new(pal.bg_void, pal.copper_a).bold());
-        let mod_tag = if self.mod_playing.load(Ordering::Relaxed) {
-            " [♫ MOD:ON] "
-        } else {
-            " [M:PLAY MOD] "
-        };
-        x = scr.put_str(x + 1, 0, w, mod_tag, Style::new(pal.copper_c, pal.bg_header).bold());
-        let hud_r = "[1-4/SPC]:SCENE  [T]:PALETTE  [M]:CHIPTUNE  [ESC]:CHAT ";
-        let rx = w.saturating_sub(hud_r.chars().count());
-        if rx > x + 1 {
-            scr.put_str(rx, 0, w, hud_r, Style::new(pal.text_hi, pal.bg_header));
-        }
-
-        let canvas_rows = h.saturating_sub(2);
-        let pw = w;
-        let ph = canvas_rows * 2;
-        self.ensure_canvas(pw, ph, pal.bg_void);
-
-        match self.showcase_scene % 4 {
-            0 => self.scene_plasma_and_copper(&pal),
-            1 => self.scene_vector_glenz_and_stars(&pal),
-            2 => self.scene_doom_fire_and_kefrens(&pal),
-            _ => self.scene_dycp_and_horizon(&pal, info),
-        }
-
-        self.blit_subpixels(scr, 0, 1, w, canvas_rows);
-
-        // Bottom status bar (`h - 1`)
-        let fy = h - 1;
-        scr.fill_row(fy, pal.bg_footer);
-        let sc_txt = format!(
-            "░▒▓ GA102 ({} SMs) • {} • PALETTE: {} • 0 DOCKER • 0 CRATES • PRESS [M] FOR 4-CH TRACKER SYNTH • [ESC] RETURN TO CHAT   ",
-            info.active_sms,
-            info.model_name,
-            self.theme.label()
-        );
-        self.draw_chrome_bars(scr, w, h + 1, fy, &sc_txt);
-    }
-
-    fn scene_plasma_and_copper(&mut self, pal: &Palette) {
-        let pw = self.pix_w;
-        let ph = self.pix_h;
-        let t = self.time_s;
-
-        // Precompute 5 intertwining Amiga copperbar vertical centers
+    fn scene_plasma(&mut self, pal: &Palette) {
+        let (pw, ph, t) = (self.pix_w, self.pix_h, self.time_s);
         let mut bars = [(0.0f32, Rgb(0, 0, 0)); 5];
         for i in 0..5 {
             let fi = i as f32;
             let yc = 0.50 + 0.36 * (t * (1.25 + fi * 0.21) + fi * 1.15).sin();
-            let col = copper_gradient(pal, fi * 0.22 - t * 0.15);
-            bars[i] = (yc * (ph as f32), col);
+            bars[i] = (yc * (ph as f32), copper_loop(pal, fi * 0.22 - t * 0.15));
         }
-
         for py in 0..ph {
             let yf = (py as f32) * 0.065;
             for px in 0..pw {
                 let xf = (px as f32) * 0.045;
-                let v1 = (xf + t * 1.6).sin();
-                let v2 = (yf - t * 1.3).sin();
-                let v3 = ((xf + yf) * 0.7 + t * 1.1).sin();
-                let cx = xf - (pw as f32) * 0.0225;
-                let cy = yf - (ph as f32) * 0.0325;
-                let v4 = ((cx * cx + cy * cy).sqrt() * 1.4 - t * 2.1).sin();
-                let u = (v1 + v2 + v3 + v4) * 0.125 + 0.5;
-                let mut col = scale_rgb(copper_gradient(pal, u), 0.55);
-
-                // Overlay metallic Amiga copperbars with white-hot specular core
+                let u = ((xf + t * 1.6).sin() + (yf - t * 1.3).sin() + ((xf + yf) * 0.7 + t).sin()) * 0.16 + 0.5;
+                let mut col = scale_rgb(copper_loop(pal, u), 0.52);
                 for &(by, bc) in &bars {
                     let dist = ((py as f32) - by).abs();
-                    if dist < 4.2 {
-                        let k = 1.0 - dist / 4.2;
-                        let spec = if dist < 1.1 {
-                            lerp_rgb(bc, Rgb(255, 255, 255), 0.78)
-                        } else {
-                            scale_rgb(bc, k * k)
-                        };
+                    if dist < 4.0 {
+                        let k = 1.0 - dist / 4.0;
+                        let spec = if dist < 1.1 { lerp_rgb(bc, Rgb(255, 255, 255), 0.75) } else { scale_rgb(bc, k * k) };
                         col = lerp_rgb(col, spec, k);
                     }
                 }
                 self.pixels[py * pw + px] = col;
             }
         }
-        if pw >= 68 && ph >= 20 {
-            self.draw_big_text_px("SECOND REALITY", 6, 4, 1, pal, 2.0);
-        }
     }
 
-    fn scene_vector_glenz_and_stars(&mut self, pal: &Palette) {
+    fn scene_vector_stars(&mut self, pal: &Palette) {
         self.render_starfield_px(pal);
-        let pw = self.pix_w as f32;
-        let ph = self.pix_h as f32;
-        let cx = pw * 0.5;
-        let cy = ph * 0.5;
-
-        // Outer Lissajous orbital energy rings
-        let steps = 96usize;
-        let mut prev: Option<(isize, isize)> = None;
-        for i in 0..=steps {
-            let a = (i as f32 / steps as f32) * TAU;
-            let rx = (a * 2.0 + self.time_s * 1.1).cos() * (pw * 0.36);
-            let ry = (a * 3.0 - self.time_s * 1.4).sin() * (ph * 0.34);
-            let px = (cx + rx) as isize;
-            let py = (cy + ry) as isize;
-            if let Some((ox, oy)) = prev {
-                let c = scale_rgb(copper_gradient(pal, i as f32 / steps as f32), 0.55);
-                self.draw_line_px(ox, oy, px, py, c);
-            }
-            prev = Some((px, py));
+        const VERTS: [(f32, f32, f32); 14] = [
+            (-1.0, -1.0, -1.0), (1.0, -1.0, -1.0), (1.0, 1.0, -1.0), (-1.0, 1.0, -1.0),
+            (-1.0, -1.0, 1.0),  (1.0, -1.0, 1.0),  (1.0, 1.0, 1.0),  (-1.0, 1.0, 1.0),
+            (0.0, 0.0, -1.75),  (0.0, 0.0, 1.75),  (-1.75, 0.0, 0.0), (1.75, 0.0, 0.0),
+            (0.0, -1.75, 0.0),  (0.0, 1.75, 0.0),
+        ];
+        const EDGES: [(usize, usize); 24] = [
+            (0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7), (8, 0), (8, 1), (8, 2), (8, 3),
+            (9, 4), (9, 5), (9, 6), (9, 7), (10, 11), (12, 13), (8, 13), (9, 12),
+        ];
+        let (pw, ph, t) = (self.pix_w as f32, self.pix_h as f32, self.time_s);
+        let (cx, cy, scale) = (pw * 0.5, ph * 0.5, ph.min(pw * 0.65) * 1.35);
+        let (sx, cx_r) = (t * 0.92).sin_cos();
+        let (sy, cy_r) = (t * 1.27).sin_cos();
+        let (sz, cz_r) = (t * 0.61).sin_cos();
+        let mut proj = [(0isize, 0isize, 0.0f32); 14];
+        for (i, &(vx, vy, vz)) in VERTS.iter().enumerate() {
+            let (y1, z1) = (vy * cx_r - vz * sx, vy * sx + vz * cx_r);
+            let (x2, z2) = (vx * cy_r + z1 * sy, -vx * sy + z1 * cy_r);
+            let (x3, y3) = (x2 * cz_r - y1 * sz, x2 * sz + y1 * cz_r);
+            let p = scale / (4.2 + z2).max(1.2);
+            proj[i] = ((cx + x3 * p * 1.15).round() as isize, (cy + y3 * p).round() as isize, z2);
         }
-
-        let scale = ph.min(pw * 0.65) * 1.35;
-        self.render_3d_polyhedron_px(cx, cy, scale, pal);
+        for (ei, &(a, b)) in EDGES.iter().enumerate() {
+            let ((x0, y0, za), (x1, y1, zb)) = (proj[a], proj[b]);
+            let depth = ((2.0 - (za + zb) * 0.5) / 3.6).clamp(0.20, 1.0);
+            let col = lerp_rgb(pal.border_dim, if ei >= 12 { pal.grad_c } else { pal.grad_b }, depth);
+            self.draw_line_px(x0, y0, x1, y1, col);
+        }
     }
 
-    fn scene_doom_fire_and_kefrens(&mut self, pal: &Palette) {
-        let pw = self.pix_w;
-        let ph = self.pix_h;
+    fn scene_fire_kefrens(&mut self, pal: &Palette) {
+        let (pw, ph) = (self.pix_w, self.pix_h);
         if self.fire_w != pw || self.fire_h != ph || self.fire_buf.len() != pw * ph {
             self.fire_w = pw;
             self.fire_h = ph;
-            self.fire_buf.clear();
             self.fire_buf.resize(pw * ph, 0);
         }
-
-        // Seed bottom generator row with roaring heat + audio bass boost!
         let bass = (self.bands[0] + self.bands[1] + self.bands[2]) * 0.33;
         if ph >= 2 {
             for x in 0..pw {
-                let r = self.next_rand_f32();
-                let heat = if r < 0.82 + bass * 0.15 { 255u8 } else { 140u8 };
-                self.fire_buf[(ph - 1) * pw + x] = heat;
+                self.fire_buf[(ph - 1) * pw + x] = if self.next_rand_f32() < 0.82 + bass * 0.15 { 255 } else { 140 };
             }
         }
-
-        // Classic 1993 cellular upward convection + wind cooling
         for y in 0..ph.saturating_sub(1) {
             for x in 0..pw {
                 let drift = ((self.next_rand_f32() * 3.0) as usize).saturating_sub(1);
-                let sx = (x + drift).min(pw - 1);
-                let below = self.fire_buf[(y + 1) * pw + sx] as i32;
+                let below = self.fire_buf[(y + 1) * pw + (x + drift).min(pw - 1)] as i32;
                 let decay = ((self.next_rand_f32() * (280.0 / (ph.max(16) as f32)).max(4.5)) as i32).max(1);
                 self.fire_buf[y * pw + x] = (below - decay).max(0) as u8;
             }
         }
-
         for y in 0..ph {
             for x in 0..pw {
                 let hval = self.fire_buf[y * pw + x] as f32 / 255.0;
@@ -1301,94 +1529,50 @@ impl DemosceneEngine {
                 self.pixels[y * pw + x] = col;
             }
         }
-
-        // Overlay classic Amiga Kefrens vertical raster column wave in upper sky
-        for y in 0..(ph * 2 / 3) {
-            let yf = y as f32 * 0.11;
-            let cx = ((pw as f32) * 0.5
-                + ((pw as f32) * 0.30) * (self.time_s * 2.3 + yf * 0.55).sin()
-                + ((pw as f32) * 0.12) * (self.time_s * 3.7 - yf * 0.9).cos()) as isize;
-            for dx in -5isize..=5isize {
-                let k = 1.0 - (dx.abs() as f32) / 5.5;
-                let rc = lerp_rgb(pal.copper_a, Rgb(255, 255, 255), k * k);
-                self.put_px(cx + dx, y as isize, rc);
-            }
-        }
     }
 
-    fn scene_dycp_and_horizon(&mut self, pal: &Palette, info: &BannerInfo<'_>) {
-        let pw = self.pix_w;
-        let ph = self.pix_h;
-        let horizon = ph * 52 / 100;
-
-        // Upper sky starfield
+    fn scene_dycp_horizon(&mut self, pal: &Palette, model_name: &str, active_sms: u32) {
         self.render_starfield_px(pal);
-
-        // Lower 3D perspective synth/Amiga checkerboard floor
+        let (pw, ph) = (self.pix_w, self.pix_h);
+        let horizon = ph * 54 / 100;
         for py in horizon..ph {
             let dy = ((py - horizon + 1) as f32) / ((ph - horizon).max(1) as f32);
             let z = 1.0 / dy.max(0.04);
-            let fog = dy.powf(0.75);
             for px in 0..pw {
                 let nx = ((px as f32) / (pw.max(1) as f32) - 0.5) * 2.0;
-                let wx = nx * z * 2.6;
-                let wz = z * 1.4 + self.time_s * 4.5;
-                let checker = ((wx.floor() as i32) ^ (wz.floor() as i32)) & 1;
-                let tile = if checker == 0 { pal.copper_a } else { pal.bg_header };
-                self.pixels[py * pw + px] = lerp_rgb(pal.bg_void, tile, fog * 0.72);
+                let chk = (((nx * z * 2.6).floor() as i32) ^ (((z * 1.4 + self.time_s * 4.5).floor()) as i32)) & 1;
+                let tile = if chk == 0 { pal.grad_b } else { pal.bg_header };
+                self.pixels[py * pw + px] = lerp_rgb(pal.bg_void, tile, dy.powf(0.75) * 0.72);
             }
         }
-        // Bright horizon laser line
-        if horizon < ph {
-            for px in 0..pw {
-                self.pixels[horizon * pw + px] = pal.copper_b;
-            }
-        }
-
-        // Giant scrolling DYCP sine-wave bitmap banner across the sky!
-        let msg = format!(
-            "   RTX 3080 GA102 • 68 SMs • {} • ZERO DOCKER • ZERO CRATES • GREETZ FUTURE CREW & TRITON!   ",
-            info.model_name.to_ascii_uppercase()
-        );
+        let msg = format!("   RTX 3080 GA102 · {} SMs · {}   ", active_sms, model_name.to_ascii_uppercase());
         let scale = if ph >= 36 { 2isize } else { 1isize };
-        let char_px = 6 * scale;
-        let total_px = (msg.chars().count() as isize) * char_px;
-        let scroll_x = -(((self.time_s * 42.0 * (scale as f32)) as isize).rem_euclid(total_px.max(1)));
+        let total_px = (msg.chars().count() as isize) * 6 * scale;
+        let scroll_x = -(((self.time_s * 40.0 * (scale as f32)) as isize).rem_euclid(total_px.max(1)));
         let base_y = (horizon as isize / 2 - 3 * scale).max(2);
-        self.draw_big_text_px(&msg, scroll_x, base_y, scale, pal, 4.0 * (scale as f32));
-        self.draw_big_text_px(&msg, scroll_x + total_px, base_y, scale, pal, 4.0 * (scale as f32));
-
-        // 16-band subpixel spectrum bars rising from the bottom of the screen!
-        let bar_area_w = (pw * 3 / 4).max(16);
-        let x_start = (pw - bar_area_w) / 2;
-        let bw = (bar_area_w / NUM_BANDS).max(1);
-        let max_bh = (ph / 3).max(6);
-        for b in 0..NUM_BANDS {
-            let bh = ((self.bands[b] * (max_bh as f32)).round() as usize).min(max_bh);
-            let pk_y = ph.saturating_sub(1 + ((self.peaks[b] * (max_bh as f32)).round() as usize).min(max_bh));
-            for bx in 0..bw.saturating_sub(1).max(1) {
-                let x = x_start + b * bw + bx;
-                for by in 0..bh {
-                    let y = ph - 1 - by;
-                    let ratio = (by as f32) / (max_bh as f32);
-                    let c = if ratio > 0.75 {
-                        Rgb(255, 72, 92)
-                    } else if ratio > 0.45 {
-                        Rgb(255, 214, 64)
-                    } else {
-                        Rgb(64, 244, 132)
-                    };
-                    self.put_px(x as isize, y as isize, c);
+        for off in [scroll_x, scroll_x + total_px] {
+            let mut pen_x = off;
+            for (ci, ch) in msg.chars().enumerate() {
+                let bits = glyph_5x5(ch);
+                for gx in 0..5isize {
+                    let col_x = pen_x + gx * scale;
+                    let wy = (((col_x as f32) * 0.085 + self.time_s * 4.4).sin() * 4.0 * (scale as f32)) as isize;
+                    for gy in 0..5isize {
+                        if ((bits >> ((4 - gy) * 5 + (4 - gx))) & 1) != 0 {
+                            let col = copper_loop(pal, (ci as f32) * 0.1 + (gy as f32) * 0.14 - self.time_s * 0.5);
+                            for sy in 0..scale {
+                                for sx in 0..scale {
+                                    self.put_px(col_x + sx, base_y + wy + gy * scale + sy, col);
+                                }
+                            }
+                        }
+                    }
                 }
-                self.put_px(x as isize, pk_y as isize, Rgb(255, 255, 255));
+                pen_x += 6 * scale;
             }
         }
     }
 }
-
-// =============================================================================
-// Compact 5x5 Demoscene Pixel Font (Bit-Packed `u32`, MSB = top-left `(0,0)`)
-// =============================================================================
 
 fn glyph_5x5(ch: char) -> u32 {
     match ch.to_ascii_uppercase() {
@@ -1401,7 +1585,6 @@ fn glyph_5x5(ch: char) -> u32 {
         'G' => 0b01111_10000_10011_10001_01111,
         'H' => 0b10001_10001_11111_10001_10001,
         'I' => 0b11111_00100_00100_00100_11111,
-        'J' => 0b00111_00010_00010_10010_01100,
         'K' => 0b10010_10100_11000_10100_10010,
         'L' => 0b10000_10000_10000_10000_11111,
         'M' => 0b10001_11011_10101_10001_10001,
@@ -1426,18 +1609,10 @@ fn glyph_5x5(ch: char) -> u32 {
         '8' => 0b01110_10001_01110_10001_01110,
         '9' => 0b01110_10001_01111_00001_11110,
         '-' => 0b00000_00000_11111_00000_00000,
-        '.' => 0b00000_00000_00000_00000_00100,
-        ':' => 0b00000_00100_00000_00100_00000,
-        '!' => 0b00100_00100_00100_00000_00100,
-        '&' => 0b01100_10010_01101_10010_01101,
-        '•' | '*' => 0b00000_00100_01110_00100_00000,
+        '·' | '•' => 0b00000_00100_01110_00100_00000,
         _ => 0,
     }
 }
-
-// =============================================================================
-// Procedural 4-Channel 24 kHz Amiga/SID Tracker Chiptune ("GA102 OVERDRIVE.MOD")
-// =============================================================================
 
 #[inline]
 fn midi_to_hz(note: i32) -> f32 {
@@ -1449,21 +1624,13 @@ fn run_tracker_chiptune_loop(
     cancel: &AtomicBool,
     viz_pcm: &Arc<Mutex<Vec<f32>>>,
 ) {
-    // 125 BPM, 16th-note row = 120 ms = 2,880 samples @ 24 kHz (sub-stepped in 480-sample 50Hz Amiga ticks!)
-    const TICK_SAMPLES: usize = 480; // 20 ms = 50 Hz PAL Amiga VBlank tick!
-    const TICKS_PER_ROW: usize = 6;  // Classic ProTracker `Speed 6` @ 125 BPM!
+    const TICK_SAMPLES: usize = 480;
+    const TICKS_PER_ROW: usize = 6;
     const CHORDS: [[i32; 3]; 8] = [
-        [60, 63, 67], // Cm
-        [60, 63, 67], // Cm
-        [56, 60, 63], // Ab
-        [63, 67, 70], // Eb
-        [58, 62, 65], // Bb
-        [53, 56, 60], // Fm
-        [55, 59, 62], // G
-        [55, 62, 65], // G7
+        [60, 63, 67], [60, 63, 67], [56, 60, 63], [63, 67, 70],
+        [58, 62, 65], [53, 56, 60], [55, 59, 62], [55, 62, 65],
     ];
     const BASS_ROOTS: [i32; 8] = [36, 36, 32, 39, 34, 29, 31, 31];
-    // 64-row lead melody (0 = rest/sustain)
     const LEAD: [i32; 64] = [
         72, 0, 75, 74, 72, 0, 67, 0,  72, 74, 75, 79, 77, 75, 74, 72,
         68, 0, 72, 0,  75, 0, 79, 77, 75, 0,  74, 0,  70, 0,  67, 0,
@@ -1472,32 +1639,19 @@ fn run_tracker_chiptune_loop(
     ];
 
     let sr_inv = 1.0 / (TTS_SAMPLE_RATE as f32);
-    let mut ph_arp = 0.0f32;
-    let mut ph_bass = 0.0f32;
-    let mut ph_lead = 0.0f32;
-    let mut ph_kick = 0.0f32;
+    let (mut ph_arp, mut ph_bass, mut ph_lead, mut ph_kick) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let mut lfsr = 0xACE1u32;
-    let mut delay_ring = vec![0.0f32; 5760]; // 240ms dotted-8th tracker echo
-    let mut delay_idx = 0usize;
-
-    let mut row = 0usize;
-    let mut tick = 0usize;
+    let mut delay_ring = vec![0.0f32; 5760];
+    let (mut delay_idx, mut row, mut tick) = (0usize, 0usize, 0usize);
     let mut lead_note = 72i32;
-    let mut lead_env = 0.0f32;
-    let mut bass_env = 0.0f32;
-    let mut kick_env = 0.0f32;
-    let mut snare_env = 0.0f32;
-    let mut hat_env = 0.0f32;
+    let (mut lead_env, mut bass_env, mut kick_env, mut snare_env, mut hat_env) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let mut chunk = [0.0f32; TICK_SAMPLES];
 
     while !cancel.load(Ordering::Relaxed) {
         let bar = (row / 8) % 8;
         let step_in_bar = row % 8;
-        let chord = CHORDS[bar];
-        let arp_semi = chord[tick % 3];
-
+        let arp_semi = CHORDS[bar][tick % 3];
         if tick == 0 {
-            // Trigger row events
             bass_env = 1.0;
             if LEAD[row % 64] > 0 {
                 lead_note = LEAD[row % 64];
@@ -1512,25 +1666,19 @@ fn run_tracker_chiptune_loop(
             }
             hat_env = if step_in_bar % 2 == 1 { 0.55 } else { 0.25 };
         }
-
-        let bass_note = BASS_ROOTS[bar] + if step_in_bar % 2 == 1 { 12 } else { 0 };
         let f_arp = midi_to_hz(arp_semi);
-        let f_bass = midi_to_hz(bass_note);
+        let f_bass = midi_to_hz(BASS_ROOTS[bar] + if step_in_bar % 2 == 1 { 12 } else { 0 });
         let f_lead = midi_to_hz(lead_note);
         let pwm = 0.30 + 0.22 * ((row as f32) * 0.18).sin();
 
         for s in chunk.iter_mut() {
-            // Ch 1: 50Hz Amiga `0xy` PWM Chord Arpeggio
             ph_arp = (ph_arp + f_arp * sr_inv).fract();
             let c_arp = if ph_arp < pwm { 0.14 } else { -0.14 };
 
-            // Ch 2: Punchy Octave Saw/Pulse Bass
             ph_bass = (ph_bass + f_bass * sr_inv).fract();
-            let raw_bass = (ph_bass * 2.0 - 1.0) * 0.6 + if ph_bass < 0.5 { 0.4 } else { -0.4 };
-            let c_bass = raw_bass * bass_env * 0.24;
+            let c_bass = ((ph_bass * 2.0 - 1.0) * 0.6 + if ph_bass < 0.5 { 0.4 } else { -0.4 }) * bass_env * 0.24;
             bass_env *= 0.99935;
 
-            // Ch 3: Vibrato Square Lead + Dotted-8th Echo
             let vib = 1.0 + 0.0045 * (ph_arp * TAU).sin();
             ph_lead = (ph_lead + f_lead * vib * sr_inv).fract();
             let dry_lead = (if ph_lead < 0.42 { 1.0 } else { -1.0 }) * lead_env * 0.16;
@@ -1539,13 +1687,11 @@ fn run_tracker_chiptune_loop(
             delay_ring[delay_idx] = echoed;
             delay_idx = (delay_idx + 1) % delay_ring.len();
 
-            // Ch 4: Pitch-Swept Kick + LFSR Noise Snare/Hi-Hat
-            let f_kick = 44.0 + 135.0 * kick_env * kick_env;
-            ph_kick = (ph_kick + f_kick * sr_inv).fract();
+            ph_kick = (ph_kick + (44.0 + 135.0 * kick_env * kick_env) * sr_inv).fract();
             let c_kick = (ph_kick * TAU).sin() * kick_env * 0.30;
             kick_env *= 0.9982;
 
-            let bit = ((lfsr >> 0) ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5)) & 1;
+            let bit = (lfsr ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5)) & 1;
             lfsr = (lfsr >> 1) | (bit << 15);
             let noise = if (lfsr & 1) != 0 { 1.0f32 } else { -1.0f32 };
             let c_drums = c_kick + noise * (snare_env * 0.18 + hat_env * 0.06);
@@ -1565,7 +1711,6 @@ fn run_tracker_chiptune_loop(
         if player.push_samples(&chunk).is_err() {
             break;
         }
-
         tick += 1;
         if tick >= TICKS_PER_ROW {
             tick = 0;

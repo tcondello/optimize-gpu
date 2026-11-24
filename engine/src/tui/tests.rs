@@ -91,8 +91,14 @@
             last_cached_prefix: 0,
             last_tps: 120.35,
             last_ttft_ms: 42.5,
+            last_prefill_tps: 329.4,
             last_launches: 2,
             last_spec_extra: 0,
+            last_think_words: 0,
+            last_answer_words: 0,
+            expand_thinking: false,
+            slash_sel: 0,
+            hw_telemetry: None,
             streaming_rx: None,
             cancel_flag: None,
             stream_live_tps: 0.0,
@@ -105,21 +111,33 @@
             mic_viz_scratch: Vec::new(),
         };
 
-        // Render 1990s demoscene attract banner, all 4 megademo scenes, palettes, + `/verify` + `/help`
-        let mut scr = ScreenBuf::new(120, 36);
-        let cur0 = app.draw(&mut scr, 120, 36);
+        // Verify 0% idle animation redraws when GPU & audio are quiet
+        assert!(!app.demo.step(None, false));
+
+        // Render wide 140x36 screen with Session Brief + Telemetry Inspector + `/` Command Palette
+        let mut scr = ScreenBuf::new(140, 36);
+        app.composer.replace_with("/in");
+        let cur0 = app.draw(&mut scr, 140, 36);
+        assert!(cur0.is_some());
         assert!(!scr.render_ansi(cur0).is_empty());
+        let snap = app.snapshot();
+        let slash = filter_slash_commands("/in", &snap, "Charm Copper", true);
+        assert_eq!(slash.len(), 1);
+        assert_eq!(slash[0].cmd, "/inspector");
+        app.composer.clear();
+
+        // Render opt-in `/demo` scenes + palettes + `/verify` + `/help`
         for scene_idx in 1..=4 {
             let _ = app.handle_slash_command(&format!("/demo {}", scene_idx), None);
-            let _ = app.demo.step(Some((&[0.25f32; 256], 24_000)), true, true);
-            assert!(app.draw(&mut scr, 120, 36).is_none());
+            assert!(app.demo.step(Some((&[0.25f32; 256], 24_000)), true));
+            assert!(app.draw(&mut scr, 140, 36).is_none());
             assert!(scr.render_ansi(None).len() > 1500);
             let _ = app.handle_slash_command("/theme", None);
         }
         let _ = app.handle_slash_command("/demo off", None);
         let _ = app.handle_slash_command("/verify", None);
         let _ = app.handle_slash_command("/help", None);
-        let cur1 = app.draw(&mut scr, 120, 36);
+        let cur1 = app.draw(&mut scr, 140, 36);
         assert!(scr.render_ansi(cur1).len() > 500);
         app.messages.clear();
 
@@ -269,6 +287,15 @@
                             .as_bytes(),
                         );
                     }
+                    "TELEMETRY" => {
+                        let _ = stream.write_all(
+                            format!(
+                                "OK\t{{\"total_mb\":10240.0,\"thinker_mb\":7986.4,\"aux_mb\":471.3,\"aux_label\":\"DSpark γ={}\",\"voice_mb\":0.0,\"asr_mb\":0.0,\"tts_mb\":0.0,\"free_mb\":1302.3}}\n",
+                                active_gamma
+                            )
+                            .as_bytes(),
+                        );
+                    }
                     "GEN" => {
                         let spec_flag = parts[3] == "1";
                         let mut lb = [0u8; 4];
@@ -399,9 +426,15 @@
         assert!(app.last_cached_prefix > 0);
         assert!(app.messages.last().unwrap().content.contains("{\"ok\":true}"));
 
-        let mut scr = ScreenBuf::new(120, 36);
-        let cur = app.draw(&mut scr, 120, 36);
+        let mut scr = ScreenBuf::new(140, 36);
+        assert!(app.hw_telemetry.is_some());
+        assert!(!app.expand_thinking);
+        let cur = app.draw(&mut scr, 140, 36);
         assert!(scr.render_ansi(cur).len() > 800);
+        let _ = app.handle_slash_command("/fold on", None);
+        assert!(app.expand_thinking);
+        let cur_exp = app.draw(&mut scr, 140, 36);
+        assert!(scr.render_ansi(cur_exp).len() > 800);
 
         let _ = DaemonControl::stop();
         let final_gamma = srv.join().expect("join mock daemon");

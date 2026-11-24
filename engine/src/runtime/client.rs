@@ -65,6 +65,7 @@ pub enum DaemonQuery {
     TopicList,
     TopicClear,
     InklingSetGamma(usize),
+    Telemetry,
 }
 
 pub struct DaemonControl;
@@ -186,6 +187,7 @@ impl DaemonControl {
             DaemonQuery::TopicList => "TOPIC_LIST\n".to_string(),
             DaemonQuery::TopicClear => "TOPIC_CLEAR\n".to_string(),
             DaemonQuery::InklingSetGamma(g) => format!("INKLING_CFG\t{}\n", g.clamp(1, 7)),
+            DaemonQuery::Telemetry => "TELEMETRY\n".to_string(),
         };
         send_simple_cmd(&cmd)
     }

@@ -24,6 +24,16 @@ impl Composer {
         self.chars.is_empty()
     }
 
+    pub(super) fn as_text(&self) -> String {
+        self.chars.iter().collect()
+    }
+
+    pub(super) fn replace_with(&mut self, text: &str) {
+        self.chars = text.chars().collect();
+        self.cursor_idx = self.chars.len();
+        self.history_pos = None;
+    }
+
     pub(super) fn clear(&mut self) {
         self.chars.clear();
         self.cursor_idx = 0;

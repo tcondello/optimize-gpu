@@ -165,6 +165,70 @@ impl RuntimeSession {
         }
     }
 
+    pub(super) fn telemetry_json(&self) -> String {
+        let total_mb = (self.gpu.vram_size() as f64) / 1_048_576.0;
+        let free_high_mb = (self.gpu.free_high_vram() as f64) / 1_048_576.0;
+        let sys_mb = 480.0f64; // 224 MiB GSP-RM WPR2 + 256 MiB BAR1 ring/PT window
+        let used_high_mb = (total_mb - sys_mb - free_high_mb).max(0.0);
+
+        let asr_mb = self
+            .asr
+            .as_ref()
+            .map(|a| (a.vram_bytes_total as f64) / 1_048_576.0)
+            .unwrap_or(0.0);
+        let asr_name = self.asr.as_ref().map(|a| a.model_name()).unwrap_or("");
+        let tts_mb = self.tts.as_ref().map(|t| t.total_vram_mb).unwrap_or(0.0);
+        let tts_name = self.tts.as_ref().map(|t| t.model_name()).unwrap_or("");
+
+        let (aux_mb, aux_label) = match self.thinker {
+            ActiveThinker::Inkling(ref ink) => {
+                if ink.has_dspark() {
+                    (447.3, "DSpark MTP")
+                } else {
+                    (0.0, "reclaimed")
+                }
+            }
+            ActiveThinker::Qwen(ref q) => {
+                let dj = q.drafter_status_json(None);
+                let lj = q.lora_status_json();
+                let dr_mb = if dj.contains("\"active\":true") { 640.0 } else { 0.0 };
+                let lora_b = crate::topic_lora::json_find_num(&lj, "vram_bytes").unwrap_or(0.0);
+                let l_mb = lora_b / 1_048_576.0;
+                let lbl = if dr_mb > 0.0 && l_mb > 1.0 {
+                    "Drafter+LoRA"
+                } else if dr_mb > 0.0 {
+                    "0.6B Drafter"
+                } else if l_mb > 1.0 {
+                    "LoRA Arena"
+                } else {
+                    "standby"
+                };
+                (dr_mb + l_mb, lbl)
+            }
+        };
+        let voice_mb = asr_mb + tts_mb;
+        let thinker_mb = (used_high_mb - voice_mb - aux_mb).max(0.0);
+
+        format!(
+            "{{\"total_mb\":{:.1},\"thinker_mb\":{:.1},\"aux_mb\":{:.1},\"aux_label\":\"{}\",\
+              \"voice_mb\":{:.1},\"asr_mb\":{:.1},\"asr_name\":\"{}\",\"tts_mb\":{:.1},\"tts_name\":\"{}\",\
+              \"free_mb\":{:.1},\"sys_mb\":{:.1},\"max_ctx\":{},\"active_sms\":{}}}",
+            total_mb,
+            thinker_mb,
+            aux_mb,
+            json_escape(aux_label),
+            voice_mb,
+            asr_mb,
+            json_escape(asr_name),
+            tts_mb,
+            json_escape(tts_name),
+            free_high_mb,
+            sys_mb,
+            self.max_ctx,
+            self.gpu.active_sms
+        )
+    }
+
     #[inline]
     pub(super) fn model_name(&self) -> &str {
         self.ping_info().1

@@ -1,4 +1,4 @@
-//! Zero-Dependency Native macOS ARM64 1990s Demoscene Terminal UI (`./tui` / `rtx tui`).
+//! Native macOS ARM64 Informative 1990s Demoscene × Charm Terminal UI (`./tui` / `rtx tui`).
 
 mod composer;
 mod demoscene;
@@ -15,16 +15,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use composer::Composer;
-use demoscene::{BannerInfo, DemosceneEngine};
+use demoscene::{copper_gradient, filter_slash_commands, DemosceneEngine, TelemetrySnapshot};
 use markdown::{
-    extract_last_fenced_code, format_help_markdown, format_markdown_block,
-    format_verify_markdown, sanitize_text_for_speech, select_bench_prompt, split_spoken_sentences,
-    RenderedLine, Span,
+    extract_last_fenced_code, format_assistant_markdown, format_help_markdown,
+    format_markdown_block, format_verify_markdown, sanitize_text_for_speech, select_bench_prompt,
+    split_spoken_sentences, RenderedLine, Span,
 };
 use telemetry::{
-    measure_voice_self_test_tts, prepare_voice_self_test_pcm, query_lora_badge_from_daemon,
-    query_rag_badge_from_daemon, query_topic_badge_from_daemon, spawn_generation_stream,
-    spawn_tts_sentences, StreamEvent, TurnStats,
+    measure_voice_self_test_tts, prepare_voice_self_test_pcm, query_hw_telemetry_from_daemon,
+    query_lora_badge_from_daemon, query_rag_badge_from_daemon, query_topic_badge_from_daemon,
+    spawn_generation_stream, spawn_tts_sentences, HwTelemetry, StreamEvent, TurnStats,
 };
 #[cfg(test)]
 use telemetry::parse_stats_json;
@@ -37,21 +37,15 @@ use crate::gguf::{resolve_model_path, BpeTokenizer, GgufFile, ModelConfig};
 use crate::models::inkling::{InklingEngine, TOK_CONTENT_TEXT, TOK_END_MESSAGE, TOK_MSG_MODEL};
 use crate::models::rag::format_rag_augmented_prompt;
 use crate::runtime::client::{DaemonControl, DaemonQuery, DaemonRagClient, DaemonStream};
-use crate::voice::audio::{
-    read_wav_mono_16k, CoreAudioRecorder, ASR_SAMPLE_RATE, TTS_SAMPLE_RATE,
-};
+use crate::voice::audio::{read_wav_mono_16k, CoreAudioRecorder, ASR_SAMPLE_RATE, TTS_SAMPLE_RATE};
 
 #[derive(Clone)]
 struct ChatMsg {
-    role: String, // "user" | "assistant" | "system" | "info"
+    role: String,
     content: String,
     raw_token_ids: Vec<i32>,
     stats: Option<TurnStats>,
 }
-
-// =============================================================================
-// Main TUI App State & Render Loop
-// =============================================================================
 
 struct TuiApp {
     #[allow(dead_code)]
@@ -64,16 +58,13 @@ struct TuiApp {
     inkling_gamma: usize,
     tok: BpeTokenizer,
     cfg: ModelConfig,
-
     active_sms: u32,
     ping_ms: f64,
     daemon_online: bool,
-
     spec_enabled: bool,
     temperature: f32,
     max_tokens: usize,
     system_prompt: String,
-
     voice_enabled: bool,
     voice_speaker: String,
     voice_lang: String,
@@ -86,8 +77,6 @@ struct TuiApp {
     rag_top_k: usize,
     topic_badge: Option<String>,
     topic_lora_active: bool,
-
-    // Live 100%-on-RTX-3080 Speech-to-Text (`Qwen3-ASR-1.7B Q8_0`) microphone & VAD state
     asr_model_ref: String,
     asr_lang_hint: String,
     active_recorder: Option<CoreAudioRecorder>,
@@ -96,24 +85,26 @@ struct TuiApp {
     hands_free_talk: bool,
     prev_tts_speaking: bool,
     talk_rearm_at: Option<Instant>,
-
     messages: Vec<ChatMsg>,
     composer: Composer,
-
     scroll_from_bottom: usize,
     total_ctx_used: usize,
     last_cached_prefix: usize,
     last_tps: f64,
     last_ttft_ms: f64,
+    last_prefill_tps: f64,
     last_launches: usize,
     last_spec_extra: usize,
-
+    last_think_words: usize,
+    last_answer_words: usize,
+    expand_thinking: bool,
+    slash_sel: usize,
+    hw_telemetry: Option<HwTelemetry>,
     streaming_rx: Option<Receiver<StreamEvent>>,
     cancel_flag: Option<Arc<AtomicBool>>,
     stream_live_tps: f64,
     stream_live_toks: usize,
     spinner_tick: usize,
-
     toast: Option<(String, Instant)>,
     mouse_capture: bool,
     demo: DemosceneEngine,
@@ -164,6 +155,7 @@ impl TuiApp {
         } else {
             query_rag_badge_from_daemon()
         };
+        let hw_telemetry = query_hw_telemetry_from_daemon();
 
         Ok(Self {
             model_ref: model_ref.to_string(),
@@ -209,8 +201,14 @@ impl TuiApp {
             last_cached_prefix: 0,
             last_tps: 0.0,
             last_ttft_ms: 0.0,
+            last_prefill_tps: 0.0,
             last_launches: 0,
             last_spec_extra: 0,
+            last_think_words: 0,
+            last_answer_words: 0,
+            expand_thinking: false,
+            slash_sel: 0,
+            hw_telemetry,
             streaming_rx: None,
             cancel_flag: None,
             stream_live_tps: 0.0,
@@ -224,8 +222,63 @@ impl TuiApp {
         })
     }
 
+    fn snapshot(&self) -> TelemetrySnapshot<'_> {
+        let active_tps = if self.streaming_rx.is_some() && self.stream_live_tps > 0.0 {
+            self.stream_live_tps
+        } else {
+            self.last_tps
+        };
+        let last_ttfa_ms = self.last_ttfa_ms.lock().map(|g| *g).unwrap_or(0.0);
+        TelemetrySnapshot {
+            model_name: &self.cfg.model_name,
+            is_inkling: self.is_inkling,
+            gguf_size_gb: self.gguf_size_gb,
+            active_gb_per_tok: self.active_gb_per_tok,
+            active_sms: self.active_sms,
+            ping_ms: self.ping_ms,
+            daemon_online: self.daemon_online,
+            effort: &self.inkling_effort,
+            spec_on: self.spec_enabled,
+            gamma: self.inkling_gamma,
+            temp: self.temperature,
+            max_tokens: self.max_tokens,
+            ctx_used: self.total_ctx_used,
+            max_ctx: self.cfg.max_ctx,
+            cached_prefix: self.last_cached_prefix,
+            active_tps,
+            last_ttft_ms: self.last_ttft_ms,
+            last_prefill_tps: self.last_prefill_tps,
+            last_launches: self.last_launches,
+            last_spec_extra: self.last_spec_extra,
+            think_words: self.last_think_words,
+            answer_words: self.last_answer_words,
+            expand_thinking: self.expand_thinking,
+            voice_enabled: self.voice_enabled,
+            hands_free: self.hands_free_talk,
+            voice_speaker: &self.voice_speaker,
+            voice_model_ref: &self.asr_model_ref,
+            last_asr_ms: self.last_asr_ms,
+            last_ttfa_ms,
+            is_recording: self.active_recorder.is_some(),
+            is_transcribing: self.asr_rx.is_some(),
+            is_speaking: self.tts_speaking.load(Ordering::Relaxed),
+            is_streaming: self.streaming_rx.is_some(),
+            hw: self.hw_telemetry.as_ref(),
+        }
+    }
+
     fn set_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    fn push_info(&mut self, content: impl Into<String>) {
+        self.messages.push(ChatMsg {
+            role: "info".into(),
+            content: content.into(),
+            raw_token_ids: Vec::new(),
+            stats: None,
+        });
+        self.scroll_from_bottom = 0;
     }
 
     fn stop_active_tts(&mut self) {
@@ -240,7 +293,7 @@ impl TuiApp {
         if clean.is_empty() {
             return;
         }
-        let _ = self.demo.configure("mod", "off", &self.viz_pcm);
+        let _ = self.demo.configure("mod", "off", 120, &self.viz_pcm);
         self.stop_active_tts();
         let sentences = split_spoken_sentences(&clean);
         if sentences.is_empty() {
@@ -403,26 +456,15 @@ impl TuiApp {
                         .enumerate()
                         .map(|(i, h)| format!("`[{}]` **{}** (`{:.3}`)", i + 1, h.title, h.score))
                         .collect();
-                    self.messages.push(ChatMsg {
-                        role: "info".into(),
-                        content: format!(
-                            "📚 **RTX 3080 Wiki RAG** (`{}` • `{:.1} ms` embed • `{:.0} µs` GPU search): {}",
-                            st.strategy,
-                            st.embed_ms,
-                            st.gpu_search_us,
-                            cite_list.join(" • ")
-                        ),
-                        raw_token_ids: Vec::new(),
-            stats: None,
-                    });
+                    self.push_info(format!(
+                        "📚 **RTX 3080 Wiki RAG** (`{}` • `{:.1} ms` embed • `{:.0} µs` GPU search): {}",
+                        st.strategy, st.embed_ms, st.gpu_search_us, cite_list.join(" • ")
+                    ));
                     rag_override = Some(format_rag_augmented_prompt(&user_text, &st.hits));
-                    // Embedding prefill used the GPU KV scratch, so force fresh prompt prefill cleanly
                     force_reset_cache = true;
                 }
                 Ok(_) => {}
-                Err(e) => {
-                    self.set_toast(format!("RAG search error: {}", e));
-                }
+                Err(e) => self.set_toast(format!("RAG search error: {}", e)),
             }
         } else if self.topic_badge.is_some() {
             match DaemonRagClient::topic_route(&user_text, self.rag_top_k, -1.0, true) {
@@ -433,19 +475,11 @@ impl TuiApp {
                         if !rt.system_prompt.is_empty() {
                             topic_sys_override = Some(rt.system_prompt.clone());
                         }
-                        self.messages.push(ChatMsg {
-                            role: "info".into(),
-                            content: format!(
-                                "⚡ **Topic LoRA**: **{}** (`cos={:.3}` • `{:.1} ms` embed • `{:.0} µs` search • `{:.2} ms` swap • `0` context tokens)",
-                                rt.topic, rt.score, rt.embed_ms, rt.gpu_search_us, rt.swap_ms
-                            ),
-                            raw_token_ids: Vec::new(),
-            stats: None,
-                        });
-                        self.set_toast(format!(
-                            "⚡ Topic LoRA: {} (cos={:.3}, swap={:.2}ms)",
-                            rt.topic, rt.score, rt.swap_ms
+                        self.push_info(format!(
+                            "⚡ **Topic LoRA**: **{}** (`cos={:.3}` • `{:.1} ms` embed • `{:.0} µs` search • `{:.2} ms` swap • `0` context tokens)",
+                            rt.topic, rt.score, rt.embed_ms, rt.gpu_search_us, rt.swap_ms
                         ));
+                        self.set_toast(format!("⚡ Topic LoRA: {} (cos={:.3}, swap={:.2}ms)", rt.topic, rt.score, rt.swap_ms));
                     } else {
                         self.topic_lora_active = false;
                         self.set_toast(format!("⚡ No topic LoRA matched (top cos={:.3})", rt.score));
@@ -505,8 +539,8 @@ impl TuiApp {
             self.stop_active_tts();
             stopped_any = true;
         }
-        if self.demo.status_tags().3 {
-            let _ = self.demo.configure("mod", "off", &self.viz_pcm);
+        if self.demo.state_flags().2 {
+            let _ = self.demo.configure("mod", "off", 120, &self.viz_pcm);
             stopped_any = true;
         }
         if stopped_any {
@@ -536,7 +570,7 @@ impl TuiApp {
         if self.active_recorder.is_some() || self.asr_rx.is_some() || self.streaming_rx.is_some() {
             return;
         }
-        let _ = self.demo.configure("mod", "off", &self.viz_pcm);
+        let _ = self.demo.configure("mod", "off", 120, &self.viz_pcm);
         self.stop_active_tts();
         self.talk_rearm_at = None;
         if !self.voice_enabled {
@@ -609,6 +643,7 @@ impl TuiApp {
         }
         if let Some(res) = asr_done {
             self.asr_rx = None;
+            self.hw_telemetry = query_hw_telemetry_from_daemon();
             changed = true;
             match res {
                 Ok((transcript, _stats_json, stt_ms)) => {
@@ -624,7 +659,6 @@ impl TuiApp {
                         }
                     } else {
                         self.set_toast(format!("🎙 RTX 3080 STT ({:.0} ms): \"{}\"", stt_ms, clean));
-                        // Ensure spoken response is enabled so Speech-In -> LLM -> Speech-Out + TUI Chat completes!
                         self.voice_enabled = true;
                         self.start_generation(clean, false);
                     }
@@ -638,6 +672,10 @@ impl TuiApp {
 
         // 3. Hands-free `/talk` turn-taking: once TTS finishes speaking, re-open mic after brief echo guard
         let now_speaking = self.tts_speaking.load(Ordering::Relaxed);
+        if self.prev_tts_speaking && !now_speaking {
+            self.hw_telemetry = query_hw_telemetry_from_daemon();
+            changed = true;
+        }
         if self.hands_free_talk {
             if self.prev_tts_speaking && !now_speaking && self.streaming_rx.is_none() && self.active_recorder.is_none() && self.asr_rx.is_none() {
                 self.talk_rearm_at = Some(Instant::now() + Duration::from_millis(400));
@@ -670,7 +708,6 @@ impl TuiApp {
                 changed = true;
                 match ev {
                     StreamEvent::Token {
-                        tok_id,
                         piece,
                         tok_count,
                         elapsed_s,
@@ -684,7 +721,6 @@ impl TuiApp {
                         if tok_count > 1 && elapsed_s > 1e-4 {
                             self.stream_live_tps = ((tok_count - 1) as f64) / elapsed_s;
                         }
-                        self.demo.pulse_token(tok_id, self.stream_live_tps.max(60.0));
                         self.total_ctx_used += 1;
                     }
                     StreamEvent::Finished(mut st) => {
@@ -693,6 +729,10 @@ impl TuiApp {
                         }
                         if st.decode_tok_s > 0.0 {
                             self.last_tps = st.decode_tok_s;
+                            self.demo.record_turn_tps(self.last_tps);
+                        }
+                        if st.prefill_tok_s > 0.0 {
+                            self.last_prefill_tps = st.prefill_tok_s;
                         }
                         if st.ttft_ms > 0.0 {
                             self.last_ttft_ms = st.ttft_ms;
@@ -737,6 +777,7 @@ impl TuiApp {
                 self.topic_lora_active = false;
                 self.lora_badge = query_lora_badge_from_daemon();
             }
+            self.hw_telemetry = query_hw_telemetry_from_daemon();
             if let Some(reply_md) = speak_reply_after {
                 self.spawn_tts_for_text(&reply_md);
             }
@@ -784,13 +825,7 @@ impl TuiApp {
                     } else {
                         "✓ **48-Layer Persistent B=1 Megakernel: ON** (`~120 tok/s` across all tasks, `2` GPU launches)".to_string()
                     };
-                    self.messages.push(ChatMsg {
-                        role: "info".into(),
-                        content: msg.clone(),
-                        raw_token_ids: Vec::new(),
-                        stats: None,
-                    });
-                    self.scroll_from_bottom = 0;
+                    self.push_info(msg.clone());
                     self.set_toast(msg);
                 } else {
                     self.set_toast(if self.spec_enabled {
@@ -806,9 +841,7 @@ impl TuiApp {
                         match arg {
                             "off" | "0" | "false" => "0",
                             "on" | "1" | "true" => "0.2",
-                            "" => {
-                                if self.inkling_effort == "0" { "0.2" } else { "0" }
-                            }
+                            "" => if self.inkling_effort == "0" { "0.2" } else { "0" },
                             other => InklingEngine::normalize_effort(other),
                         }
                     } else if arg.is_empty() {
@@ -825,17 +858,10 @@ impl TuiApp {
                     } else {
                         "Thinking **ON** (`<think>...</think>` 3-pass reasoning active)"
                     };
-                    let info_msg = format!(
+                    self.push_info(format!(
                         "✓ **Inkling Thinking Effort: `{}`** — {}. Type a prompt below to test!",
                         self.inkling_effort, mode_desc
-                    );
-                    self.messages.push(ChatMsg {
-                        role: "info".into(),
-                        content: info_msg,
-                        raw_token_ids: Vec::new(),
-                        stats: None,
-                    });
-                    self.scroll_from_bottom = 0;
+                    ));
                     self.set_toast(format!(
                         "✓ Inkling thinking effort set to '{}' (0 = instant ~120 tok/s • 0.2 = reasoning • 0.9 = deep)",
                         self.inkling_effort
@@ -850,18 +876,11 @@ impl TuiApp {
                     match DaemonControl::query(DaemonQuery::InklingSetGamma(gc)) {
                         Ok(_) => {
                             self.inkling_gamma = gc;
-                            let info_msg = format!(
+                            self.hw_telemetry = query_hw_telemetry_from_daemon();
+                            self.push_info(format!(
                                 "✓ **DSpark Draft Depth: `γ={}`** (speculative verify currently **{}** — use `/spec on` to enable)",
-                                gc,
-                                if self.spec_enabled { "ON" } else { "OFF" }
-                            );
-                            self.messages.push(ChatMsg {
-                                role: "info".into(),
-                                content: info_msg,
-                                raw_token_ids: Vec::new(),
-                                stats: None,
-                            });
-                            self.scroll_from_bottom = 0;
+                                gc, if self.spec_enabled { "ON" } else { "OFF" }
+                            ));
                             self.set_toast(format!("✓ DSpark draft depth set to γ={} (use `/spec on` to enable)", gc));
                         }
                         Err(e) => self.set_toast(format!("Gamma update error: {}", e)),
@@ -895,12 +914,7 @@ impl TuiApp {
                     self.set_toast("✓ Updated system prompt");
                 } else {
                     let cur = if self.system_prompt.is_empty() { "(none)" } else { &self.system_prompt };
-                    self.messages.push(ChatMsg {
-                        role: "info".into(),
-                        content: format!("**System Prompt**: `{}`\nUse `/sys <prompt>` to set or `/sys clear` to remove.", cur),
-                        raw_token_ids: Vec::new(),
-            stats: None,
-                    });
+                    self.push_info(format!("**System Prompt**: `{}`\nUse `/sys <prompt>` to set or `/sys clear` to remove.", cur));
                 }
             }
             "/mouse" => {
@@ -915,8 +929,7 @@ impl TuiApp {
                 });
             }
             "/copy" => {
-                let last_asst = self.messages.iter().rev().find(|m| m.role == "assistant");
-                if let Some(m) = last_asst {
+                if let Some(m) = self.messages.iter().rev().find(|m| m.role == "assistant") {
                     let target = if arg == "code" {
                         extract_last_fenced_code(&m.content).unwrap_or_else(|| m.content.clone())
                     } else {
@@ -932,19 +945,9 @@ impl TuiApp {
             }
             "/verify" => {
                 let body = format_verify_markdown(
-                    self.is_inkling,
-                    &self.cfg,
-                    &self.gguf_path,
-                    self.gguf_size_gb,
-                    self.active_gb_per_tok,
+                    self.is_inkling, &self.cfg, &self.gguf_path, self.gguf_size_gb, self.active_gb_per_tok,
                 );
-                self.messages.push(ChatMsg {
-                    role: "info".into(),
-                    content: body,
-                    raw_token_ids: Vec::new(),
-                    stats: None,
-                });
-                self.scroll_from_bottom = 0;
+                self.push_info(body);
             }
             "/bench" => {
                 let (en_spec, prompt) = select_bench_prompt(self.is_inkling, arg);
@@ -1036,12 +1039,7 @@ impl TuiApp {
                 if arg.is_empty() || arg == "status" {
                     let st = DaemonControl::query(DaemonQuery::LoraStatus).unwrap_or_else(|e| format!("Error: {}", e));
                     self.lora_badge = query_lora_badge_from_daemon();
-                    self.messages.push(ChatMsg {
-                        role: "info".into(),
-                        content: format!("**Fused Rank-r LoRA Status**: `{}`\nUse `/lora <adapter_path>` to hot-swap (`< 1 ms`) or `/lora off` to clear.", st),
-                        raw_token_ids: Vec::new(),
-            stats: None,
-                    });
+                    self.push_info(format!("**Fused Rank-r LoRA Status**: `{}`\nUse `/lora <adapter_path>` to hot-swap (`< 1 ms`) or `/lora off` to clear.", st));
                 } else if matches!(arg, "off" | "clear" | "none") {
                     match DaemonControl::query(DaemonQuery::LoraClear) {
                         Ok(_) => {
@@ -1060,21 +1058,16 @@ impl TuiApp {
                         Err(e) => self.set_toast(format!("LoRA load failed: {}", e)),
                     }
                 }
-                self.scroll_from_bottom = 0;
+                self.hw_telemetry = query_hw_telemetry_from_daemon();
             }
             "/rag" => {
                 if arg.is_empty() || arg == "status" {
                     let st = DaemonControl::query(DaemonQuery::RagStatus).unwrap_or_else(|e| format!("Error: {}", e));
                     self.rag_badge = query_rag_badge_from_daemon();
-                    self.messages.push(ChatMsg {
-                        role: "info".into(),
-                        content: format!(
-                            "**RTX 3080 Same-Model VectorDB Status**: `{}`\nUse `/rag wiki` (or `/rag <file.qvec>`) to enable live Wikipedia RAG, or `/rag off` to disable.",
-                            st
-                        ),
-                        raw_token_ids: Vec::new(),
-            stats: None,
-                    });
+                    self.push_info(format!(
+                        "**RTX 3080 Same-Model VectorDB Status**: `{}`\nUse `/rag wiki` (or `/rag <file.qvec>`) to enable live Wikipedia RAG, or `/rag off` to disable.",
+                        st
+                    ));
                 } else if matches!(arg, "off" | "clear" | "none") {
                     match DaemonControl::query(DaemonQuery::RagClear) {
                         Ok(_) => {
@@ -1084,7 +1077,7 @@ impl TuiApp {
                         Err(e) => self.set_toast(format!("RAG clear error: {}", e)),
                     }
                 } else {
-                    let resolved = if arg == "on" || arg == "wiki" || arg == "wikipedia" {
+                    let resolved = if matches!(arg, "on" | "wiki" | "wikipedia") {
                         "data/wikipedia_1k_best.qvec"
                     } else {
                         arg.strip_prefix("load ").map(|s| s.trim()).unwrap_or(arg)
@@ -1098,29 +1091,19 @@ impl TuiApp {
                         Err(e) => self.set_toast(format!("RAG load failed: {}", e)),
                     }
                 }
-                self.scroll_from_bottom = 0;
+                self.hw_telemetry = query_hw_telemetry_from_daemon();
             }
             "/topic" => {
                 if arg.is_empty() || arg == "status" {
                     let st = DaemonControl::query(DaemonQuery::TopicStatus).unwrap_or_else(|e| format!("Error: {}", e));
                     self.topic_badge = query_topic_badge_from_daemon();
-                    self.messages.push(ChatMsg {
-                        role: "info".into(),
-                        content: format!(
-                            "**RTX 3080 Sharded Topic LoRA Bank Status**: `{}`\nUse `/topic wiki` (or `/topic <bank_dir>`) to enable bare-prompt Topic LoRA routing, `/topic list` to list topics, or `/topic off` to disable.",
-                            st
-                        ),
-                        raw_token_ids: Vec::new(),
-            stats: None,
-                    });
+                    self.push_info(format!(
+                        "**RTX 3080 Sharded Topic LoRA Bank Status**: `{}`\nUse `/topic wiki` (or `/topic <bank_dir>`) to enable bare-prompt Topic LoRA routing, `/topic list` to list topics, or `/topic off` to disable.",
+                        st
+                    ));
                 } else if arg == "list" {
                     let lst = DaemonControl::query(DaemonQuery::TopicList).unwrap_or_else(|e| format!("Error: {}", e));
-                    self.messages.push(ChatMsg {
-                        role: "info".into(),
-                        content: format!("**Loaded Topic LoRA Bank**: `{}`", lst),
-                        raw_token_ids: Vec::new(),
-            stats: None,
-                    });
+                    self.push_info(format!("**Loaded Topic LoRA Bank**: `{}`", lst));
                 } else if matches!(arg, "off" | "clear" | "none") {
                     match DaemonControl::query(DaemonQuery::TopicClear) {
                         Ok(_) => {
@@ -1132,7 +1115,7 @@ impl TuiApp {
                         Err(e) => self.set_toast(format!("Topic clear error: {}", e)),
                     }
                 } else {
-                    let resolved = if arg == "on" || arg == "wiki" || arg == "wikipedia" {
+                    let resolved = if matches!(arg, "on" | "wiki" | "wikipedia") {
                         "checkpoints/wiki-topic-loras"
                     } else {
                         arg.strip_prefix("load ").map(|s| s.trim()).unwrap_or(arg)
@@ -1146,35 +1129,41 @@ impl TuiApp {
                         Err(e) => self.set_toast(format!("Topic load failed: {}", e)),
                     }
                 }
-                self.scroll_from_bottom = 0;
+                self.hw_telemetry = query_hw_telemetry_from_daemon();
+            }
+            "/fold" => {
+                self.expand_thinking = match arg {
+                    "on" | "1" | "expand" | "open" => true,
+                    "off" | "0" | "collapse" | "close" => false,
+                    _ => !self.expand_thinking,
+                };
+                self.set_toast(if self.expand_thinking {
+                    "Thinking traces: expanded (Ctrl+O to collapse)"
+                } else {
+                    "Thinking traces: collapsed to summary (Ctrl+O to expand)"
+                });
+            }
+            "/inspector" | "/sidebar" | "/fx" => {
+                let msg = self.demo.configure("sidebar", arg, term_size().0, &self.viz_pcm);
+                self.set_toast(msg);
             }
             "/demo" => {
-                let msg = self.demo.configure("demo_open", arg, &self.viz_pcm);
+                let msg = self.demo.configure("demo_open", arg, term_size().0, &self.viz_pcm);
                 if !msg.is_empty() {
                     self.set_toast(msg);
                 }
             }
             "/theme" | "/palette" => {
-                let msg = self.demo.configure("theme", arg, &self.viz_pcm);
-                self.set_toast(msg);
-            }
-            "/fx" => {
-                let msg = self.demo.configure("fx", arg, &self.viz_pcm);
+                let msg = self.demo.configure("theme", arg, term_size().0, &self.viz_pcm);
                 self.set_toast(msg);
             }
             "/mod" | "/music" | "/chiptune" => {
                 self.stop_active_tts();
-                let msg = self.demo.configure("mod", arg, &self.viz_pcm);
+                let msg = self.demo.configure("mod", arg, term_size().0, &self.viz_pcm);
                 self.set_toast(msg);
             }
             "/help" | _ => {
-                self.messages.push(ChatMsg {
-                    role: "info".into(),
-                    content: format_help_markdown(self.is_inkling).into(),
-                    raw_token_ids: Vec::new(),
-                    stats: None,
-                });
-                self.scroll_from_bottom = 0;
+                self.push_info(format_help_markdown(self.is_inkling));
             }
         }
         Some(false)
@@ -1182,174 +1171,38 @@ impl TuiApp {
 
     fn draw(&mut self, scr: &mut ScreenBuf, w: usize, h: usize) -> Option<(usize, usize)> {
         let pal = self.demo.palette();
-        let (theme_lbl, _fx_lbl, showcase_open, mod_on) = self.demo.status_tags();
+        let (theme_lbl, showcase_open, mod_on) = self.demo.state_flags();
 
         if showcase_open {
-            let b_info = BannerInfo {
-                model_name: &self.cfg.model_name,
-                is_inkling: self.is_inkling,
-                gguf_size_gb: self.gguf_size_gb,
-                active_sms: self.active_sms,
-                ping_ms: self.ping_ms,
-                effort: &self.inkling_effort,
-                spec_on: self.spec_enabled,
-                gamma: self.inkling_gamma,
-                last_tps: self.last_tps,
-            };
-            self.demo.draw_attract_or_showcase(scr, 0, 0, w, h, &b_info);
+            self.demo.draw_megademo(scr, w, h, &self.cfg.model_name, self.active_sms);
             return None;
         }
 
         scr.resize_and_clear(w, h, pal.bg_void);
+        let sidebar_on = self.demo.sidebar_visible(w);
+        let sidebar_w = if sidebar_on { 34 } else { 0 };
+        let main_w = w.saturating_sub(sidebar_w).max(24);
 
-        // ---------------------------------------------------------------------
-        // 1. 1990s Tracker / Copper Bevel Masthead (Row 0, Row 1, Row 2)
-        // ---------------------------------------------------------------------
-        scr.fill_row(0, pal.bg_header);
-        scr.fill_row(1, pal.bg_header);
-        scr.put_char(0, 0, '╔', Style::new(pal.bevel_hi, pal.bg_header).bold());
-        scr.put_char(w.saturating_sub(1), 0, '╗', Style::new(pal.bevel_hi, pal.bg_header).bold());
-        scr.put_char(0, 1, '║', Style::new(pal.bevel_hi, pal.bg_header).bold());
-        scr.put_char(w.saturating_sub(1), 1, '║', Style::new(pal.bevel_hi, pal.bg_header).bold());
-
-        let mut x = 1;
-        x = scr.put_str(x, 0, w - 1, " ♦ RTX ", Style::new(pal.bg_void, pal.copper_a).bold());
-        x = scr.put_str(x + 1, 0, w - 1, &self.cfg.model_name, Style::new(pal.text_hi, pal.bg_header).bold());
-        let sub_hdr = if self.is_inkling {
-            format!(" [{:.2}GB 128x8 MoE • 48L]", self.gguf_size_gb)
-        } else {
-            format!(" [{:.2}GB GGUF]", self.gguf_size_gb)
-        };
-        x = scr.put_str(x, 0, w - 1, &sub_hdr, Style::new(pal.text_muted, pal.bg_header));
-
-        let gpu_tag = format!(
-            " GA102:{}SMs • {:.1}ms ",
-            self.active_sms, self.ping_ms
-        );
-        let gx = w.saturating_sub(gpu_tag.chars().count() + 1);
-        if gx > x + 16 {
-            x = self.demo.draw_spectrum_strip(scr, x + 2, 0, gx.saturating_sub(1), true);
-        }
-        if gx > x + 1 {
-            scr.put_str(gx, 0, w - 1, &gpu_tag, Style::new(FG_GREEN, pal.bg_header).bold());
-        }
-
-        // Row 1: Mode LEDs + Effort/Voice/MOD/LoRA badges + KV Gauge + Digital Speedometer
-        let mut x1 = 2;
-        let (mode_lbl, mode_bg) = if self.is_inkling {
-            if self.spec_enabled {
-                (format!(" DSPARK γ={} ", self.inkling_gamma), BG_BADGE_ON)
-            } else {
-                (" 48L B=1 ".to_string(), BG_BADGE_T1)
-            }
-        } else if self.spec_enabled {
-            (" SPEC BM=4 ".to_string(), BG_BADGE_ON)
-        } else {
-            (" T=1 MK ".to_string(), BG_BADGE_T1)
-        };
-        x1 = scr.put_str(x1, 1, w - 1, &mode_lbl, Style::new(pal.text_hi, mode_bg).bold());
-        if self.is_inkling {
-            let eff_lbl = format!(" EFFORT:{} ", self.inkling_effort);
-            let eff_fg = if self.inkling_effort == "0" { FG_GREEN } else { FG_PURPLE };
-            x1 = scr.put_str(x1 + 1, 1, w - 1, &eff_lbl, Style::new(pal.bg_void, eff_fg).bold());
-        }
-        if mod_on {
-            x1 = scr.put_str(x1 + 1, 1, w - 1, " ♫ MOD:ON ", Style::new(pal.bg_void, pal.copper_b).bold());
-        }
-        if self.active_recorder.is_some() {
-            x1 = scr.put_str(x1 + 1, 1, w - 1, " ►MIC REC ", Style::new(pal.bg_void, FG_GREEN).bold());
-        } else if self.asr_rx.is_some() {
-            x1 = scr.put_str(x1 + 1, 1, w - 1, " ►GPU STT ", Style::new(pal.bg_void, FG_CYAN).bold());
-        } else if self.tts_speaking.load(Ordering::Relaxed) {
-            let ttfa = self.last_ttfa_ms.lock().map(|g| *g).unwrap_or(0.0);
-            let lbl = if ttfa > 0.0 {
-                format!(" ♫ TTS {:.0}ms ", ttfa)
-            } else {
-                " ♫ SYNTH... ".to_string()
-            };
-            x1 = scr.put_str(x1 + 1, 1, w - 1, &lbl, Style::new(pal.bg_void, FG_AMBER).bold());
-        } else if self.hands_free_talk {
-            let lbl = format!(" ►TALK:{} ", self.voice_speaker);
-            x1 = scr.put_str(x1 + 1, 1, w - 1, &lbl, Style::new(pal.bg_void, FG_GREEN).bold());
-        } else if self.voice_enabled {
-            let lbl = format!(" ♫ VOICE:{} ", self.voice_speaker);
-            x1 = scr.put_str(x1 + 1, 1, w - 1, &lbl, Style::new(pal.text_hi, pal.badge_bot).bold());
-        }
-        if let Some(tb) = &self.topic_badge {
-            x1 = scr.put_str(x1 + 1, 1, w - 1, tb, Style::new(pal.bg_void, FG_AMBER).bold());
-        } else if let Some(rb) = &self.rag_badge {
-            x1 = scr.put_str(x1 + 1, 1, w - 1, rb, Style::new(pal.bg_void, FG_CYAN).bold());
-        }
-        if let Some(lb) = &self.lora_badge {
-            x1 = scr.put_str(x1 + 1, 1, w - 1, lb, Style::new(pal.bg_void, FG_PURPLE).bold());
-        }
-
-        let ctx_pct = ((self.total_ctx_used as f64 / self.cfg.max_ctx.max(1) as f64) * 100.0).min(100.0);
-        let filled = ((ctx_pct / 100.0) * 8.0).round() as usize;
-        let bar = format!(
-            "  KV:[{}{}] {}/{} (+{})",
-            "▓".repeat(filled.min(8)),
-            "░".repeat(8usize.saturating_sub(filled.min(8))),
-            self.total_ctx_used,
-            self.cfg.max_ctx,
-            self.last_cached_prefix
-        );
-        x1 = scr.put_str(x1, 1, w - 1, &bar, Style::new(pal.copper_a, pal.bg_header));
-
-        let active_tps = if self.streaming_rx.is_some() && self.stream_live_tps > 0.0 {
-            self.stream_live_tps
-        } else {
-            self.last_tps
-        };
-        if active_tps > 0.0 {
-            let eff_bw = active_tps * self.active_gb_per_tok;
-            let sp_str = format!(
-                "► {:.1} TOK/S • {:.0} GB/S • {:.0}ms ",
-                active_tps, eff_bw, self.last_ttft_ms
-            );
-            let sx = w.saturating_sub(sp_str.chars().count() + 1);
-            if sx > x1 + 1 {
-                scr.put_str(sx, 1, w - 1, &sp_str, Style::new(pal.copper_c, pal.bg_header).bold());
-            }
-        }
-
-        // ---------------------------------------------------------------------
-        // 3. Composer Height Calculation (Bottom Zone)
-        // ---------------------------------------------------------------------
-        let inner_comp_w = w.saturating_sub(6).max(10);
+        let inner_comp_w = main_w.saturating_sub(6).max(10);
         let (comp_lines, cur_comp_row, cur_comp_col) = self.composer.wrapped_lines(inner_comp_w);
         let vis_comp_rows = comp_lines.len().clamp(1, 6);
-        let comp_scroll = if cur_comp_row >= vis_comp_rows {
-            cur_comp_row + 1 - vis_comp_rows
-        } else {
-            0
-        };
+        let comp_scroll = cur_comp_row.saturating_add(1).saturating_sub(vis_comp_rows);
 
         let footer_y = h.saturating_sub(1);
         let comp_bot_y = footer_y.saturating_sub(1);
         let comp_top_y = comp_bot_y.saturating_sub(vis_comp_rows + 1);
         let chat_top_y = 3usize;
-        let chat_bot_y = comp_top_y; // exclusive
-        let chat_h = chat_bot_y.saturating_sub(chat_top_y);
+        let chat_h = comp_top_y.saturating_sub(chat_top_y);
 
-        // ---------------------------------------------------------------------
-        // 2. Scrollable Chat Viewport OR Live 1990s Demoscene Attract Intro
-        // ---------------------------------------------------------------------
-        if self.messages.is_empty() {
-            let b_info = BannerInfo {
-                model_name: &self.cfg.model_name,
-                is_inkling: self.is_inkling,
-                gguf_size_gb: self.gguf_size_gb,
-                active_sms: self.active_sms,
-                ping_ms: self.ping_ms,
-                effort: &self.inkling_effort,
-                spec_on: self.spec_enabled,
-                gamma: self.inkling_gamma,
-                last_tps: self.last_tps,
-            };
-            self.demo.draw_attract_or_showcase(scr, 0, chat_top_y, w, chat_h, &b_info);
-        } else {
+        // 1. Main Chat Viewport (or Calm Session Brief when empty)
+        if !self.messages.is_empty() {
             let mut all_lines: Vec<RenderedLine> = Vec::with_capacity(256);
+            let last_asst_idx = self.messages.iter().rposition(|m| m.role == "assistant");
+            if last_asst_idx.is_none() {
+                self.last_think_words = 0;
+                self.last_answer_words = 0;
+            }
+
             for (idx, msg) in self.messages.iter().enumerate() {
                 if idx > 0 {
                     all_lines.push(RenderedLine { spans: Vec::new(), row_bg: pal.bg_void });
@@ -1359,63 +1212,76 @@ impl TuiApp {
 
                 if msg.role == "user" {
                     hdr_spans.push(Span {
-                        text: " ╔► YOU ".into(),
-                        style: Style::new(pal.text_hi, pal.badge_user).bold(),
+                        text: "▍ You".into(),
+                        style: Style::new(pal.accent_user, pal.bg_void).bold(),
                     });
                 } else if msg.role == "assistant" {
                     hdr_spans.push(Span {
-                        text: format!(" ╔♦ {} ", self.cfg.model_name),
-                        style: Style::new(pal.text_hi, pal.badge_bot).bold(),
+                        text: "▍ ".into(),
+                        style: Style::new(pal.accent_bot, pal.bg_void).bold(),
+                    });
+                    hdr_spans.push(Span {
+                        text: self.cfg.model_name.clone(),
+                        style: Style::new(pal.text_hi, pal.bg_void).bold(),
                     });
                     if is_last_streaming {
-                        const FRAMES: [char; 4] = ['░', '▒', '▓', '█'];
+                        const FRAMES: [char; 4] = ['·', '✢', '✳', '◈'];
                         let sp = FRAMES[(self.spinner_tick / 2) % FRAMES.len()];
                         hdr_spans.push(Span {
-                            text: format!(
-                                "  {} STREAMING {} TOKS ({:.1} TOK/S)",
-                                sp, self.stream_live_toks, self.stream_live_tps
-                            ),
-                            style: Style::new(pal.copper_c, pal.bg_void).bold(),
+                            text: format!("  {} {} toks · {:.1} tok/s", sp, self.stream_live_toks, self.stream_live_tps),
+                            style: Style::new(pal.grad_c, pal.bg_void),
                         });
                     } else if let Some(st) = &msg.stats {
                         let eff_bw = st.decode_tok_s * self.active_gb_per_tok;
-                        let spec_note = if st.spec_accepted_extra > 0 {
-                            format!(" • +{} spec", st.spec_accepted_extra)
+                        let cache_note = if st.cached_prefix_tokens > 0 {
+                            format!(" · +{} cached", st.cached_prefix_tokens)
                         } else {
                             String::new()
                         };
-                        let status_note = if st.cancelled { " [HALT]" } else { "" };
+                        let spec_note = if st.spec_accepted_extra > 0 {
+                            format!(" · +{} spec", st.spec_accepted_extra)
+                        } else {
+                            String::new()
+                        };
+                        let status_note = if st.cancelled { " · stopped" } else { "" };
                         hdr_spans.push(Span {
                             text: format!(
-                                "  [{:.1} tok/s • {:.0} GB/s • {} toks • TTFT {:.1}ms • {} launches{}{}]",
-                                st.decode_tok_s,
-                                eff_bw,
-                                st.completion_tokens,
-                                st.ttft_ms,
-                                st.kernel_launches,
-                                spec_note,
-                                status_note
+                                "  · {:.1} tok/s · {:.0} GB/s · TTFT {:.0}ms{}{}{}",
+                                st.decode_tok_s, eff_bw, st.ttft_ms, cache_note, spec_note, status_note
                             ),
-                            style: Style::new(pal.text_muted, pal.bg_void),
+                            style: Style::new(pal.text_dim, pal.bg_void),
                         });
                     }
                 } else {
-                    let badge_bg = if msg.content.starts_with("Error:") { FG_CORAL } else { pal.copper_c };
+                    let is_err = msg.content.starts_with("Error:");
                     hdr_spans.push(Span {
-                        text: " ╔≡ SYS.NFO ".into(),
-                        style: Style::new(pal.bg_void, badge_bg).bold(),
+                        text: if is_err { "▍ Error".into() } else { "▍ System".into() },
+                        style: Style::new(if is_err { FG_CORAL } else { pal.grad_b }, pal.bg_void).bold(),
                     });
                 }
                 all_lines.push(RenderedLine { spans: hdr_spans, row_bg: pal.bg_void });
 
-                let body_text = if is_last_streaming && msg.content.is_empty() {
-                    "█".to_string()
-                } else if is_last_streaming {
-                    format!("{}█", msg.content)
+                let rendered = if msg.role == "assistant" {
+                    let (rls, th_w, ans_w) = format_assistant_markdown(
+                        &msg.content,
+                        main_w.saturating_sub(2),
+                        is_last_streaming,
+                        self.expand_thinking,
+                        pal.bg_void,
+                        pal.text_muted,
+                        pal.text_dim,
+                        pal.grad_a,
+                    );
+                    if Some(idx) == last_asst_idx {
+                        self.last_think_words = th_w;
+                        self.last_answer_words = ans_w;
+                    }
+                    rls
                 } else {
-                    msg.content.clone()
+                    format_markdown_block(&msg.content, main_w.saturating_sub(2), msg.role == "user")
                 };
-                for mut rl in format_markdown_block(&body_text, w.saturating_sub(2), msg.role == "user") {
+
+                for mut rl in rendered {
                     if rl.row_bg == terminal::BG_MAIN {
                         rl.row_bg = pal.bg_void;
                         for sp in &mut rl.spans {
@@ -1438,124 +1304,241 @@ impl TuiApp {
             for (row_off, rline) in all_lines[start_idx..end_idx].iter().enumerate() {
                 let y = chat_top_y + row_off;
                 if rline.row_bg != pal.bg_void {
-                    scr.fill_row(y, rline.row_bg);
+                    scr.fill_row_range_help(0, y, main_w, rline.row_bg);
                 }
                 let mut rx = 0usize;
                 for sp in &rline.spans {
-                    rx = scr.put_str(rx, y, w.saturating_sub(1), &sp.text, sp.style);
+                    rx = scr.put_str(rx, y, main_w.saturating_sub(1), &sp.text, sp.style);
                 }
             }
 
             if self.scroll_from_bottom > 0 && chat_h > 0 {
-                let pill = format!(" ▲ SCROLLED +{} LINES (PgDn / End) ", self.scroll_from_bottom);
-                let px = w.saturating_sub(pill.chars().count() + 2);
-                scr.put_str(px, chat_bot_y.saturating_sub(1), w, &pill, Style::new(pal.bg_void, pal.copper_c).bold());
+                let pill = format!(" ↑ +{} lines (End) ", self.scroll_from_bottom);
+                let px = main_w.saturating_sub(pill.chars().count() + 2);
+                scr.put_str(px, comp_top_y.saturating_sub(1), main_w, &pill, Style::new(pal.bg_void, pal.grad_b).bold());
             }
         }
 
-        // ---------------------------------------------------------------------
-        // 3b. CP437 Double-Bevel Prompt Deck + Live Spectrum/VU Visualizer
-        // ---------------------------------------------------------------------
+        // 2. Rounded Prompt Composer (`╭─ ... ─╮`)
         let mic_stats = self.active_recorder.as_ref().map(|r| r.live_stats());
         let is_transcribing = self.asr_rx.is_some();
         let is_busy = self.streaming_rx.is_some() || is_transcribing;
-        let border_st = if let Some(ref ms) = mic_stats {
-            if ms.speech_started {
-                Style::new(FG_GREEN, pal.bg_deck).bold()
-            } else {
-                Style::new(FG_CORAL, pal.bg_deck).bold()
-            }
+        let border_fg = if let Some(ref ms) = mic_stats {
+            if ms.speech_started { FG_GREEN } else { FG_CORAL }
         } else if is_transcribing {
-            Style::new(FG_CYAN, pal.bg_deck).bold()
+            FG_CYAN
         } else if is_busy {
-            Style::new(pal.copper_c, pal.bg_deck).bold()
+            pal.grad_c
         } else {
-            Style::new(pal.bevel_hi, pal.bg_deck)
+            pal.border_mid
         };
+        let border_st = Style::new(border_fg, pal.bg_deck);
+        let box_w = main_w.saturating_sub(2);
 
         let title = if mic_stats.is_some() {
             format!(
-                "═[ ►MIC CAPTURE -> RTX 3080 Qwen3-ASR-{} // Enter/^R:Send • Esc:Abort ]",
+                "─ ● Recording 16 kHz -> RTX 3080 ASR-{} (Enter/^R send · Esc cancel) ",
                 self.asr_model_ref.to_uppercase()
             )
         } else if is_transcribing {
-            format!(
-                "═[ ►GPU TRANSCRIBING (Qwen3-ASR-{} Q8_0)... ]",
-                self.asr_model_ref.to_uppercase()
-            )
+            format!("─ ◈ Transcribing on RTX 3080 (Qwen3-ASR-{})... ", self.asr_model_ref.to_uppercase())
         } else if is_busy {
-            "═[ ►GA102 STREAMING ON 68 SMs (Esc:Halt) ]".to_string()
+            "─ ◈ Generating on GA102 68 SMs (Esc stop) ".to_string()
         } else {
-            format!(
-                "═[ ►TRANSMIT // {} ]═[ ^R:Voice • /talk • ^D:/demo • /mod • ^T:{} ]",
-                self.cfg.model_name, theme_lbl
-            )
+            format!("─ ▸ Prompt · {} ", self.cfg.model_name)
         };
-        scr.fill_row(comp_top_y, pal.bg_deck);
-        scr.put_char(1, comp_top_y, '╔', border_st);
-        let mut tx = scr.put_str(2, comp_top_y, w.saturating_sub(2), &title, border_st);
-        while tx < w.saturating_sub(2) {
-            tx += scr.put_char(tx, comp_top_y, '═', border_st);
+        scr.fill_row_range_help(1, comp_top_y, box_w, pal.bg_deck);
+        scr.put_char(1, comp_top_y, '╭', border_st);
+        let mut tx = scr.put_str(2, comp_top_y, main_w.saturating_sub(2), &title, Style::new(border_fg, pal.bg_deck).bold());
+        while tx < main_w.saturating_sub(2) {
+            tx += scr.put_char(tx, comp_top_y, '─', Style::new(pal.border_dim, pal.bg_deck));
         }
-        scr.put_char(w.saturating_sub(2), comp_top_y, '╗', border_st);
+        scr.put_char(main_w.saturating_sub(2), comp_top_y, '╮', border_st);
 
         for r in 0..vis_comp_rows {
             let y = comp_top_y + 1 + r;
-            scr.fill_row(y, pal.bg_deck);
-            scr.put_char(1, y, '║', border_st);
-            scr.put_char(w.saturating_sub(2), y, '║', border_st);
+            scr.fill_row_range_help(1, y, box_w, pal.bg_deck);
+            scr.put_char(1, y, '│', Style::new(pal.border_dim, pal.bg_deck));
+            scr.put_char(main_w.saturating_sub(2), y, '│', Style::new(pal.border_dim, pal.bg_deck));
             let line_idx = comp_scroll + r;
             if let Some(ref ms) = mic_stats {
                 if r == 0 {
                     let level = ((ms.rms * 14.0).sqrt()).clamp(0.0, 1.0) as f64;
-                    let meter_w = 14usize;
-                    let lit = ((level * (meter_w as f64)).round() as usize).min(meter_w);
-                    let bar = format!(
-                        "►VU:[{}{}] {:4.1}s ",
-                        "█".repeat(lit),
-                        "░".repeat(meter_w - lit),
-                        ms.duration_sec
-                    );
-                    let st = if ms.speech_started {
-                        Style::new(FG_GREEN, pal.bg_deck).bold()
-                    } else {
-                        Style::new(pal.text_hi, pal.bg_deck)
-                    };
-                    let nx = scr.put_str(3, y, w.saturating_sub(3), &bar, st);
-                    let sx = self.demo.draw_spectrum_strip(scr, nx + 1, y, w.saturating_sub(4), false);
-                    let hint = if ms.speech_started { "  [Pause ~1s auto-sends]" } else { "  [Speak now...]" };
-                    scr.put_str(sx + 1, y, w.saturating_sub(3), hint, Style::new(pal.text_muted, pal.bg_deck));
+                    let lit = ((level * 12.0).round() as usize).min(12);
+                    let bar = format!("● VU [{}{}] {:4.1}s ", "█".repeat(lit), "░".repeat(12 - lit), ms.duration_sec);
+                    let st = Style::new(if ms.speech_started { FG_GREEN } else { pal.text_hi }, pal.bg_deck).bold();
+                    let nx = scr.put_str(3, y, main_w.saturating_sub(3), &bar, st);
+                    let sx = self.demo.draw_voice_spectrum(scr, nx + 1, y, main_w.saturating_sub(4), pal.bg_deck);
+                    let hint = if ms.speech_started { "  pause ~1s auto-sends" } else { "  speak now..." };
+                    scr.put_str(sx + 1, y, main_w.saturating_sub(3), hint, Style::new(pal.text_muted, pal.bg_deck));
                 }
             } else if is_transcribing && r == 0 {
-                let stt_msg = if self.is_inkling {
-                    "Running GPU STFT/Mel -> 18L AuT Encoder -> 28L Qwen3-ASR-0.6B Megakernel on RTX 3080..."
-                } else {
-                    "Running GPU STFT/Mel -> 24L AuT Encoder -> 28L Qwen3-ASR-1.7B Megakernel on RTX 3080..."
-                };
-                scr.put_str(3, y, w.saturating_sub(3), stt_msg, Style::new(FG_CYAN, pal.bg_deck));
+                let stt_msg = format!(
+                    "Running GPU STFT/Mel -> AuT Encoder -> Qwen3-ASR-{} on RTX 3080...",
+                    self.asr_model_ref.to_uppercase()
+                );
+                scr.put_str(3, y, main_w.saturating_sub(3), &stt_msg, Style::new(FG_CYAN, pal.bg_deck));
             } else if self.composer.is_empty() && r == 0 && !is_busy {
                 scr.put_str(
                     3,
                     y,
-                    w.saturating_sub(3),
-                    "Type prompt or /demo (Ctrl+D), /mod, /theme (Ctrl+T), Ctrl+R (Mic), /talk, /effort, /bench...",
+                    main_w.saturating_sub(3),
+                    "Ask anything, type / for commands, or press Ctrl+R to speak...",
                     Style::new(pal.text_dim, pal.bg_deck),
                 );
             } else if let Some(ln) = comp_lines.get(line_idx) {
-                scr.put_str(3, y, w.saturating_sub(3), ln, Style::new(pal.text_hi, pal.bg_deck));
+                scr.put_str(3, y, main_w.saturating_sub(3), ln, Style::new(pal.text_hi, pal.bg_deck));
             }
         }
 
-        scr.fill_row(comp_bot_y, pal.bg_deck);
-        scr.put_char(1, comp_bot_y, '╚', border_st);
-        for bx in 2..w.saturating_sub(2) {
-            scr.put_char(bx, comp_bot_y, '═', border_st);
+        scr.fill_row_range_help(1, comp_bot_y, box_w, pal.bg_deck);
+        scr.put_char(1, comp_bot_y, '╰', border_st);
+        for bx in 2..main_w.saturating_sub(2) {
+            scr.put_char(bx, comp_bot_y, '─', Style::new(pal.border_dim, pal.bg_deck));
         }
-        scr.put_char(w.saturating_sub(2), comp_bot_y, '╝', border_st);
+        scr.put_char(main_w.saturating_sub(2), comp_bot_y, '╯', border_st);
 
-        // ---------------------------------------------------------------------
-        // 4. Copper Divider (Row 2) & Demoscene Scroller / Toast Footer
-        // ---------------------------------------------------------------------
+        // 3. Snapshot Telemetry -> Empty-State Brief, Top Instrument Bar, Right Inspector, & Slash Palette
+        let snap = self.snapshot();
+        if self.messages.is_empty() {
+            self.demo.draw_session_brief(scr, 0, chat_top_y, main_w, chat_h, &snap);
+        }
+
+        // Row 0 & Row 1: Top Instrument Header + Row 2 Copper Hairline Rule
+        scr.fill_row(0, pal.bg_header);
+        scr.fill_row(1, pal.bg_header);
+        let brand = " ▄▀ RTX ";
+        let mut x = 1;
+        for (i, ch) in brand.chars().enumerate() {
+            let col = copper_gradient(&pal, (i as f32) / 8.0);
+            x += scr.put_char(x, 0, ch, Style::new(col, pal.bg_header).bold());
+        }
+        x = scr.put_str(x + 1, 0, w - 1, &self.cfg.model_name, Style::new(pal.text_hi, pal.bg_header).bold());
+        let arch_tag = if self.is_inkling {
+            format!(" · 48L 128×8 MoE ({:.2}G)", self.gguf_size_gb)
+        } else {
+            format!(" · {:.2}G GGUF", self.gguf_size_gb)
+        };
+        x = scr.put_str(x, 0, w - 1, &arch_tag, Style::new(pal.text_muted, pal.bg_header));
+
+        let dot_fg = if self.daemon_online { FG_GREEN } else { FG_CORAL };
+        let gpu_tag = format!(" ● GA102 {} SMs · {:.1}ms ", self.active_sms, self.ping_ms);
+        let vram_cells = 10usize;
+        let rhs_need = gpu_tag.chars().count() + vram_cells + 7;
+        if w > x + rhs_need + 2 {
+            let vx = w - rhs_need - 1;
+            let bx = scr.put_str(vx, 0, w - 1, "VRAM ", Style::new(pal.text_dim, pal.bg_header));
+            let ax = self.demo.draw_vram_bar(scr, bx, 0, vram_cells, pal.bg_header, &snap);
+            scr.put_str(ax + 1, 0, w - 1, &gpu_tag, Style::new(dot_fg, pal.bg_header).bold());
+        }
+
+        // Row 1: Mode, Effort, Voice/Adapter pills, Context counter, & Roofline Sparkline
+        let mut x1 = 2;
+        let (mode_lbl, mode_bg) = if self.is_inkling {
+            if self.spec_enabled {
+                (format!(" DSpark γ={} ", self.inkling_gamma), BG_BADGE_ON)
+            } else {
+                (" 48L B=1 ".to_string(), BG_BADGE_T1)
+            }
+        } else if self.spec_enabled {
+            (" Spec BM=4 ".to_string(), BG_BADGE_ON)
+        } else {
+            (" T=1 MK ".to_string(), BG_BADGE_T1)
+        };
+        x1 = scr.put_str(x1, 1, w - 1, &mode_lbl, Style::new(pal.text_hi, mode_bg).bold());
+        if self.is_inkling {
+            let eff_lbl = if self.inkling_effort == "0" {
+                " effort 0 · fast ".to_string()
+            } else {
+                format!(" effort {} ", self.inkling_effort)
+            };
+            let eff_fg = if self.inkling_effort == "0" { FG_GREEN } else { pal.grad_a };
+            x1 = scr.put_str(x1 + 1, 1, w - 1, &eff_lbl, Style::new(eff_fg, pal.bg_surface).bold());
+        }
+        if mod_on {
+            x1 = scr.put_str(x1 + 1, 1, w - 1, " ♫ MOD ", Style::new(pal.bg_void, pal.grad_b).bold());
+        }
+        if self.active_recorder.is_some() {
+            x1 = scr.put_str(x1 + 1, 1, w - 1, " ● REC ", Style::new(pal.bg_void, FG_GREEN).bold());
+        } else if self.asr_rx.is_some() {
+            x1 = scr.put_str(x1 + 1, 1, w - 1, " ◈ STT ", Style::new(pal.bg_void, FG_CYAN).bold());
+        } else if snap.is_speaking {
+            let lbl = if snap.last_ttfa_ms > 0.0 {
+                format!(" ♫ TTS {:.0}ms ", snap.last_ttfa_ms)
+            } else {
+                " ♫ SYNTH ".to_string()
+            };
+            x1 = scr.put_str(x1 + 1, 1, w - 1, &lbl, Style::new(pal.bg_void, FG_AMBER).bold());
+        } else if self.hands_free_talk {
+            x1 = scr.put_str(
+                x1 + 1,
+                1,
+                w - 1,
+                &format!(" ● TALK:{} ", self.voice_speaker),
+                Style::new(pal.bg_void, FG_GREEN).bold(),
+            );
+        } else if self.voice_enabled {
+            x1 = scr.put_str(
+                x1 + 1,
+                1,
+                w - 1,
+                &format!(" ♫ {} ", self.voice_speaker),
+                Style::new(pal.grad_c, pal.bg_surface).bold(),
+            );
+        }
+        if let Some(tb) = &self.topic_badge {
+            x1 = scr.put_str(x1 + 1, 1, w - 1, tb, Style::new(pal.bg_void, FG_AMBER).bold());
+        } else if let Some(rb) = &self.rag_badge {
+            x1 = scr.put_str(x1 + 1, 1, w - 1, rb, Style::new(pal.bg_void, FG_CYAN).bold());
+        }
+        if let Some(lb) = &self.lora_badge {
+            x1 = scr.put_str(x1 + 1, 1, w - 1, lb, Style::new(pal.bg_void, FG_PURPLE).bold());
+        }
+
+        let ctx_str = format!(
+            "  ctx {}/{} (+{})",
+            self.total_ctx_used, self.cfg.max_ctx, self.last_cached_prefix
+        );
+        x1 = scr.put_str(x1, 1, w - 1, &ctx_str, Style::new(pal.text_muted, pal.bg_header));
+
+        if snap.active_tps > 0.0 {
+            let eff_bw = snap.active_tps * self.active_gb_per_tok;
+            let sp_str = format!("{:.1} tok/s · {:.0} GB/s ", snap.active_tps, eff_bw);
+            let spark_w = 8usize;
+            let sx = w.saturating_sub(sp_str.chars().count() + spark_w + 2);
+            if sx > x1 + 2 {
+                let nx = scr.put_str(sx, 1, w - 1, &sp_str, Style::new(pal.grad_c, pal.bg_header).bold());
+                self.demo.draw_tps_sparkline(scr, nx, 1, spark_w, pal.bg_header, snap.active_tps);
+            }
+        }
+
+        self.demo.draw_copper_rule(scr, w, 2, is_busy);
+
+        // Right-Side Hardware & Session Telemetry Inspector
+        if sidebar_on {
+            self.demo.draw_inspector_sidebar(
+                scr,
+                main_w,
+                chat_top_y,
+                sidebar_w,
+                footer_y.saturating_sub(chat_top_y),
+                &snap,
+            );
+        }
+
+        // Interactive Slash-Command Autocomplete Popup (`/` prefix)
+        if !is_busy && mic_stats.is_none() {
+            let comp_txt = self.composer.as_text();
+            if comp_txt.starts_with('/') && !comp_txt.contains(char::is_whitespace) {
+                let items = filter_slash_commands(&comp_txt, &snap, theme_lbl, sidebar_on);
+                if !items.is_empty() {
+                    let sel = self.slash_sel.min(items.len() - 1);
+                    self.demo.draw_slash_palette(scr, 2, comp_top_y, main_w.saturating_sub(4), &items, sel);
+                }
+            }
+        }
+
+        // 4. Calm Static Status & Keybind Footer (`0` distracting scrolling marquee!)
         let show_toast = self
             .toast
             .as_ref()
@@ -1564,24 +1547,28 @@ impl TuiApp {
         if show_toast.is_none() {
             self.toast = None;
         }
-
-        if let Some(msg) = show_toast {
-            self.demo.draw_chrome_bars(scr, w, 2, h + 1, "");
-            scr.fill_row(footer_y, pal.bg_footer);
-            scr.put_str(2, footer_y, w.saturating_sub(1), &msg, Style::new(FG_GREEN, pal.bg_footer).bold());
+        scr.fill_row(footer_y, pal.bg_footer);
+        let lhs_end = if let Some(msg) = show_toast {
+            scr.put_str(2, footer_y, w.saturating_sub(2), &msg, Style::new(FG_GREEN, pal.bg_footer).bold())
         } else {
-            let marquee = format!(
-                "♦ RTX DEMOSCENE EDITION [{}] // {} ({} SMs • 0 DOCKER • 0 CRATES) // ^R:VOICE • /talk:HANDS-FREE • ^D:/demo:60FPS MEGADEMO • /mod:CHIPTUNE • ^T:/theme:PALETTE • ^S:SPEC • ^Y:COPY • ^Q:QUIT // GREETZ: FUTURE CREW • TRITON • SANITY • FARBRAUSCH • TINYGRAD   ",
-                theme_lbl, self.cfg.model_name, self.active_sms
-            );
-            self.demo.draw_chrome_bars(scr, w, 2, footer_y, &marquee);
+            let state_txt = if is_busy {
+                format!("◈ Active · {}", theme_lbl)
+            } else {
+                format!("● Ready · {}", theme_lbl)
+            };
+            scr.put_str(2, footer_y, w.saturating_sub(2), &state_txt, Style::new(pal.text_muted, pal.bg_footer))
+        };
+        let keys = "^R voice · ^O think · ^B inspector · ^S spec · ^T theme · / cmds · ^Q quit ";
+        let kx = w.saturating_sub(keys.chars().count());
+        if kx > lhs_end + 2 {
+            scr.put_str(kx, footer_y, w, keys, Style::new(pal.text_dim, pal.bg_footer));
         }
 
         if is_busy || mic_stats.is_some() {
             None
         } else {
             let cy = comp_top_y + 1 + (cur_comp_row.saturating_sub(comp_scroll));
-            let cx = (3 + cur_comp_col).min(w.saturating_sub(3));
+            let cx = (3 + cur_comp_col).min(main_w.saturating_sub(3));
             Some((cx, cy))
         }
     }
@@ -1590,7 +1577,7 @@ impl TuiApp {
         if voice_start {
             self.voice_enabled = true;
             self.warm_voice_stack_bg(false);
-            self.set_toast("🎙🔊 RTX 3080 Full Voice Stack Active — press Ctrl+R to speak a question (or /talk for hands-free)");
+            self.set_toast("🎙🔊 RTX 3080 Voice Active — press Ctrl+R to speak (or /talk for hands-free)");
         }
         let mut guard = RawTermGuard::enter()?;
         let (w, h) = term_size();
@@ -1613,52 +1600,43 @@ impl TuiApp {
                 needs_redraw = true;
             }
 
-            // Feed live microphone or TTS/MOD PCM samples into the 16-band demoscene spectrum analyzer
-            let (_, fx_lbl, showcase_open, mod_on) = self.demo.status_tags();
+            let (_, showcase_open, mod_on) = self.demo.state_flags();
+            let gpu_busy = self.streaming_rx.is_some() || self.asr_rx.is_some();
             let anim_changed = if let Some(ref rec) = self.active_recorder {
                 rec.recent_samples(256, &mut self.mic_viz_scratch);
-                self.demo.step(
-                    Some((&self.mic_viz_scratch, ASR_SAMPLE_RATE)),
-                    self.streaming_rx.is_some(),
-                    self.messages.is_empty(),
-                )
+                self.demo.step(Some((&self.mic_viz_scratch, ASR_SAMPLE_RATE)), gpu_busy)
             } else if self.tts_speaking.load(Ordering::Relaxed) || mod_on {
                 self.mic_viz_scratch.clear();
                 if let Ok(ring) = self.viz_pcm.lock() {
                     let start = ring.len().saturating_sub(256);
                     self.mic_viz_scratch.extend_from_slice(&ring[start..]);
                 }
-                self.demo.step(
-                    Some((&self.mic_viz_scratch, TTS_SAMPLE_RATE)),
-                    self.streaming_rx.is_some(),
-                    self.messages.is_empty(),
-                )
+                self.demo.step(Some((&self.mic_viz_scratch, TTS_SAMPLE_RATE)), gpu_busy)
             } else {
-                self.demo.step(None, self.streaming_rx.is_some(), self.messages.is_empty())
+                self.demo.step(None, gpu_busy)
             };
             if anim_changed {
                 needs_redraw = true;
             }
 
-            if self.streaming_rx.is_some()
+            if gpu_busy
                 || self.tts_speaking.load(Ordering::Relaxed)
                 || self.active_recorder.is_some()
-                || self.asr_rx.is_some()
                 || mod_on
             {
                 self.spinner_tick = self.spinner_tick.wrapping_add(1);
                 needs_redraw = true;
             }
 
-            if self.streaming_rx.is_none()
-                && !self.active_recorder.is_some()
-                && self.asr_rx.is_none()
+            if !gpu_busy
+                && self.active_recorder.is_none()
                 && last_ping_check.elapsed() > Duration::from_secs(5)
             {
                 let tp = Instant::now();
                 if DaemonControl::ping().is_ok() {
                     self.ping_ms = tp.elapsed().as_secs_f64() * 1000.0;
                     self.daemon_online = true;
+                    self.hw_telemetry = query_hw_telemetry_from_daemon();
                 } else {
                     self.daemon_online = false;
                 }
@@ -1676,15 +1654,12 @@ impl TuiApp {
 
             let poll_ms = if showcase_open
                 || mod_on
-                || self.streaming_rx.is_some()
+                || gpu_busy
                 || self.active_recorder.is_some()
-                || self.asr_rx.is_some()
                 || self.tts_speaking.load(Ordering::Relaxed)
                 || self.talk_rearm_at.is_some()
             {
                 16
-            } else if fx_lbl == "FULL 60FPS" {
-                33
             } else {
                 50
             };
@@ -1695,54 +1670,63 @@ impl TuiApp {
             needs_redraw = true;
 
             for ev in evs {
-                if self.demo.status_tags().2 {
+                if self.demo.state_flags().1 {
                     match ev {
                         InputEvent::CtrlQ => {
-                            let _ = self.demo.configure("stop_all", "", &self.viz_pcm);
+                            let _ = self.demo.configure("stop_all", "", tw, &self.viz_pcm);
                             self.cancel_active_stream();
                             return Ok(());
                         }
-                        InputEvent::Esc | InputEvent::CtrlD | InputEvent::CtrlC => {
-                            let msg = self.demo.configure("demo_open", "off", &self.viz_pcm);
-                            self.set_toast(msg);
-                        }
-                        InputEvent::Char('q') | InputEvent::Char('Q') => {
-                            let msg = self.demo.configure("demo_open", "off", &self.viz_pcm);
+                        InputEvent::Esc | InputEvent::CtrlC | InputEvent::Char('q') | InputEvent::Char('Q') => {
+                            let msg = self.demo.configure("demo_open", "off", tw, &self.viz_pcm);
                             self.set_toast(msg);
                         }
                         InputEvent::Char(c @ ('1'..='4')) => {
-                            let _ = self.demo.configure("demo_scene", &c.to_string(), &self.viz_pcm);
+                            let _ = self.demo.configure("demo_scene", &c.to_string(), tw, &self.viz_pcm);
                         }
                         InputEvent::Char(' ') | InputEvent::Right | InputEvent::Enter => {
-                            let _ = self.demo.configure("demo_scene", "next", &self.viz_pcm);
+                            let _ = self.demo.configure("demo_scene", "next", tw, &self.viz_pcm);
                         }
                         InputEvent::Char('t') | InputEvent::Char('T') | InputEvent::CtrlT => {
-                            let _ = self.demo.configure("theme_cycle", "", &self.viz_pcm);
+                            let _ = self.demo.configure("theme_cycle", "", tw, &self.viz_pcm);
                         }
                         InputEvent::Char('m') | InputEvent::Char('M') => {
-                            let _ = self.demo.configure("mod", "", &self.viz_pcm);
+                            let _ = self.demo.configure("mod", "", tw, &self.viz_pcm);
                         }
                         _ => {}
                     }
                     continue;
                 }
 
+                let comp_txt = self.composer.as_text();
+                let slash_items = if comp_txt.starts_with('/') && !comp_txt.contains(char::is_whitespace) {
+                    let (theme_lbl, _, _) = self.demo.state_flags();
+                    let sidebar_on = self.demo.sidebar_visible(tw);
+                    let snap = self.snapshot();
+                    filter_slash_commands(&comp_txt, &snap, theme_lbl, sidebar_on)
+                } else {
+                    Vec::new()
+                };
+                if slash_items.is_empty() {
+                    self.slash_sel = 0;
+                } else if self.slash_sel >= slash_items.len() {
+                    self.slash_sel = slash_items.len() - 1;
+                }
+
                 match ev {
                     InputEvent::CtrlQ => {
-                        let _ = self.demo.configure("stop_all", "", &self.viz_pcm);
+                        let _ = self.demo.configure("stop_all", "", tw, &self.viz_pcm);
                         self.cancel_active_stream();
                         return Ok(());
                     }
-                    InputEvent::CtrlD => {
-                        if self.composer.is_empty() {
-                            let msg = self.demo.configure("demo_open", "", &self.viz_pcm);
-                            self.set_toast(msg);
-                        } else {
-                            self.composer.delete_forward();
-                        }
+                    InputEvent::CtrlO => {
+                        let _ = self.handle_slash_command("/fold", Some(&mut guard));
+                    }
+                    InputEvent::CtrlB => {
+                        let _ = self.handle_slash_command("/inspector", Some(&mut guard));
                     }
                     InputEvent::CtrlT => {
-                        let msg = self.demo.configure("theme_cycle", "", &self.viz_pcm);
+                        let msg = self.demo.configure("theme_cycle", "", tw, &self.viz_pcm);
                         self.set_toast(msg);
                     }
                     InputEvent::CtrlR => {
@@ -1776,7 +1760,7 @@ impl TuiApp {
                             || self.hands_free_talk
                             || self.streaming_rx.is_some()
                             || self.tts_speaking.load(Ordering::Relaxed)
-                            || self.demo.status_tags().3
+                            || self.demo.state_flags().2
                         {
                             self.cancel_active_stream();
                         } else if self.scroll_from_bottom > 0 {
@@ -1808,11 +1792,31 @@ impl TuiApp {
                     InputEvent::PageDown => {
                         self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(th / 2);
                     }
-                    InputEvent::Char(ch) => self.composer.insert_char(ch),
+                    InputEvent::Tab => {
+                        if !slash_items.is_empty() {
+                            let chosen = &slash_items[self.slash_sel];
+                            let repl = if chosen.args.is_empty() {
+                                chosen.cmd.to_string()
+                            } else {
+                                format!("{} ", chosen.cmd)
+                            };
+                            self.composer.replace_with(&repl);
+                            self.slash_sel = 0;
+                        } else {
+                            self.composer.insert_str("    ");
+                        }
+                    }
+                    InputEvent::Char(ch) => {
+                        self.composer.insert_char(ch);
+                        self.slash_sel = 0;
+                    }
                     InputEvent::Paste(text) => self.composer.insert_str(&text),
                     InputEvent::Newline => self.composer.insert_char('\n'),
-                    InputEvent::Backspace => self.composer.backspace(),
-                    InputEvent::Delete => self.composer.delete_forward(),
+                    InputEvent::Backspace => {
+                        self.composer.backspace();
+                        self.slash_sel = 0;
+                    }
+                    InputEvent::Delete | InputEvent::CtrlD => self.composer.delete_forward(),
                     InputEvent::CtrlW => self.composer.delete_word_back(),
                     InputEvent::CtrlU => self.composer.kill_to_start(),
                     InputEvent::Left => self.composer.move_left(),
@@ -1825,8 +1829,24 @@ impl TuiApp {
                             self.composer.move_end();
                         }
                     }
-                    InputEvent::Up => self.composer.move_vertical(-1),
-                    InputEvent::Down => self.composer.move_vertical(1),
+                    InputEvent::Up => {
+                        if !slash_items.is_empty() {
+                            self.slash_sel = if self.slash_sel == 0 {
+                                slash_items.len() - 1
+                            } else {
+                                self.slash_sel - 1
+                            };
+                        } else {
+                            self.composer.move_vertical(-1);
+                        }
+                    }
+                    InputEvent::Down => {
+                        if !slash_items.is_empty() {
+                            self.slash_sel = (self.slash_sel + 1) % slash_items.len();
+                        } else {
+                            self.composer.move_vertical(1);
+                        }
+                    }
                     InputEvent::Enter => {
                         if self.active_recorder.is_some() {
                             self.stop_and_submit_mic();
@@ -1834,6 +1854,26 @@ impl TuiApp {
                         }
                         if self.asr_rx.is_some() || self.streaming_rx.is_some() {
                             self.set_toast("Wait for current voice/text turn or press Esc to stop first");
+                            continue;
+                        }
+                        if !slash_items.is_empty() {
+                            let chosen = &slash_items[self.slash_sel];
+                            if chosen.args.starts_with('<')
+                                && comp_txt.trim() != chosen.cmd
+                                && chosen.cmd != "/effort"
+                            {
+                                self.composer.replace_with(&format!("{} ", chosen.cmd));
+                                self.slash_sel = 0;
+                                continue;
+                            }
+                            let selected_cmd = chosen.cmd.to_string();
+                            let _ = self.composer.take_submission();
+                            self.slash_sel = 0;
+                            if let Some(should_quit) = self.handle_slash_command(&selected_cmd, Some(&mut guard)) {
+                                if should_quit {
+                                    return Ok(());
+                                }
+                            }
                             continue;
                         }
                         let Some(trimmed) = self.composer.take_submission() else {
@@ -1852,51 +1892,40 @@ impl TuiApp {
         }
     }
 
+    fn drain_stream(&mut self, timeout_s: u64, label: &str) -> Result<(), String> {
+        let t0 = Instant::now();
+        while self.streaming_rx.is_some() {
+            self.pump_stream();
+            if t0.elapsed() > Duration::from_secs(timeout_s) {
+                return Err(format!("{} timed out", label));
+            }
+            thread::sleep(Duration::from_millis(4));
+        }
+        Ok(())
+    }
+
     fn run_self_test(model_ref: &str, max_ctx: usize, spec: bool, temp: f32) -> Result<(), String> {
         let mut app = Self::new(model_ref, max_ctx, spec, temp, 128)?;
-        let mut scr = ScreenBuf::new(110, 34);
-
+        let mut scr = ScreenBuf::new(140, 36);
         let _ = app.handle_slash_command("/verify", None);
-        let _ = app.draw(&mut scr, 110, 34);
+        let _ = app.draw(&mut scr, 140, 36);
 
         app.start_generation(
             "Remember the secret code `RTX3080-GA102`. Reply in one short sentence confirming it.".into(),
             true,
         );
-        let t0 = Instant::now();
-        while app.streaming_rx.is_some() {
-            app.pump_stream();
-            if t0.elapsed() > Duration::from_secs(15) {
-                return Err("TUI self-test turn 1 timed out".into());
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        app.drain_stream(15, "TUI self-test turn 1")?;
         let reply1 = app.messages.last().map(|m| m.content.clone()).unwrap_or_default();
 
         app.start_generation("What was the exact secret code I just gave you?".into(), false);
-        let t1 = Instant::now();
-        while app.streaming_rx.is_some() {
-            app.pump_stream();
-            if t1.elapsed() > Duration::from_secs(15) {
-                return Err("TUI self-test turn 2 timed out".into());
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        app.drain_stream(15, "TUI self-test turn 2")?;
         let reply2 = app.messages.last().map(|m| m.content.clone()).unwrap_or_default();
-        let cached = app.last_cached_prefix;
 
-        let cursor = app.draw(&mut scr, 110, 34);
+        let cursor = app.draw(&mut scr, 140, 36);
         let ansi_bytes = scr.render_ansi(cursor).len();
-
         println!(
             "TUI_SELF_TEST_OK | model='{}' | ping={:.2}ms | turn1_tps={:.2} | turn2_cached_prefix={} toks | ansi_frame={}B | reply1={:?} | reply2={:?}",
-            app.cfg.model_name,
-            app.ping_ms,
-            app.last_tps,
-            cached,
-            ansi_bytes,
-            reply1.trim(),
-            reply2.trim()
+            app.cfg.model_name, app.ping_ms, app.last_tps, app.last_cached_prefix, ansi_bytes, reply1.trim(), reply2.trim()
         );
         Ok(())
     }
@@ -1906,11 +1935,8 @@ impl TuiApp {
         let voice_ref = app.asr_model_ref.clone();
         let _ = DaemonControl::query(DaemonQuery::AsrWarm(voice_ref.clone()))?;
         let _ = DaemonControl::query(DaemonQuery::TtsWarm(voice_ref.clone()))?;
-
         let pcm_16k = prepare_voice_self_test_pcm(&voice_ref)?;
-
-        let mut scr = ScreenBuf::new(116, 36);
-        let t_roundtrip = Instant::now();
+        let mut scr = ScreenBuf::new(140, 36);
 
         app.submit_pcm_for_transcription(pcm_16k);
         let t_stt = Instant::now();
@@ -1923,63 +1949,31 @@ impl TuiApp {
             thread::sleep(Duration::from_millis(3));
         }
         let stt_ms = app.last_asr_ms;
-        let user_msg = app
-            .messages
-            .iter()
-            .find(|m| m.role == "user")
-            .map(|m| m.content.clone())
+        let user_msg = app.messages.iter().find(|m| m.role == "user").map(|m| m.content.clone())
             .ok_or("Expected transcribed user message in TUI chat window")?;
 
         let t_llm = Instant::now();
-        while app.streaming_rx.is_some() {
-            app.pump_stream();
-            if t_llm.elapsed() > Duration::from_secs(20) {
-                return Err("TUI voice self-test LLM generation timed out".into());
-            }
-            thread::sleep(Duration::from_millis(3));
-        }
+        app.drain_stream(20, "TUI voice self-test LLM generation")?;
         let llm_ms = t_llm.elapsed().as_secs_f64() * 1000.0;
-        let asst_msg = app
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant")
-            .map(|m| m.content.clone())
+        let asst_msg = app.messages.iter().rev().find(|m| m.role == "assistant").map(|m| m.content.clone())
             .ok_or("Expected assistant reply in TUI chat window")?;
 
         let (reply_pcm, ttfa_ms) = measure_voice_self_test_tts(&voice_ref, &asst_msg)?;
-        let total_to_first_voice_ms = stt_ms + llm_ms + ttfa_ms;
-        let _ = t_roundtrip.elapsed();
-
-        let cursor = app.draw(&mut scr, 116, 36);
+        let cursor = app.draw(&mut scr, 140, 36);
         let ansi_bytes = scr.render_ansi(cursor).len();
-
         println!(
             "TUI_VOICE_SELF_TEST_OK | stt_ms={:.2} | llm_tps={:.2} | llm_ms={:.2} | tts_ttfa_ms={:.2} | speech_to_voice_ms={:.2} | reply_audio_s={:.2} | chat_msgs={} | ansi_frame={}B | transcript={:?} | reply_preview={:?}",
-            stt_ms,
-            app.last_tps,
-            llm_ms,
-            ttfa_ms,
-            total_to_first_voice_ms,
-            reply_pcm.len() as f64 / (TTS_SAMPLE_RATE as f64),
-            app.messages.len(),
-            ansi_bytes,
-            user_msg,
-            asst_msg.chars().take(90).collect::<String>()
+            stt_ms, app.last_tps, llm_ms, ttfa_ms, stt_ms + llm_ms + ttfa_ms,
+            reply_pcm.len() as f64 / (TTS_SAMPLE_RATE as f64), app.messages.len(), ansi_bytes,
+            user_msg, asst_msg.chars().take(90).collect::<String>()
         );
         Ok(())
     }
 }
 
 pub fn run_tui(
-    model_ref: &str,
-    max_ctx: usize,
-    spec: bool,
-    temp: f32,
-    max_tokens: usize,
-    self_test: bool,
-    voice_start: bool,
-    voice_self_test: bool,
+    model_ref: &str, max_ctx: usize, spec: bool, temp: f32, max_tokens: usize,
+    self_test: bool, voice_start: bool, voice_self_test: bool,
 ) -> Result<(), String> {
     if voice_self_test {
         return TuiApp::run_voice_self_test(model_ref, max_ctx, spec, temp);
@@ -1987,8 +1981,7 @@ pub fn run_tui(
     if self_test {
         return TuiApp::run_self_test(model_ref, max_ctx, spec, temp);
     }
-    let mut app = TuiApp::new(model_ref, max_ctx, spec, temp, max_tokens)?;
-    app.run_interactive_loop(voice_start)
+    TuiApp::new(model_ref, max_ctx, spec, temp, max_tokens)?.run_interactive_loop(voice_start)
 }
 
 #[cfg(test)]
